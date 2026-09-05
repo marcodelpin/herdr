@@ -147,6 +147,9 @@ impl ClientShellState {
                     }
                     return;
                 }
+                if self.handle_endpoint_navigation(action, outcome) {
+                    return;
+                }
                 if let Some(method) = self.endpoint_method_for_action(action) {
                     self.push_endpoint_method(method, outcome);
                     return;
@@ -408,7 +411,9 @@ impl ClientShellState {
         kind: PendingEndpointKind,
         outcome: &mut ClientShellInput,
     ) -> bool {
-        if self.snapshot.is_none() {
+        if !self.endpoint_is_online(&self.active_endpoint_id) {
+            let label = self.active_endpoint_label().to_owned();
+            outcome.repaint |= self.receive_endpoint_unavailable(format!("{label} is not ready"));
             return false;
         }
         let method_name = crate::api::api_method_name(&method).to_owned();
@@ -423,7 +428,9 @@ impl ClientShellState {
             );
             return false;
         }
-        let snapshot = self.snapshot.as_deref().expect("checked snapshot");
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return false;
+        };
         let confirmation_workspace_id = match &method {
             crate::api::schema::Method::TabClose(target) => snapshot
                 .tabs
@@ -450,6 +457,7 @@ impl ClientShellState {
             },
         );
         outcome.actions.push(ClientShellAction::Endpoint {
+            endpoint_id: self.active_endpoint_id.clone(),
             boot_id: snapshot.boot_id.clone(),
             request: Box::new(crate::api::schema::Request {
                 id: request_id,
@@ -466,6 +474,58 @@ impl ClientShellState {
             "Paste rejected",
             message,
         )
+    }
+
+    pub(crate) fn receive_endpoint_unavailable(&mut self, message: String) -> bool {
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Unavailable,
+            message.clone(),
+            "Endpoint unavailable",
+            message,
+        )
+    }
+
+    pub(crate) fn focus_endpoint_target(
+        &mut self,
+        target: ClientEndpointFocusTarget,
+    ) -> Vec<ClientShellAction> {
+        let method = match target {
+            ClientEndpointFocusTarget::Workspace(workspace_id) => {
+                crate::api::schema::Method::WorkspaceFocus(crate::api::schema::WorkspaceTarget {
+                    workspace_id,
+                })
+            }
+            ClientEndpointFocusTarget::Tab(tab_id) => {
+                crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id })
+            }
+            ClientEndpointFocusTarget::Pane(pane_id) => {
+                crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget { pane_id })
+            }
+        };
+        let mut outcome = ClientShellInput::default();
+        self.push_endpoint_method(method, &mut outcome);
+        outcome.actions
+    }
+
+    pub(crate) fn cancel_endpoint_request(&mut self, request_id: &str) -> bool {
+        let Some(pending) = self.pending_requests.get(request_id) else {
+            return false;
+        };
+        let boot_id = pending.boot_id.clone();
+        let (repaint, actions) = self.handle_endpoint_result(
+            &boot_id,
+            request_id,
+            Err(ClientShellEndpointError {
+                code: Some("endpoint_cancelled".into()),
+                message: "This server action was interrupted. Check its state before retrying."
+                    .into(),
+            }),
+        );
+        debug_assert!(
+            actions.is_empty(),
+            "cancellation must not start another action"
+        );
+        repaint
     }
 
     pub(crate) fn handle_endpoint_result(
@@ -505,6 +565,12 @@ impl ClientShellState {
                         pending.method_name.clone(),
                         "Server timed out",
                         format!("This server did not respond to {}.", pending.method_name),
+                    ),
+                    "endpoint_cancelled" => (
+                        ClientEndpointNoticeKind::Unavailable,
+                        "cancelled".to_owned(),
+                        "Action interrupted",
+                        error.message.clone(),
                     ),
                     "server_unavailable" => (
                         ClientEndpointNoticeKind::Unavailable,
@@ -612,6 +678,9 @@ impl ClientShellState {
                         self.endpoint_error =
                             Some("endpoint returned an unexpected selection result".to_owned());
                         (true, fallback())
+                    }
+                    Err(error) if error.code.as_deref() == Some("endpoint_cancelled") => {
+                        (true, Vec::new())
                     }
                     Err(_) => (true, fallback()),
                 };
@@ -724,7 +793,7 @@ impl ClientShellState {
                     Err(error)
                         if matches!(
                             error.code.as_deref(),
-                            Some("stale_content" | "stale_target")
+                            Some("stale_content" | "stale_target" | "endpoint_cancelled")
                         ) =>
                     {
                         self.url_click_consumes_until_up = completed_before_release;
