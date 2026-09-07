@@ -38,7 +38,13 @@ pub(super) fn server_reader_thread(
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
 ) {
-    if stream.set_nonblocking(true).is_err() {
+    // Windows named pipes must stay in blocking (sync) mode: the reader peeks with
+    // PeekNamedPipe before every read (see ipc::poll_local_stream_read_count). Forcing
+    // PIPE_NOWAIT here (what the raw set_nonblocking does on Windows) gives an OVERLAPPED
+    // byte pipe flaky read semantics and stalls large frames (e.g. the shell snapshot), so
+    // the endpoint health check times out ~10s after the handshake. set_local_stream_polling
+    // is the platform abstraction: real set_nonblocking on Unix, a no-op on Windows.
+    if crate::ipc::set_local_stream_polling(&mut stream, true).is_err() {
         let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected {
             endpoint_id,
             generation,
