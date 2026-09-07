@@ -1939,7 +1939,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 }
 
 fn bridge_connection(
-    stream: crate::ipc::LocalStream,
+    mut stream: crate::ipc::LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -1983,7 +1983,15 @@ fn bridge_connection(
             return Err(err);
         }
     };
-    if let Err(err) = stream.set_nonblocking(true) {
+    // The download half writes the server's frames into this local pipe. On Windows the raw
+    // set_nonblocking puts the named pipe in PIPE_NOWAIT, where a WriteFile larger than the free
+    // buffer space reports zero bytes written instead of a partial write, so the 4 KB chunk loop
+    // spins without progress. The 1014-byte welcome fits and lands, so the handshake succeeds,
+    // but the 16 KB shell snapshot never does and the endpoint health check times out 10 s later,
+    // reconnecting on a 12 s cycle (#3701). set_local_stream_polling keeps Unix nonblocking and
+    // leaves the Windows pipe blocking, where the write drains as the client reads; the upload
+    // half is unaffected because it polls through PeekNamedPipe rather than the handle mode.
+    if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, true) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
