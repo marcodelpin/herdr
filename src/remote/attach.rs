@@ -1939,7 +1939,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 }
 
 fn bridge_connection(
-    stream: crate::ipc::LocalStream,
+    mut stream: crate::ipc::LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
