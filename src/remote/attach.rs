@@ -1983,7 +1983,15 @@ fn bridge_connection(
             return Err(err);
         }
     };
-    if let Err(err) = stream.set_nonblocking(true) {
+    // The download half writes the server's frames into this local pipe. On Windows the raw
+    // set_nonblocking puts the named pipe in PIPE_NOWAIT, and a WriteFile larger than the free
+    // buffer space then reports zero bytes written instead of a partial write, so the relay
+    // spins without progress: the 1014-byte welcome lands, the 16 KB shell snapshot never does,
+    // and the endpoint health check times out 10 s after a successful handshake (#3701).
+    // set_local_stream_polling keeps Unix nonblocking and leaves the Windows pipe in blocking
+    // mode, where the write drains as the client reads and the upload half still polls through
+    // PeekNamedPipe.
+    if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, true) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
@@ -2131,7 +2139,10 @@ fn copy_reader_to_local_stream<R: io::Read>(
             }
             let chunk_len = (read - written).min(4 * 1024);
             match stream.write(&buffer[written..written + chunk_len]) {
-                Ok(0) => thread::sleep(BRIDGE_IO_POLL),
+                Ok(0) => {
+                    tracing::info!(chunk_len, written, read, "dbg3701 bridge-down: write returned 0");
+                    thread::sleep(BRIDGE_IO_POLL)
+                }
                 Ok(count) => written += count,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
