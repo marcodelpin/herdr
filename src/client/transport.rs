@@ -102,8 +102,14 @@ impl io::Read for EndpointReader<'_> {
                 return Ok(0);
             }
             match crate::ipc::poll_local_stream_read_count(self.stream, buffer)? {
-                crate::ipc::LocalStreamReadCount::Data(count) => return Ok(count),
-                crate::ipc::LocalStreamReadCount::Closed => return Ok(0),
+                crate::ipc::LocalStreamReadCount::Data(count) => {
+                    tracing::info!(count, want = buffer.len(), "dbg3701 client-read: got bytes");
+                    return Ok(count);
+                }
+                crate::ipc::LocalStreamReadCount::Closed => {
+                    tracing::info!("dbg3701 client-read: stream closed");
+                    return Ok(0);
+                }
                 crate::ipc::LocalStreamReadCount::Pending => {
                     crate::platform::wait_client_stream_readable(self.stream)?;
                 }

@@ -2112,11 +2112,18 @@ fn copy_reader_to_local_stream<R: io::Read>(
 
     loop {
         let read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
+            Ok(0) => {
+                tracing::info!(total, "dbg3701 bridge-down: EOF from ssh stdout");
+                return Ok(total);
+            }
             Ok(read) => read,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                tracing::info!(total, %err, "dbg3701 bridge-down: read error from ssh stdout");
+                return Err(err);
+            }
         };
+        tracing::info!(read, total, "dbg3701 bridge-down: read from ssh stdout");
         let mut written = 0;
         while written < read {
             if connection_stop.load(Ordering::Acquire) || bridge_stop.load(Ordering::Acquire) {
@@ -2135,6 +2142,7 @@ fn copy_reader_to_local_stream<R: io::Read>(
         }
         stream.flush()?;
         total += read as u64;
+        tracing::info!(read, total, "dbg3701 bridge-down: wrote to local pipe");
     }
 }
 
@@ -2154,6 +2162,7 @@ fn copy_local_stream_to_writer<W: io::Write>(
                 writer.write_all(&buffer[..read])?;
                 writer.flush()?;
                 total += read as u64;
+                tracing::info!(read, total, "dbg3701 bridge-up: pipe -> ssh stdin");
             }
             crate::ipc::LocalStreamReadCount::Pending => thread::sleep(BRIDGE_IO_POLL),
             crate::ipc::LocalStreamReadCount::Closed => {
