@@ -252,6 +252,60 @@ mod tests {
         assert_eq!(pipe.received, frame);
     }
 
+    #[test]
+    fn a_frame_that_stops_moving_still_times_out() {
+        // The stall timeout restarts on progress; it must still fire once progress stops, for a
+        // pipe that keeps reporting zero bytes and for a socket that reports WouldBlock.
+        struct StallsAfterOnePiece {
+            accepted: bool,
+            would_block: bool,
+        }
+        impl io::Write for StallsAfterOnePiece {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.accepted {
+                    self.accepted = true;
+                    return Ok(bytes.len().min(NONBLOCKING_PIPE_BUFFER));
+                }
+                if self.would_block {
+                    Err(io::ErrorKind::WouldBlock.into())
+                } else {
+                    Ok(0)
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for would_block in [false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let (done, finished) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut pipe = StallsAfterOnePiece {
+                    accepted: false,
+                    would_block,
+                };
+                let frame = vec![b's'; 4 * NONBLOCKING_PIPE_BUFFER];
+                let result =
+                    write_frame_within(&mut pipe, &frame, &worker_stop, Duration::from_millis(100));
+                let _ = done.send(());
+                result
+            });
+            let returned = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+            stop.store(true, Ordering::Release);
+            let result = worker.join().unwrap();
+            assert!(
+                returned,
+                "a stalled write did not return within 2 s (would_block={would_block})"
+            );
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::TimedOut,
+                "would_block={would_block}"
+            );
+        }
+    }
+
     fn streams() -> (LocalStream, LocalStream, std::path::PathBuf) {
         use interprocess::local_socket::traits::Listener as _;
         let path = std::env::temp_dir().join(format!(
@@ -336,7 +390,6 @@ mod tests {
         crate::protocol::write_message(&mut expected, &input).unwrap();
         let expected_len = expected.len();
         let (done, received) = mpsc::channel();
-        let started = Instant::now();
         let reader = std::thread::spawn(move || {
             // Generous: a fixed writer drains the pipe one buffer per poll, and Windows runners
             // round short sleeps up. An unfixed writer never delivers anything, whatever the wait.
@@ -357,7 +410,9 @@ mod tests {
             done.send(bytes).unwrap();
         });
         transport.send(&input).unwrap();
-        let bytes = received.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Outlasts the reader's own 20 s deadline, so a slow but complete transfer is judged by
+        // its bytes, not by this channel wait.
+        let bytes = received.recv_timeout(Duration::from_secs(30)).unwrap();
         reader.join().unwrap();
         drop(transport);
         let _ = std::fs::remove_file(path);

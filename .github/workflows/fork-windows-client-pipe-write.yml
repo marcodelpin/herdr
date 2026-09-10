@@ -47,6 +47,44 @@ jobs:
       - name: Run endpoint writer tests
         run: cargo test --locked --bin herdr client::endpoint::writer
 
+  stall-timeout-mutant:
+    # The stall timeout restarts on progress. This proves a_frame_that_stops_moving_still_times_out
+    # can go red: with the timeout check disabled the crate must still build and that test must fail.
+    name: mutant - stall timeout disabled must be caught
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Disable the stall timeout and require the test to fail
+        run: |
+          perl -0pi -e 's/if Instant::now\(\) >= deadline \{/if false {/' src/client/endpoint/writer.rs
+          landed=$(grep -c 'if false {' src/client/endpoint/writer.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo test --locked --bin herdr --no-run
+          if cargo test --locked --bin herdr client::endpoint::writer::tests::a_frame_that_stops_moving_still_times_out; then
+            echo "MUTANT SURVIVED: the stall-timeout test passed with the timeout disabled"
+            exit 1
+          fi
+          echo "mutant killed: the test failed with the timeout disabled"
+
   build-windows:
     name: build herdr-windows-x86_64
     needs: writer-tests
