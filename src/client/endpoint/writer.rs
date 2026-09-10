@@ -205,6 +205,105 @@ mod tests {
         (client, accepting.join().unwrap(), path)
     }
 
+    /// A named pipe in PIPE_NOWAIT mode as measured on Windows: a write is taken whole when it
+    /// fits the free buffer and otherwise reports zero bytes, never a partial write. The reader
+    /// drains everything between calls, like the SSH bridge polling through PeekNamedPipe.
+    struct NonblockingPipe {
+        capacity: usize,
+        received: Vec<u8>,
+        largest_accepted: usize,
+    }
+
+    impl io::Write for NonblockingPipe {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.capacity {
+                return Ok(0);
+            }
+            self.largest_accepted = self.largest_accepted.max(bytes.len());
+            self.received.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_larger_than_a_nonblocking_pipe_buffer_is_written_in_pieces_that_fit() {
+        let frame: Vec<u8> = (0..64 * 1024).map(|index| (index % 251) as u8).collect();
+        let expected = frame.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (done, finished) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut pipe = NonblockingPipe {
+                capacity: 512,
+                received: Vec::new(),
+                largest_accepted: 0,
+            };
+            let result = write_frame(&mut pipe, &frame, &worker_stop);
+            let _ = done.send(());
+            (result, pipe)
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+        stop.store(true, Ordering::Release);
+        let (result, pipe) = worker.join().unwrap();
+        assert!(
+            completed,
+            "a 64 KiB frame made no progress in 2 s against a 512-byte nonblocking pipe (received {} bytes)",
+            pipe.received.len()
+        );
+        result.unwrap();
+        assert_eq!(pipe.received, expected);
+        assert!(pipe.largest_accepted <= 512);
+    }
+
+    #[test]
+    fn a_reader_polling_like_the_ssh_bridge_receives_a_frame_larger_than_the_pipe_buffer() {
+        // The bridge's upload half reads only what poll_local_stream_read_count reports
+        // (PeekNamedPipe on Windows), so no pending read lets a large write bypass the pipe
+        // buffer. Only Windows can turn this red; Unix sockets accept partial writes.
+        let (stream, mut peer, path) = streams();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        let input = ClientMessage::Input {
+            data: vec![b'p'; 64 * 1024],
+        };
+        let mut expected = Vec::new();
+        crate::protocol::write_message(&mut expected, &input).unwrap();
+        let expected_len = expected.len();
+        let (done, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            while bytes.len() < expected_len && Instant::now() < deadline {
+                match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
+                    crate::ipc::LocalStreamReadCount::Data(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    crate::ipc::LocalStreamReadCount::Pending => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    crate::ipc::LocalStreamReadCount::Closed => break,
+                }
+            }
+            done.send(bytes).unwrap();
+        });
+        transport.send(&input).unwrap();
+        let bytes = received.recv_timeout(Duration::from_secs(10)).unwrap();
+        reader.join().unwrap();
+        drop(transport);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            bytes.len(),
+            expected_len,
+            "the polling reader received {} of {expected_len} bytes",
+            bytes.len()
+        );
+        assert_eq!(bytes, expected);
+    }
+
     #[test]
     fn native_endpoint_writer_delivers_ordered_protocol_frames() {
         let (stream, mut peer, path) = streams();
