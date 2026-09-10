@@ -157,17 +157,38 @@ fn queue_full() -> io::Error {
     )
 }
 
-fn write_frame(
+/// herdr's named pipes keep interprocess's default 512-byte buffers, and a pipe handle in
+/// PIPE_NOWAIT mode takes a write only when all of it fits the free buffer, reporting zero bytes
+/// otherwise and never a partial write (measured on Windows: 512 bytes write, 513 report zero). A
+/// reader polling through PeekNamedPipe, like the SSH bridge, never makes room for a larger write,
+/// so after a zero-byte write the rest of the frame is offered in pieces of at most this size.
+const NONBLOCKING_PIPE_BUFFER: usize = 512;
+
+fn write_frame(writer: &mut impl io::Write, frame: &[u8], stopped: &AtomicBool) -> io::Result<()> {
+    write_frame_within(writer, frame, stopped, WRITE_TIMEOUT)
+}
+
+/// `timeout` bounds a stall, not the whole frame: it restarts whenever bytes are accepted, so a
+/// large frame that drains one buffer at a time is not cut off while it is still moving.
+fn write_frame_within(
     writer: &mut impl io::Write,
     mut frame: &[u8],
     stopped: &AtomicBool,
+    timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + WRITE_TIMEOUT;
+    let mut deadline = Instant::now() + timeout;
+    let mut limit = frame.len();
     while !frame.is_empty() && !stopped.load(Ordering::Acquire) {
-        match writer.write(frame) {
+        let offered = frame.len().min(limit);
+        match writer.write(&frame[..offered]) {
+            Ok(0) if offered > NONBLOCKING_PIPE_BUFFER => {
+                limit = NONBLOCKING_PIPE_BUFFER;
+                continue;
+            }
             Ok(0) => {}
             Ok(written) => {
                 frame = &frame[written..];
+                deadline = Instant::now() + timeout;
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -188,6 +209,48 @@ fn write_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_that_keeps_moving_is_not_cut_off_by_the_stall_timeout() {
+        // Every other write finds the buffer full, so the writer sleeps between pieces. The whole
+        // frame takes several times the timeout, while no single stall comes close to it.
+        struct AlternatingPipe {
+            full: bool,
+            received: Vec<u8>,
+        }
+        impl io::Write for AlternatingPipe {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.full = !self.full;
+                if self.full {
+                    return Ok(0);
+                }
+                let count = bytes.len().min(64);
+                self.received.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let frame = vec![b'z'; 64 * 300];
+        let mut pipe = AlternatingPipe {
+            full: false,
+            received: Vec::new(),
+        };
+        let started = Instant::now();
+        write_frame_within(
+            &mut pipe,
+            &frame,
+            &AtomicBool::new(false),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() > Duration::from_millis(200),
+            "the frame finished inside one timeout, so no restart was exercised"
+        );
+        assert_eq!(pipe.received, frame);
+    }
 
     fn streams() -> (LocalStream, LocalStream, std::path::PathBuf) {
         use interprocess::local_socket::traits::Listener as _;
@@ -273,8 +336,11 @@ mod tests {
         crate::protocol::write_message(&mut expected, &input).unwrap();
         let expected_len = expected.len();
         let (done, received) = mpsc::channel();
+        let started = Instant::now();
         let reader = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            // Generous: a fixed writer drains the pipe one buffer per poll, and Windows runners
+            // round short sleeps up. An unfixed writer never delivers anything, whatever the wait.
+            let deadline = Instant::now() + Duration::from_secs(20);
             let mut bytes = Vec::new();
             let mut buffer = [0_u8; 16 * 1024];
             while bytes.len() < expected_len && Instant::now() < deadline {
