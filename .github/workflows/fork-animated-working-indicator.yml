@@ -1,6 +1,6 @@
 # Fork-only workflow for fix/animated-working-indicator (not for upstream). The fix branch is not
 # a branch CI runs on, and this host cannot build the crate (zig 0.15.2). The full test binary
-# runs on both platforms; the Windows package is built only once they pass, with the same steps
+# runs on both platforms (nextest, one process per test); the Windows package is built only once they pass, with the same steps
 # as build-artifacts-manual.yml. bd herdr-qlk.2.
 name: Fork animated working indicator
 
@@ -44,8 +44,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      # nextest runs one process per test, like `just ci` upstream. A plain `cargo test` binary
+      # died with SIGPIPE (signal 13) in the plugins action tests on the first run of this
+      # workflow (run 34568308787), taking every later test with it.
       - name: Run the crate tests
-        run: cargo test --locked --bin herdr
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
 
   frozen-spinner-mutant:
     # The spinner frame comes from elapsed time. This proves
