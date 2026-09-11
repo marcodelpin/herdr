@@ -82,7 +82,7 @@ pub(crate) fn render_collapsed_sidebar(
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            status_icon(status, config.status_indicators),
+            agent_status_icon(status, config),
             Style::default().fg(status_color(status, palette)),
         );
         hits.workspaces.push(WorkspaceHit {
@@ -149,7 +149,7 @@ pub(crate) fn render_collapsed_sidebar(
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            status_icon(agent.agent_status, config.status_indicators),
+            agent_status_icon(agent.agent_status, config),
             Style::default().fg(status_color(agent.agent_status, palette)),
         );
         hits.agents.push((rect, pane_id));
@@ -308,7 +308,7 @@ pub(crate) fn render_sidebar(
             rect,
             workspace,
             status,
-            config.status_indicators,
+            agent_status_icon(status, config),
             entry,
             rows,
             true,
@@ -617,7 +617,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
     area: Rect,
     workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
-    indicators: crate::config::StatusIndicatorStyle,
+    icon: &'static str,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
     endpoint_active: bool,
@@ -675,10 +675,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         });
         let spans = crate::ui::resolved_token_spans(
             row,
-            (
-                status_icon(status, indicators),
-                Style::default().fg(status_color(status, palette)),
-            ),
+            (icon, Style::default().fg(status_color(status, palette))),
             Style::default()
                 .fg(status_color(status, palette))
                 .add_modifier(Modifier::DIM),

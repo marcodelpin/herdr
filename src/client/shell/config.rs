@@ -108,6 +108,7 @@ impl ClientShellConfig {
             agents: config.ui.sidebar.agents.clone(),
             agent_panel_sort: config.ui.agent_panel_sort,
             status_indicators: config.ui.status_indicators,
+            animate_working: config.ui.animate_working,
             sound_enabled: config.ui.sound.enabled,
             toast_delivery: config.ui.toast.delivery,
             toast_delay_seconds: config.ui.toast.delay_seconds,
@@ -142,6 +143,8 @@ impl ClientShellConfig {
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
             startup_onboarding: false,
+            spinner_frame: 0,
+            spinner_drawn: std::cell::Cell::new(false),
         }
     }
 
@@ -159,6 +162,24 @@ impl ClientShellConfig {
         self.keybinding_source = source;
         self.keybinds.keybinds.custom_commands.clear();
         self
+    }
+
+    /// Picks the Working spinner frame for the composition about to be drawn.
+    pub(super) fn begin_spinner_frame(&mut self, epoch: std::time::Instant) {
+        self.spinner_frame = spinner_frame_at(epoch.elapsed());
+        self.spinner_drawn.set(false);
+    }
+
+    /// The spinner frame for a row in `status`, or `None` when its icon stays static.
+    pub(super) fn spinner_frame_for(
+        &self,
+        status: crate::api::schema::AgentStatus,
+    ) -> Option<usize> {
+        if !self.animate_working || status != crate::api::schema::AgentStatus::Working {
+            return None;
+        }
+        self.spinner_drawn.set(true);
+        Some(self.spinner_frame)
     }
 
     pub(crate) fn uses_endpoint_keybindings(&self) -> bool {
@@ -310,6 +331,7 @@ impl ClientShellConfig {
                 self.agents = ui.sidebar.agents.clone();
                 self.agent_panel_sort = ui.agent_panel_sort;
                 self.status_indicators = ui.status_indicators;
+                self.animate_working = ui.animate_working;
                 self.sound_enabled = ui.sound.enabled;
                 self.toast_delivery = ui.toast.delivery;
                 self.toast_delay_seconds = ui.toast.delay_seconds;
@@ -441,6 +463,7 @@ mod tests {
         next.ui.tab_bar_position = TabBarPositionConfig::Bottom;
         next.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
         next.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+        next.ui.animate_working = false;
         next.ui.sidebar.agents = toml::from_str("rows = [[{ token = 'machine', rules = [{ equals = 'Local', bold = true }] }]]\nrow_gap = 2").unwrap();
         next.keys.prefix = "ctrl+a".to_owned();
 
@@ -457,6 +480,7 @@ mod tests {
             shell.status_indicators,
             crate::config::StatusIndicatorStyle::Symbols
         );
+        assert!(!shell.animate_working);
         assert_eq!(shell.agents.row_gap, 2);
         assert_eq!(
             shell.agents.rows[0][0].style_for_value("Local").bold,

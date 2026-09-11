@@ -21,6 +21,7 @@ fn restore_mode_bar(
 
 impl ClientShellState {
     fn compose_unavailable(&mut self, cols: u16, rows: u16) -> FrameData {
+        self.config.begin_spinner_frame(self.spinner_epoch);
         let layout = self.layout(cols, rows);
         let mut buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
         buffer.set_style(
@@ -113,6 +114,7 @@ impl ClientShellState {
         if snapshot.revision != surface.projection_revision {
             return None;
         }
+        self.config.begin_spinner_frame(self.spinner_epoch);
         let layout = self.layout(cols, rows);
         if self.last_tab_bar_width != Some(layout.tab_bar.width) {
             self.last_tab_bar_width = Some(layout.tab_bar.width);

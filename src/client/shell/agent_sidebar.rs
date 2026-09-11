@@ -343,7 +343,7 @@ pub(super) fn render_agent_row(
         .fg(palette.overlay0)
         .add_modifier(Modifier::DIM);
     let icon = (
-        status_icon(row.status, config.status_indicators),
+        agent_status_icon(row.status, config),
         Style::default().fg(status_color(row.status, palette)),
     );
     let rows = if row.rows.is_empty() {

@@ -962,6 +962,8 @@ pub struct UiConfig {
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
     /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
+    /// Animate the Working state icon as a spinner; other states stay static. Default: true.
+    pub animate_working: bool,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1186,6 +1188,7 @@ impl Default for UiConfig {
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             _legacy_agent_panel_scope: None,
             status_indicators: StatusIndicatorStyle::Dots,
+            animate_working: true,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1445,6 +1448,20 @@ status_indicators = "symbols"
         )
         .unwrap();
         assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Symbols);
+    }
+
+    #[test]
+    fn animate_working_defaults_to_true_and_parses_false() {
+        assert!(Config::default().ui.animate_working);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+animate_working = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.ui.animate_working);
     }
 
     #[test]

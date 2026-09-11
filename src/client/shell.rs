@@ -191,12 +191,38 @@ fn pane_surface_topology_signature(surface: &PaneSurfaceFrame) -> u64 {
     hash
 }
 
+/// Working spinner for the dots style: the braille block (U+2800..U+28FF) that
+/// `terminal::title` already treats as an agent activity glyph.
+const DOTS_WORKING_FRAMES: [&str; 10] = [
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
+/// Working spinner for the symbols style: the quarter-circle rotation (U+25D0,
+/// U+25D3, U+25D1, U+25D2) whose first frame is the static symbols Working glyph.
+const SYMBOLS_WORKING_FRAMES: [&str; 4] = ["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"];
+const WORKING_SPINNER_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn spinner_frame_at(elapsed: std::time::Duration) -> usize {
+    (elapsed.as_millis() / WORKING_SPINNER_FRAME_PERIOD.as_millis()) as usize
+}
+
+/// `spinner_frame` animates only the Working glyph; `None` keeps the static glyph
+/// and every other status is static regardless.
 fn status_icon(
     status: crate::api::schema::AgentStatus,
     style: crate::config::StatusIndicatorStyle,
+    spinner_frame: Option<usize>,
 ) -> &'static str {
     use crate::api::schema::AgentStatus;
     use crate::config::StatusIndicatorStyle;
+    if let (AgentStatus::Working, Some(frame)) = (status, spinner_frame) {
+        return match style {
+            StatusIndicatorStyle::Dots => DOTS_WORKING_FRAMES[frame % DOTS_WORKING_FRAMES.len()],
+            StatusIndicatorStyle::Symbols => {
+                SYMBOLS_WORKING_FRAMES[frame % SYMBOLS_WORKING_FRAMES.len()]
+            }
+        };
+    }
     match (style, status) {
         (
             StatusIndicatorStyle::Dots,
@@ -212,8 +238,21 @@ fn status_icon(
     }
 }
 
+/// The configured state icon for an agent or workspace row. Drawing an animated
+/// Working frame marks the composition so the client timer keeps advancing it.
+fn agent_status_icon(
+    status: crate::api::schema::AgentStatus,
+    config: &ClientShellConfig,
+) -> &'static str {
+    status_icon(
+        status,
+        config.status_indicators,
+        config.spinner_frame_for(status),
+    )
+}
+
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
-    status_icon(status, crate::config::StatusIndicatorStyle::Dots)
+    status_icon(status, crate::config::StatusIndicatorStyle::Dots, None)
 }
 
 fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {

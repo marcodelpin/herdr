@@ -1042,11 +1042,17 @@
           "key": "ui.status_indicators",
           "type": "enum",
           "default": "\"dots\"",
-          "description": "Choose compact color dots or distinct static symbols for agent states.",
+          "description": "Choose compact color dots or distinct symbols for agent states.",
           "values": [
             "dots",
             "symbols"
           ]
+        },
+        {
+          "key": "ui.animate_working",
+          "type": "boolean",
+          "default": "true",
+          "description": "Animate the working state icon as a spinner: braille frames for dots, rotating quarter circles for symbols. Other states stay static."
         },
         {
           "key": "ui.sidebar.agents.row_gap",
