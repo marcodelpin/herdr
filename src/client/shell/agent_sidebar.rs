@@ -82,7 +82,7 @@ pub(super) fn render_agent_panel(
         |row| row.rows.len(),
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, config);
+            render_agent_row(buffer, rect, row, false, config);
         },
     );
 }
@@ -322,6 +322,7 @@ pub(super) fn render_agent_row(
     buffer: &mut Buffer,
     rect: Rect,
     row: &AgentRow,
+    stale: bool,
     config: &ClientShellConfig,
 ) {
     let palette = &config.palette;
@@ -341,10 +342,7 @@ pub(super) fn render_agent_row(
     };
     let status_style = Style::default().fg(status_color(row.status, palette));
     let secondary = Style::default().fg(palette.overlay0);
-    let icon = (
-        agent_status_icon(row.status, config),
-        Style::default().fg(status_color(row.status, palette)),
-    );
+    let icon_style = Style::default().fg(status_color(row.status, palette));
     let rows = if row.rows.is_empty() {
         vec![vec![crate::ui::ResolvedToken {
             kind: crate::ui::ResolvedTokenKind::StateIcon,
@@ -358,7 +356,10 @@ pub(super) fn render_agent_row(
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
-            icon,
+            (
+                token_row_state_icon(tokens, row.status, config, stale),
+                icon_style,
+            ),
             status_style,
             name_style,
             secondary,

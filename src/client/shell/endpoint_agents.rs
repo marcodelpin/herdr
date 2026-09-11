@@ -21,7 +21,10 @@ pub(super) fn render_collapsed(
             rect.x,
             rect.y,
             rect.width,
-            &format!("{initial}{}", agent_status_icon(row.agent.status, config)),
+            &format!(
+                "{initial}{}",
+                drawn_status_icon(row.agent.status, config, row.stale)
+            ),
             Style::default()
                 .fg(if row.stale {
                     config.palette.overlay0
@@ -69,7 +72,7 @@ pub(super) fn render_expanded(
         hits,
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
-            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, row.stale, config);
             if row.stale {
                 buffer.set_style(
                     rect,
