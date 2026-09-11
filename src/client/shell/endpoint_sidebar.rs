@@ -163,7 +163,7 @@ pub(super) fn render_collapsed(
                 rect.x.saturating_add(number_width),
                 rect.y,
                 rect.width.saturating_sub(number_width),
-                agent_status_icon(workspace.agent_status, config),
+                drawn_status_icon(workspace.agent_status, config, stale),
                 Style::default()
                     .fg(if stale {
                         palette.overlay0
@@ -452,20 +452,21 @@ pub(super) fn render_expanded(
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
+                let stale = endpoint.status != ClientEndpointStatus::Online;
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
                     status,
-                    agent_status_icon(status, config),
+                    stale,
                     entry,
                     tokens,
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
                     false,
-                    palette,
+                    config,
                 );
-                if endpoint.status != ClientEndpointStatus::Online {
+                if stale {
                     buffer.set_style(
                         rect,
                         Style::default()

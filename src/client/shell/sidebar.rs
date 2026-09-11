@@ -325,14 +325,14 @@ pub(crate) fn render_sidebar(
             buffer,
             rect,
             status,
-            agent_status_icon(status, config),
+            false,
             entry,
             rows,
             workspace.focused,
             selected,
             state.selected_workspace_id.is_some(),
             dragged,
-            palette,
+            config,
         );
         let group_toggle = render_parent_group_toggle(
             buffer,
@@ -656,20 +656,22 @@ pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
     status: crate::api::schema::AgentStatus,
-    icon: &'static str,
+    stale: bool,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
     focused: bool,
     selected: bool,
     navigating: bool,
     dragged: bool,
-    palette: &Palette,
+    config: &ClientShellConfig,
 ) {
+    let palette = &config.palette;
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
         if y >= area.bottom() {
             break;
         }
+        let icon = token_row_state_icon(row, status, config, stale);
         let mut x = area.x;
         if entry.indented {
             let prefix = if row_index == 0 {
