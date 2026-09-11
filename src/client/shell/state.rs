@@ -25,6 +25,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) agents: crate::config::AgentsSidebarConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
+    pub(super) animate_working: bool,
     pub(super) sound_enabled: bool,
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
@@ -51,6 +52,10 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
     pub(super) startup_onboarding: bool,
+    /// Render-time state, not on-disk config: the Working spinner frame of the
+    /// current composition and whether that composition drew an animated icon.
+    pub(super) spinner_frame: usize,
+    pub(super) spinner_drawn: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +886,8 @@ pub(crate) struct ClientShellState {
     pub(super) last_composed_size: Option<(u16, u16)>,
     pub(super) last_composed_at: Option<std::time::Instant>,
     pub(super) selection_repaint_deadline: Option<std::time::Instant>,
+    /// Time origin of the Working spinner; never reset, so the phase survives reloads.
+    pub(super) spinner_epoch: std::time::Instant,
     pub(super) hits: ShellHitMap,
     pub(super) endpoints: Vec<ClientShellEndpoint>,
     pub(super) active_endpoint_id: ClientEndpointId,
@@ -1045,6 +1052,7 @@ impl ClientShellState {
             last_composed_size: None,
             last_composed_at: None,
             selection_repaint_deadline: None,
+            spinner_epoch: std::time::Instant::now(),
             hits: ShellHitMap::default(),
             endpoints: vec![local_endpoint()],
             active_endpoint_id: ClientEndpointId::Local,
@@ -1849,6 +1857,15 @@ impl ClientShellState {
             return true;
         }
         false
+    }
+
+    /// True when the last composition drew an animated Working icon and the spinner
+    /// has advanced to another frame since, so the timer should recompose.
+    pub(crate) fn tick_working_spinner(&self, now: std::time::Instant) -> bool {
+        self.config.animate_working
+            && self.config.spinner_drawn.get()
+            && spinner_frame_at(now.saturating_duration_since(self.spinner_epoch))
+                != self.config.spinner_frame
     }
 
     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {

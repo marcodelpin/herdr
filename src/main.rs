@@ -332,8 +332,12 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # agent_panel_sort = "spaces"
 
 # Agent status indicators: "dots" preserves the compact color marks; "symbols" uses
-# distinct static glyphs for blocked, working, done, idle, and unknown states.
+# distinct glyphs for blocked, working, done, idle, and unknown states.
 # status_indicators = "dots"
+
+# Animate the working state icon as a spinner (braille frames for "dots", rotating
+# quarter circles for "symbols"). Other states stay static. Set false for a static icon.
+# animate_working = true
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
