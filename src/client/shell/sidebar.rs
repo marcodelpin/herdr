@@ -304,17 +304,7 @@ pub(crate) fn render_sidebar(
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
         render_workspace_rows(
-            buffer,
-            rect,
-            workspace,
-            status,
-            agent_status_icon(status, config),
-            entry,
-            rows,
-            true,
-            selected,
-            dragged,
-            palette,
+            buffer, rect, workspace, status, false, entry, rows, true, selected, dragged, config,
         );
         let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
             let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
@@ -617,19 +607,21 @@ pub(in crate::client::shell) fn render_workspace_rows(
     area: Rect,
     workspace: &ClientShellWorkspace,
     status: crate::api::schema::AgentStatus,
-    icon: &'static str,
+    stale: bool,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
     endpoint_active: bool,
     selected: bool,
     dragged: bool,
-    palette: &Palette,
+    config: &ClientShellConfig,
 ) {
+    let palette = &config.palette;
     for (row_index, row) in rows.iter().enumerate() {
         let y = area.y + row_index as u16;
         if y >= area.bottom() {
             break;
         }
+        let icon = token_row_state_icon(row, status, config, stale);
         let mut x = area.x;
         if entry.indented {
             let prefix = if row_index == 0 {

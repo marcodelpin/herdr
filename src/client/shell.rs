@@ -238,17 +238,66 @@ fn status_icon(
     }
 }
 
-/// The configured state icon for an agent or workspace row. Drawing an animated
-/// Working frame marks the composition so the client timer keeps advancing it.
+/// A row's configured state icon and whether it is an animated Working frame,
+/// without recording anything: the caller marks the composition only once the
+/// glyph is known to be on screen. A row of a disconnected (`stale`) endpoint
+/// keeps the static glyph, since its cached Working status is not live activity.
+fn lookup_status_icon(
+    status: crate::api::schema::AgentStatus,
+    config: &ClientShellConfig,
+    stale: bool,
+) -> (&'static str, bool) {
+    let frame = if stale {
+        None
+    } else {
+        config.spinner_frame_for(status)
+    };
+    (
+        status_icon(status, config.status_indicators, frame),
+        frame.is_some(),
+    )
+}
+
+/// The state icon for a glyph the caller draws into the frame right now. An
+/// animated Working frame marks the composition so the client timer keeps
+/// advancing it, so call this only where the glyph is actually emitted.
+fn drawn_status_icon(
+    status: crate::api::schema::AgentStatus,
+    config: &ClientShellConfig,
+    stale: bool,
+) -> &'static str {
+    let (icon, animated) = lookup_status_icon(status, config, stale);
+    if animated {
+        config.mark_spinner_drawn();
+    }
+    icon
+}
+
+/// `drawn_status_icon` for a row of the live, local snapshot.
 fn agent_status_icon(
     status: crate::api::schema::AgentStatus,
     config: &ClientShellConfig,
 ) -> &'static str {
-    status_icon(
-        status,
-        config.status_indicators,
-        config.spinner_frame_for(status),
-    )
+    drawn_status_icon(status, config, false)
+}
+
+/// The glyph for the `state_icon` token of one rendered token row.
+/// `resolved_token_spans` draws the icon only for that token, so a row without it
+/// gets the static glyph and never marks the composition.
+fn token_row_state_icon(
+    row: &[crate::ui::ResolvedToken],
+    status: crate::api::schema::AgentStatus,
+    config: &ClientShellConfig,
+    stale: bool,
+) -> &'static str {
+    if row
+        .iter()
+        .any(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::StateIcon))
+    {
+        drawn_status_icon(status, config, stale)
+    } else {
+        status_icon(status, config.status_indicators, None)
+    }
 }
 
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {

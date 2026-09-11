@@ -15,6 +15,9 @@ struct MobileItem {
     lines: Vec<Line<'static>>,
     background: Color,
     target: Option<ClientMobileTarget>,
+    /// The first line holds an animated Working glyph; it marks the composition
+    /// only when that line is inside the rendered viewport.
+    spinner: bool,
 }
 
 impl MobileItem {
@@ -29,6 +32,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: None,
+            spinner: false,
         }
     }
 
@@ -43,6 +47,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: Some(target),
+            spinner: false,
         }
     }
 }
@@ -291,11 +296,18 @@ fn render_agent_summary(
         if count == 0 {
             continue;
         }
-        let symbol = match (config.status_indicators, status) {
-            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => Some("◉"),
-            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => Some("●"),
-            (crate::config::StatusIndicatorStyle::Dots, _) => None,
-            _ => Some(agent_status_icon(status, config)),
+        let (symbol, spinner) = match (config.status_indicators, status) {
+            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => {
+                (Some("\u{25c9}"), false)
+            }
+            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => {
+                (Some("\u{25cf}"), false)
+            }
+            (crate::config::StatusIndicatorStyle::Dots, _) => (None, false),
+            _ => {
+                let (icon, spinner) = lookup_status_icon(status, config, false);
+                (Some(icon), spinner)
+            }
         };
         let text = symbol.map_or_else(
             || format!("{count} {label}"),
@@ -306,6 +318,9 @@ fn render_agent_summary(
         if area.right().saturating_sub(x) < needed {
             omitted = true;
             break;
+        }
+        if spinner {
+            config.mark_spinner_drawn();
         }
         if !separator.is_empty() {
             x = put_segment(
@@ -375,6 +390,10 @@ pub(super) fn render_mobile_switcher(
     }
     let palette = &config.palette;
     Clear.render(area, buffer);
+    if area == buffer.area {
+        // The switcher hides the header and every row drawn under it.
+        config.clear_spinner_drawn();
+    }
     buffer.set_style(area, Style::default().bg(palette.panel_bg));
     hits.mobile_switch = Rect::default();
     if area.height <= 2 {
@@ -502,6 +521,9 @@ pub(super) fn render_mobile_switcher(
             let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
             let rect = Rect::new(content.x, y, content.width, height);
             buffer.set_style(rect, Style::default().bg(item.background));
+            if item.spinner && visible_start == item_start {
+                config.mark_spinner_drawn();
+            }
             for row in visible_start..visible_end {
                 let line = item.lines[row - item_start].clone();
                 Paragraph::new(line).render(
@@ -605,6 +627,7 @@ fn mobile_items(
                 ],
                 background,
                 target: Some(ClientMobileTarget::Machine(endpoint.endpoint_id.clone())),
+                spinner: false,
             });
         }
     }
@@ -627,6 +650,7 @@ fn mobile_items(
                 ))],
                 background: palette.panel_bg,
                 target: None,
+                spinner: false,
             });
         }
         for row in agents {
@@ -695,12 +719,13 @@ fn mobile_items(
             } else {
                 Modifier::empty()
             };
+            let (icon, spinner) = lookup_status_icon(agent.agent_status, config, endpoint.stale());
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
                         Span::styled("  ", Style::default().bg(background)),
                         Span::styled(
-                            agent_status_icon(agent.agent_status, config),
+                            icon,
                             Style::default()
                                 .fg(if endpoint.stale() {
                                     palette.overlay0
@@ -738,6 +763,7 @@ fn mobile_items(
                     endpoint_id: endpoint.endpoint_id.clone(),
                     pane_id: agent.pane_id.clone(),
                 }),
+                spinner,
             });
         }
     }
@@ -810,6 +836,8 @@ fn mobile_items(
             } else {
                 String::new()
             };
+            let (icon, spinner) =
+                lookup_status_icon(workspace.agent_status, config, endpoint.stale());
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
@@ -821,7 +849,7 @@ fn mobile_items(
                                 .add_modifier(dim),
                         ),
                         Span::styled(
-                            agent_status_icon(workspace.agent_status, config),
+                            icon,
                             Style::default().fg(status).bg(background).add_modifier(dim),
                         ),
                         Span::styled(" ", Style::default().bg(background)),
@@ -859,6 +887,7 @@ fn mobile_items(
                     endpoint_id: endpoint.endpoint_id.clone(),
                     workspace_id: workspace.workspace_id.clone(),
                 }),
+                spinner,
             });
         }
     }
@@ -903,6 +932,7 @@ fn mobile_items(
                     endpoint_id: active_endpoint_id.clone(),
                     tab_id: tab.tab_id.clone(),
                 }),
+                spinner: false,
             });
         }
     }
@@ -919,6 +949,7 @@ fn mobile_items(
             ))],
             background: palette.panel_bg,
             target: Some(ClientMobileTarget::Menu(index)),
+            spinner: false,
         });
     }
     items

@@ -342,7 +342,7 @@ Agent status uses compact colored dots by default. To distinguish blocked, worki
 status_indicators = "symbols"
 ```
 
-While an agent is working, its state icon animates as a spinner: braille frames with `dots`, rotating quarter circles with `symbols`. Blocked, done, idle, and unknown icons are always static. To keep the working icon static too, configure:
+While an agent is working, its state icon animates as a spinner: braille frames with `dots`, rotating quarter circles with `symbols`. Blocked, done, idle, and unknown icons are always static, and so is the last known state of a disconnected machine. To keep the working icon static too, configure:
 
 ```toml
 [ui]

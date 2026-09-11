@@ -171,6 +171,7 @@ impl ClientShellConfig {
     }
 
     /// The spinner frame for a row in `status`, or `None` when its icon stays static.
+    /// A pure lookup: only `mark_spinner_drawn` records that a frame reached the screen.
     pub(super) fn spinner_frame_for(
         &self,
         status: crate::api::schema::AgentStatus,
@@ -178,8 +179,18 @@ impl ClientShellConfig {
         if !self.animate_working || status != crate::api::schema::AgentStatus::Working {
             return None;
         }
-        self.spinner_drawn.set(true);
         Some(self.spinner_frame)
+    }
+
+    /// Records that the composition put an animated Working glyph into the frame, so
+    /// the client timer keeps advancing it.
+    pub(super) fn mark_spinner_drawn(&self) {
+        self.spinner_drawn.set(true);
+    }
+
+    /// Forgets every animated glyph drawn so far, for a layer that covers them all.
+    pub(super) fn clear_spinner_drawn(&self) {
+        self.spinner_drawn.set(false);
     }
 
     pub(crate) fn uses_endpoint_keybindings(&self) -> bool {
