@@ -82,6 +82,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
     pub(super) status_indicators: crate::config::StatusIndicatorStyle,
     pub(super) animate_working: bool,
+    pub(super) waiting_indicator: bool,
     pub(super) sound_enabled: bool,
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
@@ -108,10 +109,13 @@ pub(crate) struct ClientShellConfig {
     pub(super) preferences: preferences::ClientChromePreferences,
     pub(super) startup_config_diagnostic: Option<String>,
     pub(super) startup_onboarding: bool,
-    /// Render-time state, not on-disk config: the Working spinner frame of the
-    /// current composition and whether that composition drew an animated icon.
+    /// Render-time state, not on-disk config: the spinner frame each clock is on in
+    /// the current composition, and whether that composition drew an icon animated
+    /// by that clock.
     pub(super) spinner_frame: usize,
     pub(super) spinner_drawn: std::cell::Cell<bool>,
+    pub(super) waiting_frame: usize,
+    pub(super) waiting_drawn: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1777,13 +1781,18 @@ impl ClientShellState {
         repaint
     }
 
-    /// True when the last composition drew an animated Working icon and the spinner
-    /// has advanced to another frame since, so the timer should recompose.
+    /// True when the last composition drew an animated icon and its clock has
+    /// advanced to another frame since, so the timer should recompose. The Waiting
+    /// clock is checked separately: it turns over once per second, so a drawn
+    /// hourglass must not repaint at the Working spinner's rate.
     pub(crate) fn tick_working_spinner(&self, now: std::time::Instant) -> bool {
-        self.config.animate_working
-            && self.config.spinner_drawn.get()
-            && spinner_frame_at(now.saturating_duration_since(self.spinner_epoch))
-                != self.config.spinner_frame
+        if !self.config.animate_working {
+            return false;
+        }
+        let elapsed = now.saturating_duration_since(self.spinner_epoch);
+        (self.config.spinner_drawn.get() && spinner_frame_at(elapsed) != self.config.spinner_frame)
+            || (self.config.waiting_drawn.get()
+                && waiting_frame_at(elapsed) != self.config.waiting_frame)
     }
 
     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {

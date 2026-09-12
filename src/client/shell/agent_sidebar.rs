@@ -12,7 +12,7 @@ use super::*;
 
 pub(super) struct AgentRow {
     pub(super) pane_id: String,
-    pub(super) status: crate::api::schema::AgentStatus,
+    pub(super) display: DisplayState,
     pub(super) focused: bool,
     pub(super) rows: Vec<Vec<crate::ui::ResolvedToken>>,
 }
@@ -303,7 +303,7 @@ pub(super) fn agent_rows(
             );
             Some(AgentRow {
                 pane_id: agent.pane_id.clone(),
-                status: agent.agent_status,
+                display: agent_display_state(agent, config),
                 focused: agent.focused,
                 rows,
             })
@@ -333,17 +333,15 @@ pub(super) fn render_agent_row(
             .fg(palette.subtext0)
             .add_modifier(Modifier::BOLD)
     };
-    let status_style = Style::default()
-        .fg(status_color(row.status, palette))
-        .add_modifier(if row.focused {
-            Modifier::empty()
-        } else {
-            Modifier::DIM
-        });
+    let status_style = display_state_style(row.display, palette).add_modifier(if row.focused {
+        Modifier::empty()
+    } else {
+        display_state_dim(row.display)
+    });
     let secondary = Style::default()
         .fg(palette.overlay0)
         .add_modifier(Modifier::DIM);
-    let icon_style = Style::default().fg(status_color(row.status, palette));
+    let icon_style = display_state_style(row.display, palette);
     let rows = if row.rows.is_empty() {
         vec![vec![crate::ui::ResolvedToken {
             kind: crate::ui::ResolvedTokenKind::StateIcon,
@@ -358,7 +356,7 @@ pub(super) fn render_agent_row(
         spans.extend(crate::ui::resolved_token_spans(
             tokens,
             (
-                token_row_state_icon(tokens, row.status, config, stale),
+                token_row_state_icon(tokens, row.display, config, stale),
                 icon_style,
             ),
             status_style,

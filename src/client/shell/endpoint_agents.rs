@@ -23,18 +23,18 @@ pub(super) fn render_collapsed(
             rect.width,
             &format!(
                 "{initial}{}",
-                drawn_status_icon(row.agent.status, config, row.stale)
+                drawn_display_icon(row.agent.display, config, row.stale)
             ),
             Style::default()
                 .fg(if row.stale {
                     config.palette.overlay0
                 } else {
-                    status_color(row.agent.status, &config.palette)
+                    display_state_color(row.agent.display, &config.palette)
                 })
                 .add_modifier(if row.stale {
                     Modifier::DIM
                 } else {
-                    Modifier::empty()
+                    display_state_modifier(row.agent.display)
                 }),
         );
         hits.endpoint_agents

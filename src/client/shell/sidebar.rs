@@ -76,14 +76,15 @@ pub(crate) fn render_collapsed_sidebar(
             &format!("{:<2}", index + 1),
             number_style,
         );
-        let status = workspace.agent_status;
+        let display =
+            workspace_display_state(snapshot, &[workspace], workspace.agent_status, config);
         put_text(
             buffer,
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            agent_status_icon(status, config),
-            Style::default().fg(status_color(status, palette)),
+            agent_display_icon(display, config),
+            display_state_style(display, palette),
         );
         hits.workspaces.push(WorkspaceHit {
             rect,
@@ -144,13 +145,14 @@ pub(crate) fn render_collapsed_sidebar(
                 palette.overlay0
             }),
         );
+        let display = agent_display_state(agent, config);
         put_text(
             buffer,
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            agent_status_icon(agent.agent_status, config),
-            Style::default().fg(status_color(agent.agent_status, palette)),
+            agent_display_icon(display, config),
+            display_state_style(display, palette),
         );
         hits.agents.push((rect, pane_id));
     }
@@ -288,6 +290,8 @@ pub(crate) fn render_sidebar(
             continue;
         };
         let status = displayed_workspace_status(snapshot, workspace, state.collapsed_groups);
+        let display =
+            displayed_workspace_display_state(snapshot, workspace, state.collapsed_groups, config);
         let rows = workspace_rows(workspace, status, entry.indented, &config.spaces);
         let row_height = (rows.len().max(1).min(u16::MAX as usize) as u16).min(body.height);
         if y.saturating_add(row_height) > body.bottom() {
@@ -304,7 +308,7 @@ pub(crate) fn render_sidebar(
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
         render_workspace_rows(
-            buffer, rect, workspace, status, false, entry, rows, true, selected, dragged, config,
+            buffer, rect, workspace, display, false, entry, rows, true, selected, dragged, config,
         );
         let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
             let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
@@ -544,22 +548,24 @@ pub(super) fn parent_group_key(snapshot: &ClientShellSnapshot, index: usize) -> 
         .then(|| worktree.key.clone())
 }
 
-pub(super) fn displayed_workspace_status(
-    snapshot: &ClientShellSnapshot,
-    workspace: &ClientShellWorkspace,
+/// The workspaces one workspace row speaks for: itself, plus the other members of
+/// the worktree group it stands in for while that group is collapsed.
+fn rolled_up_workspaces<'a>(
+    snapshot: &'a ClientShellSnapshot,
+    workspace: &'a ClientShellWorkspace,
     collapsed_groups: &HashSet<String>,
-) -> crate::api::schema::AgentStatus {
+) -> Vec<&'a ClientShellWorkspace> {
     let Some(worktree) = workspace
         .worktree
         .as_ref()
         .filter(|worktree| !worktree.is_linked_worktree)
     else {
-        return workspace.agent_status;
+        return vec![workspace];
     };
     if !collapsed_groups.contains(&worktree.key) {
-        return workspace.agent_status;
+        return vec![workspace];
     }
-    snapshot
+    let members = snapshot
         .workspaces
         .iter()
         .filter(|candidate| {
@@ -568,9 +574,64 @@ pub(super) fn displayed_workspace_status(
                 .as_ref()
                 .is_some_and(|candidate| candidate.key == worktree.key)
         })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        vec![workspace]
+    } else {
+        members
+    }
+}
+
+pub(super) fn displayed_workspace_status(
+    snapshot: &ClientShellSnapshot,
+    workspace: &ClientShellWorkspace,
+    collapsed_groups: &HashSet<String>,
+) -> crate::api::schema::AgentStatus {
+    rolled_up_workspaces(snapshot, workspace, collapsed_groups)
+        .iter()
         .map(|candidate| candidate.agent_status)
         .max_by_key(|status| status_priority(*status))
         .unwrap_or(workspace.agent_status)
+}
+
+/// The display state of a workspace row: `status` is the row's rolled-up status, and
+/// the WAITING / STALE override comes from every token bag the row speaks for, its
+/// own workspaces' and those of the agents inside them. So a space whose panes are
+/// idle but one of which reports `wait` shows the hourglass, and one reporting
+/// `stale` wins over it.
+pub(in crate::client::shell) fn workspace_display_state(
+    snapshot: &ClientShellSnapshot,
+    workspaces: &[&ClientShellWorkspace],
+    status: crate::api::schema::AgentStatus,
+    config: &ClientShellConfig,
+) -> DisplayState {
+    let tokens = workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tokens.iter())
+        .chain(
+            snapshot
+                .agents
+                .iter()
+                .filter(|agent| {
+                    workspaces
+                        .iter()
+                        .any(|workspace| workspace.workspace_id == agent.workspace_id)
+                })
+                .flat_map(|agent| agent.tokens.iter()),
+        )
+        .map(|(key, value)| (key.as_str(), value.as_str()));
+    display_state_of(status, tokens, config.waiting_indicator)
+}
+
+pub(super) fn displayed_workspace_display_state(
+    snapshot: &ClientShellSnapshot,
+    workspace: &ClientShellWorkspace,
+    collapsed_groups: &HashSet<String>,
+    config: &ClientShellConfig,
+) -> DisplayState {
+    let status = displayed_workspace_status(snapshot, workspace, collapsed_groups);
+    let workspaces = rolled_up_workspaces(snapshot, workspace, collapsed_groups);
+    workspace_display_state(snapshot, &workspaces, status, config)
 }
 
 pub(in crate::client::shell) fn workspace_rows(
@@ -606,7 +667,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
     buffer: &mut Buffer,
     area: Rect,
     workspace: &ClientShellWorkspace,
-    status: crate::api::schema::AgentStatus,
+    display: DisplayState,
     stale: bool,
     entry: &WorkspaceEntry,
     rows: Vec<Vec<crate::ui::ResolvedToken>>,
@@ -621,7 +682,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         if y >= area.bottom() {
             break;
         }
-        let icon = token_row_state_icon(row, status, config, stale);
+        let icon = token_row_state_icon(row, display, config, stale);
         let mut x = area.x;
         if entry.indented {
             let prefix = if row_index == 0 {
@@ -667,10 +728,8 @@ pub(in crate::client::shell) fn render_workspace_rows(
         });
         let spans = crate::ui::resolved_token_spans(
             row,
-            (icon, Style::default().fg(status_color(status, palette))),
-            Style::default()
-                .fg(status_color(status, palette))
-                .add_modifier(Modifier::DIM),
+            (icon, display_state_style(display, palette)),
+            display_state_style(display, palette).add_modifier(display_state_dim(display)),
             workspace_style,
             secondary_style,
             Style::default().fg(palette.overlay1),

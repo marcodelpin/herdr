@@ -349,6 +349,13 @@ While an agent is working, its state icon animates as a spinner: braille frames 
 animate_working = false
 ```
 
+An idle or done pane that reports the `wait` metadata token shows a blue hourglass instead of its idle icon, and one reporting `stale` shows a bold red hourglass. The hourglass turns over once a second while `animate_working` is on; the stale one never animates. Working, blocked, and unknown panes keep their own icon. Workspace rows and the mobile list roll the state up from the agents they aggregate, so a space holding one waiting agent shows the hourglass too. To keep the idle icon and read those tokens as text only, configure:
+
+```toml
+[ui]
+waiting_indicator = false
+```
+
 ### Sidebar row layouts
 
 The expanded desktop sidebar renders each inner array in `rows` as one line. These are the complete default layouts:

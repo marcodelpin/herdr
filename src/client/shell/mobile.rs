@@ -15,9 +15,9 @@ struct MobileItem {
     lines: Vec<Line<'static>>,
     background: Color,
     target: Option<ClientMobileTarget>,
-    /// The first line holds an animated Working glyph; it marks the composition
-    /// only when that line is inside the rendered viewport.
-    spinner: bool,
+    /// The clock the animated glyph on the first line advances on; it marks the
+    /// composition only when that line is inside the rendered viewport.
+    spinner: Option<SpinnerClock>,
 }
 
 impl MobileItem {
@@ -32,7 +32,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: None,
-            spinner: false,
+            spinner: None,
         }
     }
 
@@ -47,7 +47,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: Some(target),
-            spinner: false,
+            spinner: None,
         }
     }
 }
@@ -107,15 +107,19 @@ fn render_header_status(
     let tab_status = compact_tab_status(snapshot, workspace);
     let tab_width = display_width(&tab_status).saturating_add(1).min(area.width);
     let name_width = area.width.saturating_sub(tab_width);
+    let display = super::sidebar::workspace_display_state(
+        snapshot,
+        &[workspace],
+        workspace.agent_status,
+        config,
+    );
     put_text(
         buffer,
         area.x,
         area.y,
         name_width.min(3),
-        &format!(" {} ", agent_status_icon(workspace.agent_status, config)),
-        Style::default()
-            .fg(status_color(workspace.agent_status, palette))
-            .bg(palette.panel_bg),
+        &format!(" {} ", agent_display_icon(display, config)),
+        display_state_style(display, palette).bg(palette.panel_bg),
     );
     put_text(
         buffer,
@@ -298,14 +302,15 @@ fn render_agent_summary(
         }
         let (symbol, spinner) = match (config.status_indicators, status) {
             (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => {
-                (Some("\u{25c9}"), false)
+                (Some("\u{25c9}"), None)
             }
             (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => {
-                (Some("\u{25cf}"), false)
+                (Some("\u{25cf}"), None)
             }
-            (crate::config::StatusIndicatorStyle::Dots, _) => (None, false),
+            (crate::config::StatusIndicatorStyle::Dots, _) => (None, None),
             _ => {
-                let (icon, spinner) = lookup_status_icon(status, config, false);
+                let (icon, spinner) =
+                    lookup_display_icon(DisplayState::Status(status), config, false);
                 (Some(icon), spinner)
             }
         };
@@ -319,8 +324,8 @@ fn render_agent_summary(
             omitted = true;
             break;
         }
-        if spinner {
-            config.mark_spinner_drawn();
+        if let Some(clock) = spinner {
+            config.mark_spinner_drawn(clock);
         }
         if !separator.is_empty() {
             x = put_segment(
@@ -337,7 +342,7 @@ fn render_agent_summary(
         let color = if shown == 0 {
             match status {
                 AgentStatus::Done => config.palette.blue,
-                _ => status_color(status, &config.palette),
+                _ => display_state_color(DisplayState::Status(status), &config.palette),
             }
         } else {
             config.palette.overlay1
@@ -521,8 +526,8 @@ pub(super) fn render_mobile_switcher(
             let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
             let rect = Rect::new(content.x, y, content.width, height);
             buffer.set_style(rect, Style::default().bg(item.background));
-            if item.spinner && visible_start == item_start {
-                config.mark_spinner_drawn();
+            if let Some(clock) = item.spinner.filter(|_| visible_start == item_start) {
+                config.mark_spinner_drawn(clock);
             }
             for row in visible_start..visible_end {
                 let line = item.lines[row - item_start].clone();
@@ -719,7 +724,8 @@ fn mobile_items(
             } else {
                 Modifier::empty()
             };
-            let (icon, spinner) = lookup_status_icon(agent.agent_status, config, endpoint.stale());
+            let display = agent_display_state(agent, config);
+            let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
@@ -730,10 +736,10 @@ fn mobile_items(
                                 .fg(if endpoint.stale() {
                                     palette.overlay0
                                 } else {
-                                    status_color(agent.agent_status, palette)
+                                    display_state_color(display, palette)
                                 })
                                 .bg(background)
-                                .add_modifier(dim),
+                                .add_modifier(dim | display_state_modifier(display)),
                         ),
                         Span::styled(" ", Style::default().bg(background)),
                         Span::styled(
@@ -826,18 +832,23 @@ fn mobile_items(
             } else {
                 palette.text
             };
+            let display = super::sidebar::workspace_display_state(
+                endpoint.snapshot,
+                &[workspace],
+                workspace.agent_status,
+                config,
+            );
             let status = if endpoint.stale() {
                 palette.overlay0
             } else {
-                status_color(workspace.agent_status, palette)
+                display_state_color(display, palette)
             };
             let stale_detail = if endpoint.stale() {
                 format!(" · {}", mobile_endpoint_state(endpoint.status))
             } else {
                 String::new()
             };
-            let (icon, spinner) =
-                lookup_status_icon(workspace.agent_status, config, endpoint.stale());
+            let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
@@ -850,7 +861,10 @@ fn mobile_items(
                         ),
                         Span::styled(
                             icon,
-                            Style::default().fg(status).bg(background).add_modifier(dim),
+                            Style::default()
+                                .fg(status)
+                                .bg(background)
+                                .add_modifier(dim | display_state_modifier(display)),
                         ),
                         Span::styled(" ", Style::default().bg(background)),
                         Span::styled(

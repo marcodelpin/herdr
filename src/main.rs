@@ -337,6 +337,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # quarter circles for "symbols"). Other states stay static. Set false for a static icon.
 # animate_working = true
 
+# Show an hourglass instead of the idle icon while an idle or done pane reports the
+# "wait" metadata token, and a bold red one while it reports "stale". Set false to
+# keep the idle icon and read those tokens as text only.
+# waiting_indicator = true
+
 # Expanded agent rows. Built-ins are state_icon, state_text, machine, workspace, tab,
 # pane, agent, terminal_title, and terminal_title_stripped.
 # Custom values reported through pane metadata use a $name token.
