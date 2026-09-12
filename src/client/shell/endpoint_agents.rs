@@ -15,16 +15,14 @@ pub(super) fn render_collapsed(
         if row.agent.focused {
             buffer.set_style(rect, Style::default().bg(config.palette.active_row_bg));
         }
-        let initial = row.machine_label.chars().next().unwrap_or('?');
-        put_text(
+        let initial = row.machine_label.chars().next().unwrap_or('?').to_string();
+        let (icon, clock) = lookup_display_icon(row.agent.display, config, row.stale);
+        let written = put_text(
             buffer,
             rect.x,
             rect.y,
             rect.width,
-            &format!(
-                "{initial}{}",
-                drawn_display_icon(row.agent.display, config, row.stale)
-            ),
+            &format!("{initial}{icon}"),
             Style::default()
                 .fg(if row.stale {
                     config.palette.overlay0
@@ -36,6 +34,10 @@ pub(super) fn render_collapsed(
                 } else {
                     display_state_modifier(row.agent.display)
                 }),
+        );
+        config.mark_spinner_drawn_if(
+            clock,
+            icon_reached_frame(written, super::render::display_width(&initial), icon),
         );
         hits.endpoint_agents
             .push((rect, row.endpoint_id, row.agent.pane_id));
