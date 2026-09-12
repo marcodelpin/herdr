@@ -252,8 +252,7 @@ fn display_state_of<'a>(
     tokens: impl IntoIterator<Item = (&'a str, &'a str)>,
     waiting_indicator: bool,
 ) -> DisplayState {
-    use crate::api::schema::AgentStatus;
-    if !waiting_indicator || !matches!(status, AgentStatus::Idle | AgentStatus::Done) {
+    if !waiting_indicator || !display_state_overridable(status) {
         return DisplayState::Status(status);
     }
     let mut waiting = false;
@@ -273,6 +272,14 @@ fn display_state_of<'a>(
     } else {
         DisplayState::Status(status)
     }
+}
+
+/// Which statuses the WAITING / STALE tokens may override: a pane herdr already
+/// reads as busy keeps its own glyph. A rollup row asks the same question of the
+/// status it rolled up, so both go through here.
+fn display_state_overridable(status: crate::api::schema::AgentStatus) -> bool {
+    use crate::api::schema::AgentStatus;
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
 }
 
 /// `display_state_of` for the reported tokens of one pane or workspace.
@@ -383,9 +390,12 @@ fn drawn_display_icon(
     icon
 }
 
-/// `drawn_display_icon` for a row of the live, local snapshot.
-fn agent_display_icon(display: DisplayState, config: &ClientShellConfig) -> &'static str {
-    drawn_display_icon(display, config, false)
+/// Whether a `put_text` that wrote `written` columns reached the state icon, which
+/// sits `lead` columns into the text that call was given. The mark goes through
+/// `mark_spinner_drawn_if` with this, so a row too narrow for the glyph animates
+/// nothing.
+fn icon_reached_frame(written: u16, lead: u16, icon: &str) -> bool {
+    written >= lead.saturating_add(render::display_width(icon))
 }
 
 /// The glyph for the `state_icon` token of one rendered token row.

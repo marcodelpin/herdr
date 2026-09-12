@@ -237,11 +237,20 @@ pub(super) fn render_shell(
 ) -> ShellHitMap {
     let mut hits = ShellHitMap::default();
     if layout.mobile_header.height > 0 {
+        // A disconnected endpoint keeps showing its last snapshot, so the header
+        // reads cached state, not live activity: it stays static, exactly as the
+        // endpoint list rows already do.
+        let stale = state
+            .endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == state.active_endpoint_id)
+            .is_some_and(|endpoint| endpoint.status != ClientEndpointStatus::Online);
         super::mobile::render_mobile_header(
             buffer,
             layout.mobile_header,
             snapshot,
             config,
+            stale,
             &mut hits,
         );
     }
@@ -341,11 +350,22 @@ pub(super) fn put_segment(
     x.saturating_add(width)
 }
 
-pub(super) fn put_text(buffer: &mut Buffer, x: u16, y: u16, width: u16, text: &str, style: Style) {
+/// Writes `text` clipped to `width` columns and reports how many columns reached the
+/// frame. A caller drawing an animated glyph needs that count: a clipped icon must
+/// schedule no repaint.
+pub(super) fn put_text(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    style: Style,
+) -> u16 {
     if width == 0 || y >= buffer.area.bottom() || x >= buffer.area.right() {
-        return;
+        return 0;
     }
-    buffer.set_stringn(x, y, text, width as usize, style);
+    let (end, _) = buffer.set_stringn(x, y, text, width as usize, style);
+    end.saturating_sub(x)
 }
 
 pub(super) fn display_width(text: &str) -> u16 {

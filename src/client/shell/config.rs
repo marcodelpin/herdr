@@ -209,6 +209,15 @@ impl ClientShellConfig {
         }
     }
 
+    /// Records `clock` only when the glyph actually reached the frame. A row whose
+    /// icon budget could not hold it shows nothing, so scheduling a repaint for it
+    /// would spin the client on a frame that never changes.
+    pub(super) fn mark_spinner_drawn_if(&self, clock: Option<SpinnerClock>, drawn: bool) {
+        if let Some(clock) = clock.filter(|_| drawn) {
+            self.mark_spinner_drawn(clock);
+        }
+    }
+
     /// Forgets every animated glyph drawn so far, for a layer that covers them all.
     pub(super) fn clear_spinner_drawn(&self) {
         self.spinner_drawn.set(false);

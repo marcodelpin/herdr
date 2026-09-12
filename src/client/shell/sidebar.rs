@@ -78,14 +78,16 @@ pub(crate) fn render_collapsed_sidebar(
         );
         let display =
             workspace_display_state(snapshot, &[workspace], workspace.agent_status, config);
-        put_text(
+        let (icon, clock) = lookup_display_icon(display, config, false);
+        let written = put_text(
             buffer,
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            agent_display_icon(display, config),
+            icon,
             display_state_style(display, palette),
         );
+        config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 0, icon));
         hits.workspaces.push(WorkspaceHit {
             rect,
             endpoint_id: ClientEndpointId::Local,
@@ -146,14 +148,16 @@ pub(crate) fn render_collapsed_sidebar(
             }),
         );
         let display = agent_display_state(agent, config);
-        put_text(
+        let (icon, clock) = lookup_display_icon(display, config, false);
+        let written = put_text(
             buffer,
             rect.x.saturating_add(2),
             rect.y,
             rect.width.saturating_sub(2),
-            agent_display_icon(display, config),
+            icon,
             display_state_style(display, palette),
         );
+        config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 0, icon));
         hits.agents.push((rect, pane_id));
     }
     hits.sidebar_toggle = if area.is_empty() || workspace_area.width == 0 {
@@ -595,8 +599,14 @@ pub(super) fn displayed_workspace_status(
 }
 
 /// The display state of a workspace row: `status` is the row's rolled-up status, and
-/// the WAITING / STALE override comes from every token bag the row speaks for, its
-/// own workspaces' and those of the agents inside them. So a space whose panes are
+/// the WAITING / STALE override is aggregated from the DERIVED display state of each
+/// row the rollup speaks for - the workspaces' own reported tokens (the
+/// `workspace.report_metadata` API writes those, see `handle_workspace_report_metadata`)
+/// and every agent inside them.
+///
+/// Aggregating derived states rather than raw tokens is what keeps an ineligible
+/// pane out of the row: an Unknown or Working agent keeps its own glyph, so a `wait`
+/// or `stale` still cached for it never colours the space. So a space whose panes are
 /// idle but one of which reports `wait` shows the hourglass, and one reporting
 /// `stale` wins over it.
 pub(in crate::client::shell) fn workspace_display_state(
@@ -605,22 +615,34 @@ pub(in crate::client::shell) fn workspace_display_state(
     status: crate::api::schema::AgentStatus,
     config: &ClientShellConfig,
 ) -> DisplayState {
-    let tokens = workspaces
+    if !display_state_overridable(status) {
+        return DisplayState::Status(status);
+    }
+    let own = workspaces
         .iter()
-        .flat_map(|workspace| workspace.tokens.iter())
-        .chain(
-            snapshot
-                .agents
+        .map(|workspace| display_state(status, &workspace.tokens, config.waiting_indicator));
+    let agents = snapshot
+        .agents
+        .iter()
+        .filter(|agent| {
+            workspaces
                 .iter()
-                .filter(|agent| {
-                    workspaces
-                        .iter()
-                        .any(|workspace| workspace.workspace_id == agent.workspace_id)
-                })
-                .flat_map(|agent| agent.tokens.iter()),
-        )
-        .map(|(key, value)| (key.as_str(), value.as_str()));
-    display_state_of(status, tokens, config.waiting_indicator)
+                .any(|workspace| workspace.workspace_id == agent.workspace_id)
+        })
+        .map(|agent| agent_display_state(agent, config));
+    let mut waiting = false;
+    for display in own.chain(agents) {
+        match display {
+            DisplayState::Stale => return DisplayState::Stale,
+            DisplayState::Waiting => waiting = true,
+            DisplayState::Status(_) => {}
+        }
+    }
+    if waiting {
+        DisplayState::Waiting
+    } else {
+        DisplayState::Status(status)
+    }
 }
 
 pub(super) fn displayed_workspace_display_state(

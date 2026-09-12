@@ -269,7 +269,7 @@ fn popup(a: Rect, w: u16, h: u16) -> Option<Rect> {
 fn button(b: &mut Buffer, r: Rect, t: &str, s: Style) {
     b.set_style(r, s);
     let w = display_width(t).min(r.width);
-    put_text(b, r.x + (r.width - w) / 2, r.y, w, t, s)
+    put_text(b, r.x + (r.width - w) / 2, r.y, w, t, s);
 }
 fn row(i: Rect, ws: &[u16], gap: u16, off: u16) -> Vec<Rect> {
     let total = ws.iter().sum::<u16>() + gap * (ws.len().saturating_sub(1) as u16);

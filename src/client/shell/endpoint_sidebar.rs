@@ -92,12 +92,13 @@ pub(super) fn render_collapsed(
                 workspace.agent_status,
                 config,
             );
-            put_text(
+            let (icon, clock) = lookup_display_icon(display, config, stale);
+            let written = put_text(
                 buffer,
                 rect.x.saturating_add(number_width),
                 rect.y,
                 rect.width.saturating_sub(number_width),
-                drawn_display_icon(display, config, stale),
+                icon,
                 Style::default()
                     .fg(if stale {
                         palette.overlay0
@@ -106,6 +107,7 @@ pub(super) fn render_collapsed(
                     })
                     .add_modifier(dim | display_state_modifier(display)),
             );
+            config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 0, icon));
             hits.workspaces.push(WorkspaceHit {
                 rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
