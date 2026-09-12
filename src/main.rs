@@ -339,6 +339,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # quarter circles for "symbols"). Other states stay static. Set false for a static icon.
 # animate_working = true
 
+# Show an hourglass instead of the idle icon while an idle or done pane reports the
+# "wait" metadata token, and a bold red one while it reports "stale". Set false to
+# keep the idle icon and read those tokens as text only.
+# waiting_indicator = true
+
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
 # accent = "cyan"

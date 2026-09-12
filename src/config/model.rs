@@ -968,6 +968,9 @@ pub struct UiConfig {
     pub status_indicators: StatusIndicatorStyle,
     /// Animate the Working state icon as a spinner; other states stay static. Default: true.
     pub animate_working: bool,
+    /// Show the WAITING / STALE state icon on an idle or done pane that reports the
+    /// `wait` / `stale` metadata tokens, instead of its idle icon. Default: true.
+    pub waiting_indicator: bool,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1194,6 +1197,7 @@ impl Default for UiConfig {
             _legacy_agent_panel_scope: None,
             status_indicators: StatusIndicatorStyle::Dots,
             animate_working: true,
+            waiting_indicator: true,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1467,6 +1471,20 @@ animate_working = false
         )
         .unwrap();
         assert!(!config.ui.animate_working);
+    }
+
+    #[test]
+    fn waiting_indicator_defaults_to_true_and_parses_false() {
+        assert!(Config::default().ui.waiting_indicator);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+waiting_indicator = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.ui.waiting_indicator);
     }
 
     #[test]

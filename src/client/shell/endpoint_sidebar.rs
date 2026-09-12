@@ -158,19 +158,25 @@ pub(super) fn render_collapsed(
                     })
                     .add_modifier(dim),
             );
+            let display = super::sidebar::workspace_display_state(
+                snapshot,
+                &[workspace],
+                workspace.agent_status,
+                config,
+            );
             put_text(
                 buffer,
                 rect.x.saturating_add(number_width),
                 rect.y,
                 rect.width.saturating_sub(number_width),
-                drawn_status_icon(workspace.agent_status, config, stale),
+                drawn_display_icon(display, config, stale),
                 Style::default()
                     .fg(if stale {
                         palette.overlay0
                     } else {
-                        status_color(workspace.agent_status, palette)
+                        display_state_color(display, palette)
                     })
-                    .add_modifier(dim),
+                    .add_modifier(dim | display_state_modifier(display)),
             );
             hits.workspaces.push(WorkspaceHit {
                 rect,
@@ -456,7 +462,12 @@ pub(super) fn render_expanded(
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
-                    status,
+                    super::sidebar::displayed_workspace_display_state(
+                        snapshot,
+                        workspace,
+                        collapsed_groups,
+                        config,
+                    ),
                     stale,
                     entry,
                     tokens,
