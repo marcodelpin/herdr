@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use super::TransmitReceipt;
+
 pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -10,10 +12,21 @@ pub(super) enum HealthAction {
     Expired,
 }
 
+enum ProbeState {
+    /// No probe is outstanding: the endpoint is inside its heartbeat interval, or it answered.
+    Idle,
+    /// The ping is in the writer queue, behind frames the peer is still taking. The endpoint is
+    /// provably alive while its own bytes are being accepted, so no reply is owed yet and no
+    /// timer runs (bd herdr-7ak).
+    Draining(TransmitReceipt),
+    /// The writer accepted the ping's last byte at this instant. The reply window runs from here.
+    Sent(Instant),
+}
+
 pub(super) struct EndpointHealth {
     connected_at: Instant,
     last_received: Instant,
-    ping_sent_at: Option<Instant>,
+    probe: ProbeState,
     ready: bool,
 }
 
@@ -22,14 +35,14 @@ impl EndpointHealth {
         Self {
             connected_at: now,
             last_received: now,
-            ping_sent_at: None,
+            probe: ProbeState::Idle,
             ready: false,
         }
     }
 
     pub(super) fn received(&mut self, now: Instant) {
         self.last_received = now;
-        self.ping_sent_at = None;
+        self.probe = ProbeState::Idle;
     }
 
     pub(super) fn ready(&mut self) {
@@ -39,12 +52,15 @@ impl EndpointHealth {
     pub(super) fn action(&self, now: Instant) -> HealthAction {
         let initial_snapshot_expired =
             !self.ready && now.saturating_duration_since(self.connected_at) >= HEARTBEAT_TIMEOUT;
-        let probe_expired = self
-            .ping_sent_at
-            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= HEARTBEAT_TIMEOUT);
+        let probe_expired = match self.probe {
+            ProbeState::Sent(sent_at) => {
+                now.saturating_duration_since(sent_at) >= HEARTBEAT_TIMEOUT
+            }
+            ProbeState::Idle | ProbeState::Draining(_) => false,
+        };
         if initial_snapshot_expired || probe_expired {
             HealthAction::Expired
-        } else if self.ping_sent_at.is_none()
+        } else if matches!(self.probe, ProbeState::Idle)
             && now.saturating_duration_since(self.last_received) >= HEARTBEAT_INTERVAL
         {
             HealthAction::Ping
@@ -53,8 +69,31 @@ impl EndpointHealth {
         }
     }
 
+    /// The ping has been handed to the transport. `receipt` reports the instant the writer
+    /// accepts its last byte, which is when the reply window opens.
+    pub(super) fn ping_queued(&mut self, receipt: TransmitReceipt) {
+        self.probe = ProbeState::Draining(receipt);
+    }
+
+    /// Promotes a queued ping to a sent one once its receipt reports a transmission instant.
+    /// Called on every health tick, before the action is read.
+    pub(super) fn settle(&mut self) {
+        if let ProbeState::Draining(receipt) = &self.probe {
+            if let Some(transmitted_at) = receipt.transmitted_at() {
+                self.ping_sent(transmitted_at);
+            }
+        }
+    }
+
     pub(super) fn ping_sent(&mut self, now: Instant) {
-        self.ping_sent_at = Some(now);
+        self.probe = ProbeState::Sent(now);
+    }
+
+    /// The probe is still queued behind bytes the peer is taking. Test-only: production code
+    /// reads the state through `action`.
+    #[cfg(test)]
+    pub(super) fn is_draining(&self) -> bool {
+        matches!(self.probe, ProbeState::Draining(_))
     }
 }
 
