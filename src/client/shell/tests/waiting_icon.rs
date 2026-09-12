@@ -116,6 +116,23 @@ fn agent_icon<'a>(state: &ClientShellState, frame: &'a FrameData) -> &'a crate::
     cell_at(frame, rect.x.saturating_add(1), rect.y)
 }
 
+/// The state icon of the agent row speaking for `pane_id`, so a frame holding several
+/// agent rows can be read row by row rather than by position.
+fn agent_icon_for<'a>(
+    state: &ClientShellState,
+    frame: &'a FrameData,
+    pane_id: &str,
+) -> &'a crate::protocol::CellData {
+    let rect = state
+        .hits
+        .agents
+        .iter()
+        .find(|(_, id)| id == pane_id)
+        .unwrap_or_else(|| panic!("a rendered agent row for {pane_id}"))
+        .0;
+    cell_at(frame, rect.x.saturating_add(1), rect.y)
+}
+
 fn assert_icon(
     cell: &crate::protocol::CellData,
     glyph: &str,
@@ -159,6 +176,12 @@ fn compose_waiting_periods_later(state: &mut ClientShellState, periods: u32) -> 
 /// composition drew.
 fn next_waiting_frame_due(state: &ClientShellState) -> std::time::Instant {
     state.spinner_epoch + WAITING_SPINNER_FRAME_PERIOD * (state.config.waiting_frame as u32 + 1)
+}
+
+/// The first instant at which the Working spinner turns over from the frame the last
+/// composition drew.
+fn next_working_frame_due(state: &ClientShellState) -> std::time::Instant {
+    state.spinner_epoch + WORKING_SPINNER_FRAME_PERIOD * (state.config.spinner_frame as u32 + 1)
 }
 
 #[test]
@@ -740,19 +763,16 @@ fn a_collapsed_endpoint_row_too_narrow_for_the_icon_schedules_no_repaint() {
     assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
 }
 
-/// The default waiting snapshot pinned to a `width`-column sidebar whose space rows
-/// are `git_status` then `state_icon`: the ahead/behind counts are a FIXED token, so
-/// they are never dropped from the span list and they alone decide whether the glyph
-/// behind them survives the clip. The workspace reports `wait` itself and holds no
-/// agents, so that row is the frame's only Waiting glyph.
-fn git_status_before_the_icon_state(width: u16) -> ClientShellState {
+/// The default waiting snapshot pinned to a `width`-column sidebar whose space rows are
+/// `row`: the ahead/behind counts are a FIXED token, so they are never dropped from the
+/// span list and they alone decide whether a glyph behind them survives the clip. The
+/// workspace reports `wait` itself and holds no agents, so that row is the frame's only
+/// Waiting glyph.
+fn space_row_state(width: u16, row: Vec<crate::config::SpaceSidebarToken>) -> ClientShellState {
     let mut config = config_with(StatusIndicatorStyle::Symbols);
     config.ui.sidebar_min_width = width;
     config.ui.sidebar_max_width = width;
-    config.ui.sidebar.spaces.rows = vec![vec![
-        crate::config::SpaceSidebarToken::GitStatus,
-        crate::config::SpaceSidebarToken::StateIcon,
-    ]];
+    config.ui.sidebar.spaces.rows = vec![row];
     let mut projected = snapshot();
     projected.workspaces[0].git_ahead_behind = Some((1000, 1000));
     projected.workspaces[0].tokens = vec![("wait".to_owned(), "x".to_owned())];
@@ -761,6 +781,17 @@ fn git_status_before_the_icon_state(width: u16) -> ClientShellState {
     state.set_snapshot(Box::new(projected));
     state.set_pane_surface(surface());
     state
+}
+
+/// The counts first, one `state_icon` behind them.
+fn git_status_before_the_icon_state(width: u16) -> ClientShellState {
+    space_row_state(
+        width,
+        vec![
+            crate::config::SpaceSidebarToken::GitStatus,
+            crate::config::SpaceSidebarToken::StateIcon,
+        ],
+    )
 }
 
 #[test]
@@ -926,6 +957,148 @@ fn an_indented_switcher_row_too_narrow_for_the_icon_schedules_no_repaint() {
     assert!(
         !state.config.waiting_drawn.get(),
         "an indented switcher item with no room for its icon scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+}
+
+/// The default snapshot as a SINGLE-endpoint desktop layout holding one Working pane and
+/// one Idle pane reporting `wait`, with the Local endpoint connected or not. One endpoint
+/// is what makes `render_shell` draw the plain sidebar, whose space rows and agent panel
+/// both speak for Local, so the whole composition's animation hangs on that endpoint's
+/// connection state.
+fn local_working_and_waiting_state(connected: bool) -> ClientShellState {
+    let config = config_with(StatusIndicatorStyle::Dots);
+    let mut projected = snapshot();
+    projected.workspaces[0].agent_status = AgentStatus::Working;
+    projected.tabs[0].agent_status = AgentStatus::Working;
+    let mut waiting = waiting_agent(
+        "pane_2",
+        "ws_1",
+        AgentStatus::Idle,
+        &[("wait", "\u{29d7} mon 1 8m")],
+    );
+    waiting.focused = false;
+    projected.agents = vec![
+        waiting_agent("pane_1", "ws_1", AgentStatus::Working, &[]),
+        waiting,
+    ];
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    if !connected {
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    }
+    state
+}
+
+#[test]
+fn a_disconnected_local_endpoint_keeps_the_single_endpoint_sidebar_static() {
+    // Control: the same rows on a connected Local endpoint animate on both clocks.
+    let mut state = local_working_and_waiting_state(true);
+    let live = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("connected single-endpoint frame");
+    assert_eq!(agent_icon_for(&state, &live, "pane_2").symbol, WAITING);
+    assert!(
+        state.config.spinner_drawn.get(),
+        "control: a connected Working row scheduled no Working repaint"
+    );
+    assert!(
+        state.config.waiting_drawn.get(),
+        "control: a connected Waiting row scheduled no Waiting repaint"
+    );
+    assert!(state.tick_working_spinner(next_working_frame_due(&state)));
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+    let turned = compose_waiting_periods_later(&mut state, 1);
+    assert_eq!(
+        agent_icon_for(&state, &turned, "pane_2").symbol,
+        WAITING_TURNED,
+        "control: a connected Waiting row did not turn over"
+    );
+
+    // A disconnected Local endpoint keeps showing its last snapshot, so both cached rows
+    // draw their static glyph and neither clock is scheduled.
+    let mut state = local_working_and_waiting_state(false);
+    let first = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("disconnected single-endpoint frame");
+    assert_eq!(agent_icon_for(&state, &first, "pane_2").symbol, WAITING);
+    assert_eq!(
+        agent_icon_for(&state, &first, "pane_1").symbol,
+        status_icon(AgentStatus::Working, StatusIndicatorStyle::Dots, None),
+        "a disconnected endpoint's cached Working row drew a spinner frame"
+    );
+    assert!(
+        !state.config.spinner_drawn.get(),
+        "a disconnected endpoint's cached Working row scheduled Working repaints"
+    );
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a disconnected endpoint's cached Waiting row scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_working_frame_due(&state)));
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    // A whole Waiting period is several Working periods, so an animation on either clock
+    // would show here.
+    let later = compose_waiting_periods_later(&mut state, 1);
+    assert_eq!(frame_text(&first), frame_text(&later));
+}
+
+#[test]
+fn a_row_listing_the_state_icon_twice_animates_the_visible_first_glyph() {
+    // 18 columns leave the row 14 text columns. The first glyph is drawn at column 0; the
+    // counts and their separators lay the second one out at column 16, outside them.
+    let mut state = space_row_state(
+        18,
+        vec![
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::GitStatus,
+            crate::config::SpaceSidebarToken::StateIcon,
+        ],
+    );
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("two state icons, the second clipped");
+    let blue = state.config.palette.blue;
+    assert_icon(workspace_icon(&state, &frame), WAITING, blue, false);
+    assert!(
+        state.config.waiting_drawn.get(),
+        "the visible first hourglass scheduled no Waiting repaint"
+    );
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    let later = compose_waiting_periods_later(&mut state, 1);
+    assert_eq!(
+        workspace_icon(&state, &later).symbol,
+        WAITING_TURNED,
+        "the visible first hourglass did not turn over"
+    );
+}
+
+#[test]
+fn a_row_whose_state_icons_are_all_clipped_schedules_no_repaint() {
+    // The inverse control: the counts come first, so BOTH glyphs are laid out past the
+    // row's 14 text columns - at 14 and at 16 - and neither reaches the frame.
+    let mut state = space_row_state(
+        18,
+        vec![
+            crate::config::SpaceSidebarToken::GitStatus,
+            crate::config::SpaceSidebarToken::StateIcon,
+            crate::config::SpaceSidebarToken::StateIcon,
+        ],
+    );
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("two state icons, both clipped");
+    let text = frame_text(&frame);
+    assert!(
+        !text.contains(WAITING),
+        "a clipped state icon still reached the frame: {text}"
+    );
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a row whose every state icon the clip dropped still scheduled Waiting repaints"
     );
     assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
 }
