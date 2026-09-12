@@ -426,6 +426,99 @@ mod tests {
     }
 
     #[test]
+    fn a_tracked_frame_resolves_only_once_the_peer_has_taken_all_of_it() {
+        // bd herdr-7ak: the health probe timer runs from the instant the writer accepted the
+        // ping's last byte. A frame no peer is reading is larger than any socket or pipe buffer
+        // here, so its receipt must stay pending until the peer drains it.
+        let (stream, mut peer, path) = streams();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        let paste = ClientMessage::Input {
+            data: vec![b'p'; 2 * 1024 * 1024],
+        };
+        let mut expected = Vec::new();
+        crate::protocol::write_message(&mut expected, &paste).unwrap();
+        let expected_len = expected.len();
+        let queued_at = Instant::now();
+        let receipt = transport.send_tracked(&paste, queued_at).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            receipt.transmitted_at().is_none(),
+            "a frame no peer has read reported itself transmitted"
+        );
+
+        let (done, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 16 * 1024];
+            while bytes.len() < expected_len && Instant::now() < deadline {
+                match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
+                    crate::ipc::LocalStreamReadCount::Data(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    crate::ipc::LocalStreamReadCount::Pending => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    crate::ipc::LocalStreamReadCount::Closed => break,
+                }
+            }
+            done.send(bytes.len()).unwrap();
+        });
+        let read = received.recv_timeout(Duration::from_secs(90)).unwrap();
+        reader.join().unwrap();
+        assert_eq!(read, expected_len);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while receipt.transmitted_at().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let transmitted = receipt
+            .transmitted_at()
+            .expect("the writer accepted every byte, so the receipt must report an instant");
+        assert!(transmitted >= queued_at);
+        drop(transport);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stalled_frame_never_reports_itself_transmitted() {
+        // The stall timeout from herdr-8qd still cuts a frame that stops moving, and the health
+        // probe queued behind it must never read as sent: the receipt stays pending and the
+        // writer surfaces its own timeout.
+        let (stream, peer, path) = streams();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        let receipt = transport
+            .send_tracked(
+                &ClientMessage::Input {
+                    data: vec![b's'; 2 * 1024 * 1024],
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + WRITE_TIMEOUT + Duration::from_secs(15);
+        let mut failure = None;
+        while failure.is_none() && Instant::now() < deadline {
+            failure = transport.take_error();
+            if failure.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert_eq!(
+            failure
+                .expect("a peer that never reads must trip the writer stall timeout")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            receipt.transmitted_at().is_none(),
+            "a frame the peer never took reported itself transmitted"
+        );
+        drop(transport);
+        drop(peer);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn native_endpoint_writer_delivers_ordered_protocol_frames() {
         let (stream, mut peer, path) = streams();
         let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
