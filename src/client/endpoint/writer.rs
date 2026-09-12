@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use interprocess::local_socket::traits::Stream as _;
 
-use super::EndpointTransport;
+use super::{EndpointTransport, TransmitReceipt};
 use crate::ipc::LocalStream;
 use crate::protocol::ClientMessage;
 
@@ -17,8 +17,15 @@ const IO_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
 struct FrameBatch {
-    frames: Vec<Vec<u8>>,
+    frames: Vec<QueuedFrame>,
     bytes: usize,
+}
+
+struct QueuedFrame {
+    bytes: Vec<u8>,
+    /// `receipt`, when the caller asked for one, is resolved with the instant the peer accepted
+    /// the frame's last byte.
+    receipt: Option<TransmitReceipt>,
 }
 
 enum WriterCommand {
@@ -85,22 +92,22 @@ impl NativeEndpointTransport {
         })
     }
 
-    fn enqueue_frame(&mut self, frame: Vec<u8>) -> io::Result<()> {
+    fn enqueue_frame(&mut self, frame: QueuedFrame) -> io::Result<()> {
         if let Some(batch) = &self.pending_batch {
             let mut batch = batch
                 .lock()
                 .map_err(|_| io::Error::other("endpoint batch lock poisoned"))?;
             // An empty batch has already been claimed by the worker. Never append to it.
             if !batch.frames.is_empty()
-                && frame.len() <= MAX_BATCH_BYTES.saturating_sub(batch.bytes)
+                && frame.bytes.len() <= MAX_BATCH_BYTES.saturating_sub(batch.bytes)
             {
-                batch.bytes += frame.len();
+                batch.bytes += frame.bytes.len();
                 batch.frames.push(frame);
                 return Ok(());
             }
         }
         let batch = Arc::new(Mutex::new(FrameBatch {
-            bytes: frame.len(),
+            bytes: frame.bytes.len(),
             frames: vec![frame],
         }));
         self.sender
@@ -118,10 +125,12 @@ impl NativeEndpointTransport {
     pub(crate) fn stop_handle(&self) -> Arc<AtomicBool> {
         self.stopped.clone()
     }
-}
 
-impl EndpointTransport for NativeEndpointTransport {
-    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+    fn enqueue(
+        &mut self,
+        message: &ClientMessage,
+        receipt: Option<TransmitReceipt>,
+    ) -> io::Result<()> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -143,9 +152,31 @@ impl EndpointTransport for NativeEndpointTransport {
         {
             return Err(queue_full());
         }
-        self.enqueue_frame(frame).inspect_err(|_| {
+        self.enqueue_frame(QueuedFrame {
+            bytes: frame,
+            receipt,
+        })
+        .inspect_err(|_| {
             self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
         })
+    }
+}
+
+impl EndpointTransport for NativeEndpointTransport {
+    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+        self.enqueue(message, None)
+    }
+
+    fn send_tracked(
+        &mut self,
+        message: &ClientMessage,
+        _sent_at: Instant,
+    ) -> io::Result<TransmitReceipt> {
+        // The worker owns the wire, so the frame is only queued here; the receipt carries the
+        // instant it is actually written.
+        let receipt = TransmitReceipt::pending();
+        self.enqueue(message, Some(receipt.clone()))?;
+        Ok(receipt)
     }
 
     fn disconnect(&mut self) {
@@ -207,9 +238,16 @@ fn write_batch(
         if stopped.load(Ordering::Acquire) {
             break;
         }
-        let result = write_frame(writer, &frame, stopped);
-        queued_bytes.fetch_sub(frame.len(), Ordering::AcqRel);
+        let result = write_frame(writer, &frame.bytes, stopped);
+        queued_bytes.fetch_sub(frame.bytes.len(), Ordering::AcqRel);
         result?;
+        // write_frame also returns Ok when a stop cancelled it mid-frame, which leaves the rest
+        // of the frame unwritten: only an uncancelled write has reached the peer.
+        if let Some(receipt) = frame.receipt {
+            if !stopped.load(Ordering::Acquire) {
+                receipt.complete(Instant::now());
+            }
+        }
     }
     Ok(())
 }
