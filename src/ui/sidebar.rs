@@ -103,6 +103,16 @@ pub(crate) fn agent_panel_entries_from(
     entries
 }
 
+/// One rendered token row: the spans to draw, and the column the `state_icon` glyph
+/// starts at inside them. The caller clips the row to the same `max_width` it asked
+/// for, so the column is what tells a glyph that reached the frame from one the clip
+/// dropped; fixed tokens are never deactivated, so a row can be laid out wider than
+/// the budget.
+pub(crate) struct ResolvedRow {
+    pub spans: Vec<Span<'static>>,
+    pub state_icon_column: Option<usize>,
+}
+
 pub(crate) fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
@@ -112,7 +122,7 @@ pub(crate) fn resolved_token_spans(
     custom_style: Style,
     palette: &Palette,
     max_width: usize,
-) -> Vec<Span<'static>> {
+) -> ResolvedRow {
     let fixed_widths = resolved
         .iter()
         .map(|token| match &token.kind {
@@ -212,18 +222,23 @@ pub(crate) fn resolved_token_spans(
         }
     }
 
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = 0usize;
+    let mut state_icon_column = None;
     for (position, index) in visible_indices.iter().copied().enumerate() {
         let token = &resolved[index];
         if position > 0 {
             let previous = &resolved[visible_indices[position - 1]];
+            let separator = tokens::separator(previous, token);
+            column += display_width(separator);
             spans.push(Span::styled(
-                tokens::separator(previous, token),
+                separator,
                 Style::default()
                     .fg(palette.overlay0)
                     .add_modifier(Modifier::DIM),
             ));
         }
+        let emitted = spans.len();
         match &token.kind {
             ResolvedTokenKind::StateIcon => spans.push(Span::styled(
                 state_icon.0.to_string(),
@@ -272,8 +287,18 @@ pub(crate) fn resolved_token_spans(
                 ));
             }
         }
+        if matches!(token.kind, ResolvedTokenKind::StateIcon) {
+            state_icon_column = Some(column);
+        }
+        column += spans[emitted..]
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum::<usize>();
     }
-    spans
+    ResolvedRow {
+        spans,
+        state_icon_column,
+    }
 }
 
 fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) -> Style {

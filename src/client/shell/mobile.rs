@@ -15,9 +15,24 @@ struct MobileItem {
     lines: Vec<Line<'static>>,
     background: Color,
     target: Option<ClientMobileTarget>,
-    /// The clock the animated glyph on the first line advances on; it marks the
-    /// composition only when that line is inside the rendered viewport.
-    spinner: Option<SpinnerClock>,
+    /// The animated glyph on the first line, when there is one.
+    spinner: Option<ItemSpinner>,
+}
+
+/// The animated glyph on an item's first line: the clock it advances on, the columns
+/// drawn before it on that line, and the glyph itself. The item marks the composition
+/// only when that line is inside the viewport AND the row is wide enough to have
+/// emitted the glyph, so a switcher a few columns wide animates nothing.
+struct ItemSpinner {
+    clock: SpinnerClock,
+    lead: u16,
+    icon: &'static str,
+}
+
+impl ItemSpinner {
+    fn new(clock: Option<SpinnerClock>, lead: u16, icon: &'static str) -> Option<Self> {
+        clock.map(|clock| Self { clock, lead, icon })
+    }
 }
 
 impl MobileItem {
@@ -534,8 +549,12 @@ pub(super) fn render_mobile_switcher(
             let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
             let rect = Rect::new(content.x, y, content.width, height);
             buffer.set_style(rect, Style::default().bg(item.background));
-            if let Some(clock) = item.spinner.filter(|_| visible_start == item_start) {
-                config.mark_spinner_drawn(clock);
+            if let Some(spinner) = &item.spinner {
+                config.mark_spinner_drawn_if(
+                    Some(spinner.clock),
+                    visible_start == item_start
+                        && icon_reached_frame(content.width, spinner.lead, spinner.icon),
+                );
             }
             for row in visible_start..visible_end {
                 let line = item.lines[row - item_start].clone();
@@ -734,10 +753,12 @@ fn mobile_items(
             };
             let display = agent_display_state(agent, config);
             let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
+            let prefix = "  ";
+            let spinner = ItemSpinner::new(spinner, display_width(prefix), icon);
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
-                        Span::styled("  ", Style::default().bg(background)),
+                        Span::styled(prefix, Style::default().bg(background)),
                         Span::styled(
                             icon,
                             Style::default()
@@ -857,11 +878,13 @@ fn mobile_items(
                 String::new()
             };
             let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
+            let prefix = format!("  {connector}");
+            let spinner = ItemSpinner::new(spinner, display_width(&prefix), icon);
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
                         Span::styled(
-                            format!("  {connector}"),
+                            prefix,
                             Style::default()
                                 .fg(palette.overlay0)
                                 .bg(background)

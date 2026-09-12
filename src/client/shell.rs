@@ -375,21 +375,6 @@ fn lookup_display_icon(
     )
 }
 
-/// The state icon for a glyph the caller draws into the frame right now. An animated
-/// frame marks the composition so the client timer keeps advancing it, so call this
-/// only where the glyph is actually emitted.
-fn drawn_display_icon(
-    display: DisplayState,
-    config: &ClientShellConfig,
-    stale: bool,
-) -> &'static str {
-    let (icon, clock) = lookup_display_icon(display, config, stale);
-    if let Some(clock) = clock {
-        config.mark_spinner_drawn(clock);
-    }
-    icon
-}
-
 /// Whether a `put_text` that wrote `written` columns reached the state icon, which
 /// sits `lead` columns into the text that call was given. The mark goes through
 /// `mark_spinner_drawn_if` with this, so a row too narrow for the glyph animates
@@ -398,23 +383,37 @@ fn icon_reached_frame(written: u16, lead: u16, icon: &str) -> bool {
     written >= lead.saturating_add(render::display_width(icon))
 }
 
-/// The glyph for the `state_icon` token of one rendered token row.
-/// `resolved_token_spans` draws the icon only for that token, so a row without it
-/// gets the static glyph and never marks the composition.
+/// The glyph and the clock for the `state_icon` token of one rendered token row,
+/// recording nothing. `resolved_token_spans` draws the icon only for that token, so a
+/// row without it gets the static glyph and no clock at all. The caller marks the
+/// composition through `token_row_icon_reached_frame` once the row is laid out.
 fn token_row_state_icon(
     row: &[crate::ui::ResolvedToken],
     display: DisplayState,
     config: &ClientShellConfig,
     stale: bool,
-) -> &'static str {
+) -> (&'static str, Option<SpinnerClock>) {
     if row
         .iter()
         .any(|token| matches!(token.kind, crate::ui::ResolvedTokenKind::StateIcon))
     {
-        drawn_display_icon(display, config, stale)
+        lookup_display_icon(display, config, stale)
     } else {
-        display_state_icon(display, config.status_indicators, None)
+        (
+            display_state_icon(display, config.status_indicators, None),
+            None,
+        )
     }
+}
+
+/// Whether the state icon of a laid-out token row survives the clip: `column` is where
+/// `resolved_token_spans` placed the glyph and `max_width` is the width the row's
+/// `Paragraph` renders into. Fixed tokens are never dropped from the span list, so a
+/// glyph can be laid out past the budget and never reach the frame.
+fn token_row_icon_reached_frame(column: Option<usize>, icon: &str, max_width: u16) -> bool {
+    column.is_some_and(|column| {
+        icon_reached_frame(max_width, u16::try_from(column).unwrap_or(u16::MAX), icon)
+    })
 }
 
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {

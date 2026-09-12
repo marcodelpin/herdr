@@ -352,20 +352,24 @@ pub(super) fn render_agent_row(
     };
     for (index, tokens) in rows.iter().take(rect.height as usize).enumerate() {
         let indent = if index == 0 { 1 } else { 3 };
-        let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
-        spans.extend(crate::ui::resolved_token_spans(
+        let (icon, clock) = token_row_state_icon(tokens, row.display, config, stale);
+        let row_width = rect.width.saturating_sub(indent as u16);
+        let line = crate::ui::resolved_token_spans(
             tokens,
-            (
-                token_row_state_icon(tokens, row.display, config, stale),
-                icon_style,
-            ),
+            (icon, icon_style),
             status_style,
             name_style,
             secondary,
             secondary,
             palette,
-            rect.width.saturating_sub(indent as u16) as usize,
-        ));
+            row_width as usize,
+        );
+        config.mark_spinner_drawn_if(
+            clock,
+            token_row_icon_reached_frame(line.state_icon_column, icon, row_width),
+        );
+        let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
+        spans.extend(line.spans);
         Paragraph::new(Line::from(spans)).style(row_style).render(
             Rect::new(rect.x, rect.y + index as u16, rect.width, 1),
             buffer,

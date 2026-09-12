@@ -604,6 +604,10 @@ pub(super) fn displayed_workspace_status(
 /// `workspace.report_metadata` API writes those, see `handle_workspace_report_metadata`)
 /// and every agent inside them.
 ///
+/// The rollup returns the plain status without inspecting a single agent when
+/// `waiting_indicator` is off, so the disabled feature costs nothing: every state it
+/// would aggregate is `Status(status)` under that flag anyway.
+///
 /// Aggregating derived states rather than raw tokens is what keeps an ineligible
 /// pane out of the row: an Unknown or Working agent keeps its own glyph, so a `wait`
 /// or `stale` still cached for it never colours the space. So a space whose panes are
@@ -615,7 +619,7 @@ pub(in crate::client::shell) fn workspace_display_state(
     status: crate::api::schema::AgentStatus,
     config: &ClientShellConfig,
 ) -> DisplayState {
-    if !display_state_overridable(status) {
+    if !config.waiting_indicator || !display_state_overridable(status) {
         return DisplayState::Status(status);
     }
     let own = workspaces
@@ -704,7 +708,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         if y >= area.bottom() {
             break;
         }
-        let icon = token_row_state_icon(row, display, config, stale);
+        let (icon, clock) = token_row_state_icon(row, display, config, stale);
         let mut x = area.x;
         if entry.indented {
             let prefix = if row_index == 0 {
@@ -748,7 +752,8 @@ pub(in crate::client::shell) fn render_workspace_rows(
         } else {
             palette.overlay0
         });
-        let spans = crate::ui::resolved_token_spans(
+        let row_width = area.right().saturating_sub(2).saturating_sub(x);
+        let line = crate::ui::resolved_token_spans(
             row,
             (icon, display_state_style(display, palette)),
             display_state_style(display, palette).add_modifier(display_state_dim(display)),
@@ -756,12 +761,13 @@ pub(in crate::client::shell) fn render_workspace_rows(
             secondary_style,
             Style::default().fg(palette.overlay1),
             palette,
-            area.right().saturating_sub(2).saturating_sub(x) as usize,
+            row_width as usize,
         );
-        Paragraph::new(Line::from(spans)).render(
-            Rect::new(x, y, area.right().saturating_sub(2).saturating_sub(x), 1),
-            buffer,
+        config.mark_spinner_drawn_if(
+            clock,
+            token_row_icon_reached_frame(line.state_icon_column, icon, row_width),
         );
+        Paragraph::new(Line::from(line.spans)).render(Rect::new(x, y, row_width, 1), buffer);
     }
 
     let background = if selected {
