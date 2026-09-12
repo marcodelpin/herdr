@@ -530,6 +530,232 @@ mod tests {
         assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
     }
 
+    /// The Windows named pipe measured in herdr-8qd: the writer offers a large frame in
+    /// 512-byte pieces and a peer polling through PeekNamedPipe takes one piece per poll. A
+    /// 1 MiB paste is about 2048 pieces, roughly 20 s, well past the 15 s the health check
+    /// allows between received frames.
+    const DRAIN_PIECE: usize = 512;
+    const DRAIN_PIECE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// A writer driven by the test's own clock: `accept_until` moves the same virtual time the
+    /// registry is ticked with, so a 20 s drain costs no wall-clock time.
+    struct DrainingWriter {
+        queued: std::collections::VecDeque<(usize, Option<TransmitReceipt>)>,
+        accepted_through: Instant,
+        stalled: bool,
+        transmitted: Vec<Instant>,
+        error: Option<io::Error>,
+    }
+
+    impl DrainingWriter {
+        fn new(now: Instant, stalled: bool) -> Arc<Mutex<Self>> {
+            Arc::new(Mutex::new(Self {
+                queued: std::collections::VecDeque::new(),
+                accepted_through: now,
+                stalled,
+                transmitted: Vec::new(),
+                error: None,
+            }))
+        }
+
+        fn accept_until(&mut self, now: Instant) {
+            while self.accepted_through + DRAIN_PIECE_INTERVAL <= now {
+                if self.stalled {
+                    return;
+                }
+                self.accepted_through += DRAIN_PIECE_INTERVAL;
+                let Some(frame) = self.queued.front_mut() else {
+                    continue;
+                };
+                frame.0 = frame.0.saturating_sub(DRAIN_PIECE);
+                if frame.0 > 0 {
+                    continue;
+                }
+                let accepted_at = self.accepted_through;
+                if let Some((_, Some(receipt))) = self.queued.pop_front() {
+                    receipt.complete(accepted_at);
+                    self.transmitted.push(accepted_at);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct DrainingTransport(Arc<Mutex<DrainingWriter>>);
+
+    impl DrainingTransport {
+        fn queue(&self, message: &ClientMessage, receipt: Option<TransmitReceipt>) {
+            let mut frame = Vec::new();
+            crate::protocol::write_message(&mut frame, message).unwrap();
+            self.0
+                .lock()
+                .unwrap()
+                .queued
+                .push_back((frame.len(), receipt));
+        }
+    }
+
+    impl EndpointTransport for DrainingTransport {
+        fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+            self.queue(message, None);
+            Ok(())
+        }
+
+        fn send_tracked(
+            &mut self,
+            message: &ClientMessage,
+            _sent_at: Instant,
+        ) -> io::Result<TransmitReceipt> {
+            let receipt = TransmitReceipt::pending();
+            self.queue(message, Some(receipt.clone()));
+            Ok(receipt)
+        }
+
+        fn take_error(&mut self) -> Option<io::Error> {
+            self.0.lock().unwrap().error.take()
+        }
+    }
+
+    fn draining_registry(
+        now: Instant,
+        stalled: bool,
+    ) -> (
+        EndpointRegistry,
+        ClientEndpointId,
+        Arc<Mutex<DrainingWriter>>,
+    ) {
+        let mut registry = EndpointRegistry::new(
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            1,
+            negotiation(),
+        );
+        let ssh_id = ClientEndpointId::Ssh(profile());
+        let writer = DrainingWriter::new(now, stalled);
+        registry.insert(
+            ssh_id.clone(),
+            DrainingTransport(writer.clone()),
+            2,
+            negotiation(),
+            true,
+        );
+        registry.mark_ready(&ssh_id, 2);
+        registry.received(&ssh_id, 2, now);
+        (registry, ssh_id, writer)
+    }
+
+    #[test]
+    fn a_paste_that_is_still_draining_does_not_expire_a_quiet_endpoint() {
+        // bd herdr-7ak, from the codex review of herdr-8qd: a 1 MiB paste to a pane that prints
+        // nothing drains in 512-byte pieces for about 20 s. The health ping is queued behind it
+        // at 5 s and, with the probe timer started at enqueue, the connection was cut at 15 s
+        // while its own frame was still moving.
+        let now = Instant::now();
+        let (mut registry, ssh_id, writer) = draining_registry(now, false);
+        assert_eq!(
+            registry.send_to(
+                &ssh_id,
+                &ClientMessage::Input {
+                    data: vec![b'p'; 1024 * 1024],
+                }
+            ),
+            EndpointSendOutcome::Sent
+        );
+
+        let mut at = now;
+        while at < now + std::time::Duration::from_secs(25) {
+            at += std::time::Duration::from_millis(250);
+            writer.lock().unwrap().accept_until(at);
+            registry.tick_health(at);
+            assert!(
+                registry.connection(&ssh_id).is_some(),
+                "the health check cut the endpoint {:?} into a paste that was still draining",
+                at.saturating_duration_since(now)
+            );
+            assert!(registry.take_failures().is_empty());
+        }
+
+        let transmitted = writer.lock().unwrap().transmitted.clone();
+        assert_eq!(
+            transmitted.len(),
+            1,
+            "the ping is the one frame whose transmission the registry tracks"
+        );
+        let ping_at = transmitted[0];
+        assert!(
+            ping_at
+                > now + super::super::health::HEARTBEAT_INTERVAL
+                    + super::super::health::HEARTBEAT_TIMEOUT,
+            "the ping left the writer inside the old 15 s window, so this test does not cover the bug"
+        );
+        assert!(!registry
+            .connection(&ssh_id)
+            .unwrap()
+            .health
+            .as_ref()
+            .unwrap()
+            .is_draining());
+
+        registry.tick_health(
+            ping_at + super::super::health::HEARTBEAT_TIMEOUT - std::time::Duration::from_millis(1),
+        );
+        assert!(
+            registry.connection(&ssh_id).is_some(),
+            "the reply window must run from the instant the writer took the ping"
+        );
+        registry.tick_health(ping_at + super::super::health::HEARTBEAT_TIMEOUT);
+        assert!(registry.connection(&ssh_id).is_none());
+        assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_stalled_writer_is_still_cut_by_its_own_stall_timeout() {
+        // herdr-8qd's stall timeout stays the cut for a frame that stops moving: the health
+        // check leaves a queued ping alone, and the writer's timeout reaches the registry as a
+        // transport failure instead.
+        let now = Instant::now();
+        let (mut registry, ssh_id, writer) = draining_registry(now, true);
+        assert_eq!(
+            registry.send_to(
+                &ssh_id,
+                &ClientMessage::Input {
+                    data: vec![b'p'; 1024 * 1024],
+                }
+            ),
+            EndpointSendOutcome::Sent
+        );
+
+        let mut at = now;
+        while at < now + std::time::Duration::from_secs(30) {
+            at += std::time::Duration::from_millis(250);
+            writer.lock().unwrap().accept_until(at);
+            registry.tick_health(at);
+        }
+        assert!(
+            registry.connection(&ssh_id).is_some(),
+            "the health check must not double-cut a stall the writer owns"
+        );
+        assert!(registry
+            .connection(&ssh_id)
+            .unwrap()
+            .health
+            .as_ref()
+            .unwrap()
+            .is_draining());
+        assert!(writer.lock().unwrap().transmitted.is_empty());
+
+        writer.lock().unwrap().error = Some(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "endpoint write timed out",
+        ));
+        let failures = registry.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].kind, io::ErrorKind::TimedOut);
+        assert!(registry.connection(&ssh_id).is_none());
+    }
+
     #[test]
     fn a_ready_endpoint_can_stay_connected_after_the_initial_deadline() {
         let mut registry = EndpointRegistry::new(
