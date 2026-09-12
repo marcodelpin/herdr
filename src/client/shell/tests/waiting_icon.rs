@@ -87,6 +87,14 @@ fn cell_at(frame: &FrameData, x: u16, y: u16) -> &crate::protocol::CellData {
     &frame.cells[usize::from(y) * usize::from(frame.width) + usize::from(x)]
 }
 
+/// The text one rendered row shows inside its own rect, so an assertion about a row
+/// cannot be broken by an unrelated row elsewhere in the frame.
+fn row_text(frame: &FrameData, x: u16, y: u16, width: u16) -> String {
+    (x..x.saturating_add(width))
+        .map(|column| cell_at(frame, column, y).symbol.as_str())
+        .collect()
+}
+
 /// The state icon of the first space row: row 0 of a top-level workspace starts one
 /// column into its rect, and `state_icon` is the first token of the default layout.
 fn workspace_icon<'a>(
@@ -128,15 +136,20 @@ fn contains_any(text: &str, glyphs: &[&str]) -> bool {
     glyphs.iter().any(|glyph| text.contains(glyph))
 }
 
-/// Composes after moving the spinner epoch back `periods` more Waiting periods, which
-/// is the same as composing that much later without sleeping.
-fn compose_waiting_periods_later(state: &mut ClientShellState, periods: u32) -> FrameData {
+/// Moves the spinner epoch back `periods` Waiting periods, which is the same as
+/// composing that much later without sleeping.
+fn advance_waiting_periods(state: &mut ClientShellState, periods: u32) {
     if periods > 0 {
         state.spinner_epoch = state
             .spinner_epoch
             .checked_sub(WAITING_SPINNER_FRAME_PERIOD * periods)
             .expect("spinner epoch can move back");
     }
+}
+
+/// Composes a desktop frame after `advance_waiting_periods`.
+fn compose_waiting_periods_later(state: &mut ClientShellState, periods: u32) -> FrameData {
+    advance_waiting_periods(state, periods);
     state
         .compose(DESKTOP.0, DESKTOP.1)
         .expect("composed desktop frame")
@@ -220,10 +233,21 @@ fn an_idle_pane_with_a_wait_token_shows_a_blue_hourglass() {
         let blue = state.config.palette.blue;
         assert_icon(agent_icon(&state, &frame), WAITING, blue, false);
         assert_icon(workspace_icon(&state, &frame), WAITING, blue, false);
-        assert!(
-            !frame_text(&frame).contains(status_icon(AgentStatus::Idle, style, None)),
-            "{style:?}: the idle circle is still on screen"
-        );
+        let idle = status_icon(AgentStatus::Idle, style, None);
+        let agent_rect = state.hits.agents.first().expect("a rendered agent row").0;
+        let workspace_rect = state
+            .hits
+            .workspaces
+            .first()
+            .expect("a rendered workspace row")
+            .rect;
+        for (label, rect) in [("agent", agent_rect), ("workspace", workspace_rect)] {
+            let text = row_text(&frame, rect.x, rect.y, rect.width);
+            assert!(
+                !text.contains(idle),
+                "{style:?}: the {label} row still draws the idle circle: {text}"
+            );
+        }
     }
 }
 
@@ -536,4 +560,182 @@ fn an_unavailable_endpoints_waiting_row_keeps_the_static_hourglass() {
         "{}",
         frame_text(&turned)
     );
+}
+
+#[test]
+fn a_rollup_reads_each_aggregated_agents_own_display_state() {
+    let config = config_with(StatusIndicatorStyle::Symbols);
+
+    // An Unknown pane keeps its own glyph, so the `stale` still cached for it must
+    // not turn the space row red over an idle neighbour that is genuinely waiting.
+    let mut state = state_with_agents(
+        AgentStatus::Idle,
+        vec![
+            waiting_agent(
+                "pane_1",
+                "ws_1",
+                AgentStatus::Idle,
+                &[("wait", "\u{29d7} mon 1")],
+            ),
+            waiting_agent(
+                "pane_2",
+                "ws_1",
+                AgentStatus::Unknown,
+                &[("stale", "STALE: monitor expired")],
+            ),
+        ],
+        &config,
+    );
+    let frame = state.compose(DESKTOP.0, DESKTOP.1).expect("mixed rollup");
+    assert_icon(
+        workspace_icon(&state, &frame),
+        WAITING,
+        state.config.palette.blue,
+        false,
+    );
+
+    // A Working pane is never overridden either, so its cached `wait` must not reach
+    // a space row that an unread Done agent rolled up to Done.
+    let mut state = state_with_agents(
+        AgentStatus::Done,
+        vec![
+            waiting_agent(
+                "pane_1",
+                "ws_1",
+                AgentStatus::Working,
+                &[("wait", "\u{29d7} sh 2")],
+            ),
+            waiting_agent("pane_2", "ws_1", AgentStatus::Done, &[]),
+        ],
+        &config,
+    );
+    let frame = state.compose(DESKTOP.0, DESKTOP.1).expect("done rollup");
+    let icon = workspace_icon(&state, &frame).symbol.clone();
+    assert_ne!(
+        icon, WAITING,
+        "a Working pane's cached wait reached the row"
+    );
+    assert_ne!(icon, WAITING_TURNED);
+}
+
+#[test]
+fn a_disconnected_active_endpoint_keeps_the_mobile_header_static() {
+    let config = config_with(StatusIndicatorStyle::Dots);
+    let mut state = waiting_state(AgentStatus::Idle, &[("wait", "\u{29d7} mon 1 8m")], &config);
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    let first = state
+        .compose(MOBILE.0, MOBILE.1)
+        .expect("disconnected mobile header");
+    assert_eq!(cell_at(&first, 1, 0).symbol, WAITING);
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a disconnected endpoint's header scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    advance_waiting_periods(&mut state, 1);
+    let later = state
+        .compose(MOBILE.0, MOBILE.1)
+        .expect("disconnected mobile header, one period later");
+    assert_eq!(cell_at(&later, 1, 0).symbol, WAITING);
+    assert_eq!(frame_text(&first), frame_text(&later));
+}
+
+/// The default waiting snapshot with `tab_label` on the focused tab: the mobile
+/// header prints that label to the right of the state icon, so it sets the icon's
+/// column budget.
+fn mobile_state_with_tab_label(tab_label: &str, config: &Config) -> ClientShellState {
+    let mut projected = snapshot();
+    projected.tabs[0].label = tab_label.to_owned();
+    projected.agents = vec![waiting_agent(
+        "pane_1",
+        "ws_1",
+        AgentStatus::Idle,
+        &[("wait", "\u{29d7} mon 1 8m")],
+    )];
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state
+}
+
+#[test]
+fn a_mobile_header_icon_the_frame_has_no_room_for_schedules_no_repaint() {
+    let config = config_with(StatusIndicatorStyle::Dots);
+
+    let mut state = mobile_state_with_tab_label("1", &config);
+    let frame = state.compose(MOBILE.0, MOBILE.1).expect("mobile header");
+    assert_eq!(
+        cell_at(&frame, 1, 0).symbol,
+        WAITING,
+        "control: a short tab label leaves room for the icon"
+    );
+    assert!(state.config.waiting_drawn.get());
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    let mut state = mobile_state_with_tab_label(&"w".repeat(30), &config);
+    let frame = state
+        .compose(MOBILE.0, MOBILE.1)
+        .expect("clipped mobile header");
+    let text = frame_text(&frame);
+    assert!(!text.contains(WAITING), "{text}");
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a header icon with no columns left scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+}
+
+/// A saved machine whose cached snapshot holds one idle workspace numbered `number`,
+/// reporting `wait` at workspace level and holding no agents, so the collapsed
+/// endpoint sidebar row is the only Waiting glyph in the frame.
+fn remote_numbered_workspace_state(number: usize) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let profile = SavedSshEndpoint {
+        id: crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef")
+            .expect("profile id"),
+        label: "Build".into(),
+        target: "build".into(),
+        session: "agents".into(),
+        enabled: true,
+    };
+    let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+    state.set_endpoint_catalog(&[profile]);
+    state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let mut remote = snapshot();
+    remote.boot_id = "remote-boot".into();
+    remote.workspaces[0].number = number;
+    remote.workspaces[0].tokens = vec![("wait".to_owned(), "\u{29d7} mon 1 8m".to_owned())];
+    remote.agents = Vec::new();
+    state.set_endpoint_snapshot(&endpoint_id, Box::new(remote));
+    state.sidebar_collapsed = true;
+    state
+}
+
+#[test]
+fn a_collapsed_endpoint_row_too_narrow_for_the_icon_schedules_no_repaint() {
+    let mut state = remote_numbered_workspace_state(1);
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("collapsed endpoint sidebar");
+    assert!(
+        frame_text(&frame).contains(WAITING),
+        "control: a one-digit workspace number leaves a column for the icon"
+    );
+    assert!(state.config.waiting_drawn.get());
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    let mut state = remote_numbered_workspace_state(10);
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("collapsed endpoint sidebar, two-digit number");
+    let text = frame_text(&frame);
+    assert!(!text.contains(WAITING), "{text}");
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a workspace number filling the collapsed row still scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
 }
