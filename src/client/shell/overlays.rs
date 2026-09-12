@@ -881,7 +881,7 @@ fn render_navigator_overlay(
             i.width,
             &format!(" {} · {}", r.label, r.meta),
             Style::default().fg(p.overlay0).bg(p.panel_bg),
-        )
+        );
     }
     put_text(
         b,
