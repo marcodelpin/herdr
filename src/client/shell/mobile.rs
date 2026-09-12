@@ -632,7 +632,7 @@ fn mobile_items(
                 ],
                 background,
                 target: Some(ClientMobileTarget::Machine(endpoint.endpoint_id.clone())),
-                spinner: false,
+                spinner: None,
             });
         }
     }
@@ -655,7 +655,7 @@ fn mobile_items(
                 ))],
                 background: palette.panel_bg,
                 target: None,
-                spinner: false,
+                spinner: None,
             });
         }
         for row in agents {
@@ -946,7 +946,7 @@ fn mobile_items(
                     endpoint_id: active_endpoint_id.clone(),
                     tab_id: tab.tab_id.clone(),
                 }),
-                spinner: false,
+                spinner: None,
             });
         }
     }
@@ -963,7 +963,7 @@ fn mobile_items(
             ))],
             background: palette.panel_bg,
             target: Some(ClientMobileTarget::Menu(index)),
-            spinner: false,
+            spinner: None,
         });
     }
     items
