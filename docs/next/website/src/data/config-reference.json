@@ -1052,7 +1052,13 @@
           "key": "ui.animate_working",
           "type": "boolean",
           "default": "true",
-          "description": "Animate the working state icon as a spinner: braille frames for dots, rotating quarter circles for symbols. Other states stay static."
+          "description": "Animate the working state icon as a spinner: braille frames for dots, rotating quarter circles for symbols. The waiting hourglass turns over once a second on the same setting; every other state stays static."
+        },
+        {
+          "key": "ui.waiting_indicator",
+          "type": "boolean",
+          "default": "true",
+          "description": "Show the waiting hourglass on an idle or done pane that reports the wait or stale metadata token, instead of its idle icon."
         },
         {
           "key": "ui.sidebar.agents.row_gap",

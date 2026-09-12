@@ -962,7 +962,8 @@ pub struct UiConfig {
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
     /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
-    /// Animate the Working state icon as a spinner; other states stay static. Default: true.
+    /// Animate the Working state icon as a spinner, and turn the waiting hourglass over once a
+    /// second on the same setting; every other state stays static. Default: true.
     pub animate_working: bool,
     /// Show the WAITING / STALE state icon on an idle or done pane that reports the
     /// `wait` / `stale` metadata tokens, instead of its idle icon. Default: true.
