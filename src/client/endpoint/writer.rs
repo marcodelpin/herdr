@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use interprocess::local_socket::traits::Stream as _;
 
-use super::EndpointTransport;
+use super::{EndpointTransport, TransmitReceipt};
 use crate::ipc::LocalStream;
 use crate::protocol::ClientMessage;
 
@@ -15,7 +15,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 enum WriterCommand {
-    Frame(Vec<u8>),
+    /// `receipt`, when the caller asked for one, is resolved with the instant the peer accepted
+    /// the frame's last byte.
+    Frame {
+        bytes: Vec<u8>,
+        receipt: Option<TransmitReceipt>,
+    },
     Flush(mpsc::Sender<()>),
 }
 
@@ -49,8 +54,8 @@ impl NativeEndpointTransport {
                     if worker_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let frame = match command {
-                        WriterCommand::Frame(frame) => frame,
+                    let (frame, receipt) = match command {
+                        WriterCommand::Frame { bytes, receipt } => (bytes, receipt),
                         WriterCommand::Flush(done) => {
                             let _ = done.send(());
                             continue;
@@ -65,6 +70,14 @@ impl NativeEndpointTransport {
                         worker_stop.store(true, Ordering::Release);
                         break;
                     }
+                    // write_frame also returns Ok when a stop cancelled it mid-frame, which
+                    // leaves the rest of the frame unwritten: only an uncancelled write has
+                    // reached the peer.
+                    if let Some(receipt) = receipt {
+                        if !worker_stop.load(Ordering::Acquire) {
+                            receipt.complete(Instant::now());
+                        }
+                    }
                 }
             })?;
         Ok(Self {
@@ -78,10 +91,12 @@ impl NativeEndpointTransport {
     pub(crate) fn stop_handle(&self) -> Arc<AtomicBool> {
         self.stopped.clone()
     }
-}
 
-impl EndpointTransport for NativeEndpointTransport {
-    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+    fn enqueue(
+        &mut self,
+        message: &ClientMessage,
+        receipt: Option<TransmitReceipt>,
+    ) -> io::Result<()> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -104,7 +119,10 @@ impl EndpointTransport for NativeEndpointTransport {
             return Err(queue_full());
         }
         self.sender
-            .try_send(WriterCommand::Frame(frame))
+            .try_send(WriterCommand::Frame {
+                bytes: frame,
+                receipt,
+            })
             .map_err(|error| {
                 self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
                 match error {
@@ -114,6 +132,24 @@ impl EndpointTransport for NativeEndpointTransport {
                     }
                 }
             })
+    }
+}
+
+impl EndpointTransport for NativeEndpointTransport {
+    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+        self.enqueue(message, None)
+    }
+
+    fn send_tracked(
+        &mut self,
+        message: &ClientMessage,
+        _sent_at: Instant,
+    ) -> io::Result<TransmitReceipt> {
+        // The worker owns the wire, so the frame is only queued here; the receipt carries the
+        // instant it is actually written.
+        let receipt = TransmitReceipt::pending();
+        self.enqueue(message, Some(receipt.clone()))?;
+        Ok(receipt)
     }
 
     fn disconnect(&mut self) {

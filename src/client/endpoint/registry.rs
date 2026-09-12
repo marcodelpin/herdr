@@ -1,13 +1,58 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use super::health::{EndpointHealth, HealthAction};
 use super::ClientEndpointId;
 use crate::protocol::ClientMessage;
 
+/// When a transport accepted the last byte of one frame. A queued writer resolves it from its
+/// worker thread, so the caller can tell a frame that is still draining from one that is on the
+/// wire (bd herdr-7ak).
+#[derive(Clone, Debug)]
+pub(crate) struct TransmitReceipt(Arc<OnceLock<Instant>>);
+
+impl TransmitReceipt {
+    /// A frame still in the writer queue.
+    pub(crate) fn pending() -> Self {
+        Self(Arc::new(OnceLock::new()))
+    }
+
+    /// A frame already written by the time the caller's clock read `at`.
+    pub(crate) fn transmitted(at: Instant) -> Self {
+        let receipt = Self::pending();
+        receipt.complete(at);
+        receipt
+    }
+
+    /// Records the instant the writer accepted the frame's last byte. Later calls are ignored:
+    /// a frame is transmitted once.
+    pub(crate) fn complete(&self, at: Instant) {
+        let _ = self.0.set(at);
+    }
+
+    pub(crate) fn transmitted_at(&self) -> Option<Instant> {
+        self.0.get().copied()
+    }
+}
+
 pub(crate) trait EndpointTransport: Send {
     fn send(&mut self, message: &ClientMessage) -> io::Result<()>;
+
+    /// Sends `message` and reports when its last byte reaches the peer. A transport that writes
+    /// inline is done when it returns, so it reports the caller's clock; a queued writer resolves
+    /// the receipt from its worker thread. The health probe timer runs from that instant, never
+    /// from the enqueue: a ping queued behind a 1 MiB paste can wait about 20 s for a writer that
+    /// drains in 512-byte pieces, longer than the whole health window (bd herdr-7ak).
+    fn send_tracked(
+        &mut self,
+        message: &ClientMessage,
+        sent_at: Instant,
+    ) -> io::Result<TransmitReceipt> {
+        self.send(message)?;
+        Ok(TransmitReceipt::transmitted(sent_at))
+    }
 
     fn disconnect(&mut self) {}
 
@@ -202,6 +247,11 @@ impl EndpointRegistry {
     }
 
     pub(crate) fn tick_health(&mut self, now: Instant) {
+        for connection in self.connections.values_mut() {
+            if let Some(health) = connection.health.as_mut() {
+                health.settle();
+            }
+        }
         let actions = self
             .connections
             .iter()
@@ -221,14 +271,17 @@ impl EndpointRegistry {
                         kind: crate::protocol::endpoint::HEALTH_PING_KIND.into(),
                         data: String::new(),
                     };
-                    if self.send_to(&endpoint_id, &ping) == EndpointSendOutcome::Sent {
-                        if let Some(health) = self
-                            .connections
-                            .get_mut(&endpoint_id)
-                            .and_then(|connection| connection.health.as_mut())
-                        {
-                            health.ping_sent(now);
-                        }
+                    let Some(receipt) =
+                        self.dispatch(&endpoint_id, |transport| transport.send_tracked(&ping, now))
+                    else {
+                        continue;
+                    };
+                    if let Some(health) = self
+                        .connections
+                        .get_mut(&endpoint_id)
+                        .and_then(|connection| connection.health.as_mut())
+                    {
+                        health.ping_queued(receipt);
                     }
                 }
                 HealthAction::Expired => self.record_failure(
@@ -274,16 +327,29 @@ impl EndpointRegistry {
         endpoint_id: &ClientEndpointId,
         message: &ClientMessage,
     ) -> EndpointSendOutcome {
+        match self.dispatch(endpoint_id, |transport| transport.send(message)) {
+            Some(()) => EndpointSendOutcome::Sent,
+            None => EndpointSendOutcome::NotSent,
+        }
+    }
+
+    /// Runs one transport call against a connection, revoking it on failure. Every path that
+    /// writes to an endpoint goes through here, so a health ping fails it exactly like input.
+    fn dispatch<T>(
+        &mut self,
+        endpoint_id: &ClientEndpointId,
+        call: impl FnOnce(&mut dyn EndpointTransport) -> io::Result<T>,
+    ) -> Option<T> {
         let result = self
             .connections
             .get_mut(endpoint_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "endpoint is unavailable"))
-            .and_then(|connection| connection.transport.send(message));
+            .and_then(|connection| call(connection.transport.as_mut()));
         match result {
-            Ok(()) => EndpointSendOutcome::Sent,
+            Ok(value) => Some(value),
             Err(error) => {
                 self.record_failure(endpoint_id.clone(), error);
-                EndpointSendOutcome::NotSent
+                None
             }
         }
     }
@@ -580,7 +646,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
     struct DrainingTransport(Arc<Mutex<DrainingWriter>>);
 
     impl DrainingTransport {
