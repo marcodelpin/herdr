@@ -468,8 +468,12 @@ mod tests {
         // here, so its receipt must stay pending until the peer drains it.
         let (stream, mut peer, path) = streams();
         let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        // Larger than any buffer between the two ends (a Unix socket takes about 208 KiB
+        // unread; a Windows pipe takes 512 bytes at a time), small enough that draining it one
+        // piece per poll stays well inside the deadline below on a Windows runner, where a short
+        // sleep rounds up to about 16 ms.
         let paste = ClientMessage::Input {
-            data: vec![b'p'; 2 * 1024 * 1024],
+            data: vec![b'p'; 512 * 1024],
         };
         let mut expected = Vec::new();
         crate::protocol::write_message(&mut expected, &paste).unwrap();
@@ -484,7 +488,7 @@ mod tests {
 
         let (done, received) = mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(60);
+            let deadline = Instant::now() + Duration::from_secs(120);
             let mut bytes = Vec::new();
             let mut buffer = [0_u8; 16 * 1024];
             while bytes.len() < expected_len && Instant::now() < deadline {
@@ -500,7 +504,7 @@ mod tests {
             }
             done.send(bytes.len()).unwrap();
         });
-        let read = received.recv_timeout(Duration::from_secs(90)).unwrap();
+        let read = received.recv_timeout(Duration::from_secs(150)).unwrap();
         reader.join().unwrap();
         assert_eq!(read, expected_len);
 
@@ -526,7 +530,7 @@ mod tests {
         let receipt = transport
             .send_tracked(
                 &ClientMessage::Input {
-                    data: vec![b's'; 2 * 1024 * 1024],
+                    data: vec![b's'; 512 * 1024],
                 },
                 Instant::now(),
             )
