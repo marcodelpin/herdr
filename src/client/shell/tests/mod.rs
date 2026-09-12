@@ -220,4 +220,5 @@ mod mobile;
 mod mouse_selection;
 mod popup_focus_projection;
 mod startup_overlays;
+mod waiting_icon;
 mod working_spinner;
