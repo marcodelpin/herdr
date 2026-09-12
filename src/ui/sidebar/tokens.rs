@@ -283,7 +283,8 @@ rows = [[{ token = "workspace", rules = [{ equals = "long-workspace-name", fg = 
                 theme,
                 &super::super::Palette::catppuccin(),
                 width,
-            );
+            )
+            .spans;
             assert_eq!(spans.len(), 1);
             assert!(super::super::display_width(&spans[0].content) <= width);
             assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 0, 0)));
