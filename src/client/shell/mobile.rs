@@ -57,6 +57,7 @@ pub(super) fn render_mobile_header(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
     hits: &mut ShellHitMap,
 ) {
     if area.is_empty() {
@@ -74,7 +75,7 @@ pub(super) fn render_mobile_header(
     hits.mobile_switch = button;
     let status_width = button.x.saturating_sub(area.x).saturating_sub(1);
     let status = Rect::new(area.x, area.y, status_width, area.height);
-    render_header_status(buffer, status, snapshot, config);
+    render_header_status(buffer, status, snapshot, config, stale);
     render_header_button(buffer, button, snapshot, config);
 }
 
@@ -83,6 +84,7 @@ fn render_header_status(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
 ) {
     if area.is_empty() {
         return;
@@ -113,14 +115,18 @@ fn render_header_status(
         workspace.agent_status,
         config,
     );
-    put_text(
+    let (icon, clock) = lookup_display_icon(display, config, stale);
+    // The glyph sits one column into the padded text, so a one-column budget paints
+    // the pad and nothing else.
+    let written = put_text(
         buffer,
         area.x,
         area.y,
         name_width.min(3),
-        &format!(" {} ", agent_display_icon(display, config)),
+        &format!(" {icon} "),
         display_state_style(display, palette).bg(palette.panel_bg),
     );
+    config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 1, icon));
     put_text(
         buffer,
         area.x.saturating_add(3),
@@ -146,6 +152,7 @@ fn render_header_status(
             Rect::new(area.x, area.y + 1, area.width, 1),
             snapshot,
             config,
+            stale,
         );
     }
 }
@@ -245,6 +252,7 @@ fn render_agent_summary(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
 ) {
     use crate::api::schema::AgentStatus;
     let counts = [
@@ -310,7 +318,7 @@ fn render_agent_summary(
             (crate::config::StatusIndicatorStyle::Dots, _) => (None, None),
             _ => {
                 let (icon, spinner) =
-                    lookup_display_icon(DisplayState::Status(status), config, false);
+                    lookup_display_icon(DisplayState::Status(status), config, stale);
                 (Some(icon), spinner)
             }
         };
