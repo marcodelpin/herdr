@@ -334,7 +334,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # status_indicators = "dots"
 
 # Animate the working state icon as a spinner (braille frames for "dots", rotating
-# quarter circles for "symbols"). Other states stay static. Set false for a static icon.
+# quarter circles for "symbols"). The waiting hourglass below turns over once a
+# second while this is on; every other state stays static. Set false for static icons.
 # animate_working = true
 
 # Show an hourglass instead of the idle icon while an idle or done pane reports the

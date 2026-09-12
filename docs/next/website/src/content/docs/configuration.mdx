@@ -342,14 +342,14 @@ Agent status uses compact colored dots by default. To distinguish blocked, worki
 status_indicators = "symbols"
 ```
 
-While an agent is working, its state icon animates as a spinner: braille frames with `dots`, rotating quarter circles with `symbols`. Blocked, done, idle, and unknown icons are always static, and so is the last known state of a disconnected machine. To keep the working icon static too, configure:
+While an agent is working, its state icon animates as a spinner: braille frames with `dots`, rotating quarter circles with `symbols`. The waiting hourglass described below turns over once a second on the same setting. Blocked, done, idle, and unknown icons are always static, and so is the last known state of a disconnected machine. To keep the working and waiting icons static too, configure:
 
 ```toml
 [ui]
 animate_working = false
 ```
 
-An idle or done pane that reports the `wait` metadata token shows a blue hourglass instead of its idle icon, and one reporting `stale` shows a bold red hourglass. The hourglass turns over once a second while `animate_working` is on; the stale one never animates. Working, blocked, and unknown panes keep their own icon. Workspace rows and the mobile list roll the state up from the agents they aggregate, so a space holding one waiting agent shows the hourglass too. To keep the idle icon and read those tokens as text only, configure:
+An idle or done pane that reports the `wait` metadata token shows a blue hourglass instead of its idle icon, and one reporting `stale` shows a bold red hourglass. The hourglass turns over once a second while `animate_working` is on; the stale one never animates. Working, blocked, and unknown panes keep their own icon. Workspace rows and the mobile list roll the state up from the agents they aggregate, so a space holding one waiting agent shows the hourglass too; an agent that keeps its own icon contributes nothing to that rollup. Tab labels carry no state icon, so they do not show it. To keep the idle icon and read those tokens as text only, configure:
 
 ```toml
 [ui]
