@@ -103,14 +103,15 @@ pub(crate) fn agent_panel_entries_from(
     entries
 }
 
-/// One rendered token row: the spans to draw, and the column the `state_icon` glyph
+/// One rendered token row: the spans to draw, and the column EVERY `state_icon` glyph
 /// starts at inside them. The caller clips the row to the same `max_width` it asked
-/// for, so the column is what tells a glyph that reached the frame from one the clip
+/// for, so the columns are what tell a glyph that reached the frame from one the clip
 /// dropped; fixed tokens are never deactivated, so a row can be laid out wider than
-/// the budget.
+/// the budget. A row layout may name `state_icon` more than once, and then the glyphs
+/// are clipped one by one: keeping only the last column freezes a visible earlier one.
 pub(crate) struct ResolvedRow {
     pub spans: Vec<Span<'static>>,
-    pub state_icon_column: Option<usize>,
+    pub state_icon_columns: Vec<usize>,
 }
 
 pub(crate) fn resolved_token_spans(
@@ -224,7 +225,7 @@ pub(crate) fn resolved_token_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut column = 0usize;
-    let mut state_icon_column = None;
+    let mut state_icon_columns = Vec::new();
     for (position, index) in visible_indices.iter().copied().enumerate() {
         let token = &resolved[index];
         if position > 0 {
@@ -288,7 +289,7 @@ pub(crate) fn resolved_token_spans(
             }
         }
         if matches!(token.kind, ResolvedTokenKind::StateIcon) {
-            state_icon_column = Some(column);
+            state_icon_columns.push(column);
         }
         column += spans[emitted..]
             .iter()
@@ -297,7 +298,7 @@ pub(crate) fn resolved_token_spans(
     }
     ResolvedRow {
         spans,
-        state_icon_column,
+        state_icon_columns,
     }
 }
 

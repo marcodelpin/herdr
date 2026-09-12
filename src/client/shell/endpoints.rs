@@ -13,6 +13,15 @@ pub(crate) struct ClientShellEndpoint {
     pub(crate) methods: Option<HashSet<String>>,
 }
 
+impl ClientShellEndpoint {
+    /// Whether this endpoint's rows are drawn from a CACHED snapshot rather than from
+    /// live activity: a disconnected endpoint keeps showing its last state, so its
+    /// glyphs stay static and schedule no repaint.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.status != ClientEndpointStatus::Online
+    }
+}
+
 pub(super) struct MachineHit {
     pub(super) rect: Rect,
     pub(super) endpoint_id: ClientEndpointId,
@@ -490,6 +499,16 @@ pub(super) fn endpoint_status_presentation(
         ClientEndpointStatus::Attention => ("!", "attention", palette.red),
         ClientEndpointStatus::Disabled => ("·", "disabled", palette.overlay0),
     }
+}
+
+/// Whether the rows of the SINGLE-endpoint sidebar are cached: that sidebar draws the
+/// Local endpoint's snapshot and labels every hit `ClientEndpointId::Local`, so when
+/// Local is disconnected its rows carry no live activity, exactly like the endpoint list
+/// rows and the mobile header.
+pub(super) fn local_rows_are_stale(endpoints: &[ClientShellEndpoint]) -> bool {
+    endpoints
+        .iter()
+        .any(|endpoint| endpoint.endpoint_id.is_local() && endpoint.is_stale())
 }
 
 pub(super) fn local_endpoint() -> ClientShellEndpoint {

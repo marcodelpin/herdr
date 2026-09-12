@@ -406,13 +406,15 @@ fn token_row_state_icon(
     }
 }
 
-/// Whether the state icon of a laid-out token row survives the clip: `column` is where
-/// `resolved_token_spans` placed the glyph and `max_width` is the width the row's
-/// `Paragraph` renders into. Fixed tokens are never dropped from the span list, so a
-/// glyph can be laid out past the budget and never reach the frame.
-fn token_row_icon_reached_frame(column: Option<usize>, icon: &str, max_width: u16) -> bool {
-    column.is_some_and(|column| {
-        icon_reached_frame(max_width, u16::try_from(column).unwrap_or(u16::MAX), icon)
+/// Whether ANY state icon of a laid-out token row survives the clip: `columns` are the
+/// columns `resolved_token_spans` placed the glyphs at and `max_width` is the width the
+/// row's `Paragraph` renders into. Fixed tokens are never dropped from the span list, so
+/// a glyph can be laid out past the budget and never reach the frame - and a layout that
+/// names `state_icon` twice draws one glyph that survives and one that does not, so the
+/// row animates as long as a single one of them is on screen.
+fn token_row_icon_reached_frame(columns: &[usize], icon: &str, max_width: u16) -> bool {
+    columns.iter().any(|column| {
+        icon_reached_frame(max_width, u16::try_from(*column).unwrap_or(u16::MAX), icon)
     })
 }
 

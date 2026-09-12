@@ -49,11 +49,14 @@ pub(super) fn ordered_agent_pane_ids(
         .collect()
 }
 
+/// `stale` marks a DISCONNECTED endpoint, whose cached rows keep their static glyph and
+/// schedule no repaint.
 pub(super) fn render_agent_panel(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
@@ -82,7 +85,7 @@ pub(super) fn render_agent_panel(
         |row| row.rows.len(),
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, false, config);
+            render_agent_row(buffer, rect, row, stale, config);
         },
     );
 }
@@ -366,7 +369,7 @@ pub(super) fn render_agent_row(
         );
         config.mark_spinner_drawn_if(
             clock,
-            token_row_icon_reached_frame(line.state_icon_column, icon, row_width),
+            token_row_icon_reached_frame(&line.state_icon_columns, icon, row_width),
         );
         let mut spans = vec![ratatui::text::Span::raw(" ".repeat(indent))];
         spans.extend(line.spans);

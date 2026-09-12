@@ -24,11 +24,14 @@ pub(in crate::client::shell) fn collapsed_sidebar_sections(
     )
 }
 
+/// `stale` marks a DISCONNECTED Local endpoint, whose cached rows keep their static
+/// glyph and schedule no repaint.
 pub(crate) fn render_collapsed_sidebar(
     buffer: &mut Buffer,
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
     selected_workspace_id: Option<&str>,
     hits: &mut ShellHitMap,
 ) {
@@ -78,7 +81,7 @@ pub(crate) fn render_collapsed_sidebar(
         );
         let display =
             workspace_display_state(snapshot, &[workspace], workspace.agent_status, config);
-        let (icon, clock) = lookup_display_icon(display, config, false);
+        let (icon, clock) = lookup_display_icon(display, config, stale);
         let written = put_text(
             buffer,
             rect.x.saturating_add(2),
@@ -148,7 +151,7 @@ pub(crate) fn render_collapsed_sidebar(
             }),
         );
         let display = agent_display_state(agent, config);
-        let (icon, clock) = lookup_display_icon(display, config, false);
+        let (icon, clock) = lookup_display_icon(display, config, stale);
         let written = put_text(
             buffer,
             rect.x.saturating_add(2),
@@ -195,6 +198,11 @@ pub(crate) fn render_sidebar(
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
+    // This sidebar is the one drawn for a SINGLE endpoint, and that endpoint is Local.
+    // A disconnected Local keeps showing its last snapshot, so its rows read cached
+    // state, not live activity: they stay static, exactly as the endpoint list rows and
+    // the mobile header already do.
+    let stale = local_rows_are_stale(state.endpoints);
     render_sidebar_background(buffer, area, palette);
     hits.sidebar_divider = if area.is_empty() {
         Rect::default()
@@ -312,7 +320,7 @@ pub(crate) fn render_sidebar(
             buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
         }
         render_workspace_rows(
-            buffer, rect, workspace, display, false, entry, rows, true, selected, dragged, config,
+            buffer, rect, workspace, display, stale, entry, rows, true, selected, dragged, config,
         );
         let group_toggle = parent_group_key(snapshot, entry.index).map(|key| {
             let rect = Rect::new(rect.right().saturating_sub(1), rect.y, 1, 1);
@@ -423,6 +431,7 @@ pub(crate) fn render_sidebar(
         detail_area,
         snapshot,
         config,
+        stale,
         state.agent_scroll,
         hits,
     );
@@ -765,7 +774,7 @@ pub(in crate::client::shell) fn render_workspace_rows(
         );
         config.mark_spinner_drawn_if(
             clock,
-            token_row_icon_reached_frame(line.state_icon_column, icon, row_width),
+            token_row_icon_reached_frame(&line.state_icon_columns, icon, row_width),
         );
         Paragraph::new(Line::from(line.spans)).render(Rect::new(x, y, row_width, 1), buffer);
     }

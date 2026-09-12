@@ -64,7 +64,7 @@ pub(super) fn render_collapsed(
             if focused {
                 buffer.set_style(rect, Style::default().bg(palette.active_row_bg));
             }
-            let stale = endpoint.status != ClientEndpointStatus::Online;
+            let stale = endpoint.is_stale();
             let number = format!(" {}", workspace.number);
             let number_width = super::render::display_width(&number).min(rect.width);
             let dim = if stale {
@@ -306,7 +306,7 @@ pub(super) fn render_expanded(
                     rect.height,
                 );
                 let endpoint_active = &endpoint.endpoint_id == state.active_endpoint_id;
-                let stale = endpoint.status != ClientEndpointStatus::Online;
+                let stale = endpoint.is_stale();
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
