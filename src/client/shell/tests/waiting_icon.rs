@@ -739,3 +739,193 @@ fn a_collapsed_endpoint_row_too_narrow_for_the_icon_schedules_no_repaint() {
     );
     assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
 }
+
+/// The default waiting snapshot pinned to a `width`-column sidebar whose space rows
+/// are `git_status` then `state_icon`: the ahead/behind counts are a FIXED token, so
+/// they are never dropped from the span list and they alone decide whether the glyph
+/// behind them survives the clip. The workspace reports `wait` itself and holds no
+/// agents, so that row is the frame's only Waiting glyph.
+fn git_status_before_the_icon_state(width: u16) -> ClientShellState {
+    let mut config = config_with(StatusIndicatorStyle::Symbols);
+    config.ui.sidebar_min_width = width;
+    config.ui.sidebar_max_width = width;
+    config.ui.sidebar.spaces.rows = vec![vec![
+        crate::config::SpaceSidebarToken::GitStatus,
+        crate::config::SpaceSidebarToken::StateIcon,
+    ]];
+    let mut projected = snapshot();
+    projected.workspaces[0].git_ahead_behind = Some((1000, 1000));
+    projected.workspaces[0].tokens = vec![("wait".to_owned(), "x".to_owned())];
+    projected.agents = Vec::new();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state
+}
+
+#[test]
+fn a_token_row_state_icon_the_clip_drops_schedules_no_repaint() {
+    // Control: 40 columns of sidebar leave room for the counts and the glyph.
+    let mut state = git_status_before_the_icon_state(40);
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("wide sidebar frame");
+    let rect = state
+        .hits
+        .workspaces
+        .first()
+        .expect("a rendered workspace row")
+        .rect;
+    let text = row_text(&frame, rect.x, rect.y, rect.width);
+    assert!(
+        text.contains(WAITING),
+        "control: a 40-column sidebar drew no hourglass: {text}"
+    );
+    assert!(state.config.waiting_drawn.get());
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    // 18 columns leave the row 14 text columns; the counts and their separator take
+    // all 14, so the glyph is laid out at column 14 and clipped away.
+    let mut state = git_status_before_the_icon_state(18);
+    let frame = state
+        .compose(DESKTOP.0, DESKTOP.1)
+        .expect("narrow sidebar frame");
+    let text = frame_text(&frame);
+    assert!(
+        !text.contains(WAITING),
+        "a clipped state icon still reached the frame: {text}"
+    );
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a state icon the clip dropped still scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+}
+
+#[test]
+fn a_disabled_waiting_indicator_rolls_up_without_reading_any_agent() {
+    let mut config = Config::default();
+    config.ui.waiting_indicator = false;
+    let shell = ClientShellConfig::from_config(&config);
+    let mut projected = snapshot();
+    projected.workspaces[0].tokens = vec![("wait".to_owned(), "\u{29d7} mon 1".to_owned())];
+    projected.agents = vec![
+        waiting_agent(
+            "pane_1",
+            "ws_1",
+            AgentStatus::Idle,
+            &[("wait", "\u{29d7} mon 1")],
+        ),
+        waiting_agent(
+            "pane_2",
+            "ws_1",
+            AgentStatus::Idle,
+            &[("stale", "STALE: monitor expired")],
+        ),
+    ];
+    let workspaces = vec![&projected.workspaces[0]];
+    for status in [AgentStatus::Idle, AgentStatus::Done] {
+        assert_eq!(
+            super::sidebar::workspace_display_state(&projected, &workspaces, status, &shell),
+            DisplayState::Status(status),
+            "a disabled waiting indicator let an agent token reach the row"
+        );
+    }
+}
+
+/// The default waiting snapshot in the mobile switcher, so the only animated glyph is
+/// the agent item's, two columns into its first line.
+fn switcher_waiting_state() -> ClientShellState {
+    let config = config_with(StatusIndicatorStyle::Dots);
+    let mut state = waiting_state(AgentStatus::Idle, &[("wait", "\u{29d7} mon 1 8m")], &config);
+    state.mode = ClientShellMode::Navigate;
+    state
+}
+
+#[test]
+fn a_switcher_row_too_narrow_for_the_icon_schedules_no_repaint() {
+    // Control: 30 columns leave the switcher 29 content columns.
+    let mut state = switcher_waiting_state();
+    let frame = state.compose(30, MOBILE.1).expect("switcher at 30 columns");
+    assert!(
+        frame_text(&frame).contains(WAITING),
+        "control: {}",
+        frame_text(&frame)
+    );
+    assert!(state.config.waiting_drawn.get());
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    // Three columns leave two content columns, which the item's own indent fills.
+    let mut state = switcher_waiting_state();
+    let frame = state.compose(3, MOBILE.1).expect("switcher at 3 columns");
+    let text = frame_text(&frame);
+    assert!(!text.contains(WAITING), "{text}");
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "a switcher item with no room for its icon scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+}
+
+/// One worktree group of two spaces where only the INDENTED child reports `wait`, and
+/// no agents at all, so the switcher's only animated glyph sits behind the child's
+/// two-column indent plus its three-column connector.
+fn indented_switcher_waiting_state() -> ClientShellState {
+    let config = Config::default();
+    let mut projected = snapshot();
+    projected.workspaces[0].worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: false,
+    });
+    let mut child = projected.workspaces[0].clone();
+    child.workspace_id = "ws_2".into();
+    child.active_tab_id = "tab_2".into();
+    child.number = 2;
+    child.label = "child".into();
+    child.focused = false;
+    child.branch = Some("worktree/child".into());
+    child.tokens = vec![("wait".to_owned(), "\u{29d7} mon 1".to_owned())];
+    child.worktree = Some(ClientShellWorktree {
+        key: "repo".into(),
+        label: "repo".into(),
+        is_linked_worktree: true,
+    });
+    projected.workspaces.push(child);
+    let mut child_tab = projected.tabs[0].clone();
+    child_tab.tab_id = "tab_2".into();
+    child_tab.workspace_id = "ws_2".into();
+    child_tab.focused = false;
+    projected.tabs.push(child_tab);
+    projected.agents = Vec::new();
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    state.mode = ClientShellMode::Navigate;
+    state
+}
+
+#[test]
+fn an_indented_switcher_row_too_narrow_for_the_icon_schedules_no_repaint() {
+    // Control: 30 columns hold the indent, the connector and the glyph.
+    let mut state = indented_switcher_waiting_state();
+    let frame = state.compose(30, MOBILE.1).expect("switcher at 30 columns");
+    assert!(
+        frame_text(&frame).contains(WAITING),
+        "control: {}",
+        frame_text(&frame)
+    );
+    assert!(state.config.waiting_drawn.get());
+    assert!(state.tick_working_spinner(next_waiting_frame_due(&state)));
+
+    // Six columns leave five content columns, which the indent and the connector fill.
+    let mut state = indented_switcher_waiting_state();
+    let frame = state.compose(6, MOBILE.1).expect("switcher at 6 columns");
+    let text = frame_text(&frame);
+    assert!(!text.contains(WAITING), "{text}");
+    assert!(
+        !state.config.waiting_drawn.get(),
+        "an indented switcher item with no room for its icon scheduled Waiting repaints"
+    );
+    assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+}
