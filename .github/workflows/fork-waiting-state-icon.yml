@@ -130,7 +130,7 @@ jobs:
 
       - name: Ignore the reported tokens and require the waiting tests to fail
         run: |
-          perl -0pi -e 's/if !waiting_indicator \|\| !matches!\(status, AgentStatus::Idle \| AgentStatus::Done\) \{/if true \{ \/\/ MUTANT token-blind display_state/' src/client/shell.rs
+          perl -0pi -e 's/if !waiting_indicator \|\| !display_state_overridable\(status\) \{/if true \{ \/\/ MUTANT token-blind display_state/' src/client/shell.rs
           landed=$(grep -c 'MUTANT token-blind display_state' src/client/shell.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
@@ -143,6 +143,7 @@ jobs:
           fi
           for test in an_idle_pane_with_a_wait_token_shows_a_blue_hourglass \
                       workspace_rows_roll_the_waiting_state_up_from_their_agents \
+                      a_rollup_reads_each_aggregated_agents_own_display_state \
                       an_unavailable_endpoints_waiting_row_keeps_the_static_hourglass; do
             grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
           done
