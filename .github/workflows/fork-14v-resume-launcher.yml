@@ -1,12 +1,15 @@
 # Fork-only workflow for fix/14v-resume-launcher (not for upstream): the operator launches
 # claude through an account/flag wrapper (cas), so a native agent resume that types the
-# bare "claude --resume <sid>" argv into a restored pane loses the wrapper. This adds
-# [session.agent_launchers], applied right before the resume command is sent to the pane
-# shell. This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on
-# both platforms (nextest, one process per test), the fork's own tests run again by name
-# with a count check so a green run cannot skip them, a mutant proves the override itself
-# can go red, and a Linux release build runs only once BOTH the crate tests and that
-# mutant job pass, with the same steps as build-artifacts-manual.yml's linux job
+# bare "claude --resume <sid>" argv into a restored pane loses the wrapper. ADR-0001 (round
+# 3, bcf756db) settled the shape after two adversarial-review refusals: [session.agent_launchers]
+# maps an agent id to a single STRING typed VERBATIM as a command prefix, followed by a space
+# and the stock resume arguments serialized exactly as upstream serializes them - never routed
+# through a per-shell serializer, so the stock (no-launcher) path stays byte-identical to
+# upstream on every platform. This host cannot build the crate (no Zig 0.16.0), so the crate
+# tests run here on both platforms (nextest, one process per test), the fork's own tests run
+# again by name with a count check so a green run cannot skip them, a mutant proves the
+# override itself can go red, and a Linux release build runs only once BOTH the crate tests
+# and that mutant job pass, with the same steps as build-artifacts-manual.yml's linux job
 # (checksum uses blake3, not sha256, per this fleet's hashing policy). bd herdr-14v.
 name: Fork 14v resume launcher
 
@@ -62,18 +65,18 @@ jobs:
       - name: Run the crate tests
         run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
 
-      # The fork's own tests, by name: apply_launcher (the pure argv rewrite), the
-      # [session.agent_launchers] config parse and reload, the pure resume_shell_command
-      # seam test (launcher rewrite + crate::platform::interactive_shell_command
-      # together, no pane), and the two app-level tests that read back what
-      # start_pending_agent_resume() actually sends to the pane shell. The two
-      # app-level tests are #[cfg(unix)] (they drive a real pty), so Unix sees 10 and
-      # Windows sees 9: Windows drops those 2 but gains its own
-      # agent_launcher_path_with_space_round_trips_through_windows_shells (lives in
-      # src/platform/windows.rs, which only compiles on Windows at all) - 10 - 2 + 1.
-      # The count check fails the job if the filter matches fewer (or more) tests than
-      # the platform should have, so a green run that skipped, or silently gained, one
-      # of them is red.
+      # The fork's own tests, by name: 10 platform-agnostic pure tests of resume_command()
+      # (the stock path, the launcher-prefix composition, trimming, control-character
+      # fallback, upstream argument quoting, and the mutant-killing seam test), the
+      # [session.agent_launchers] config parse and reload (1 each), and 2 tests specific
+      # to each platform - #[cfg(unix)] app-level tests that read back what
+      # start_pending_agent_resume() actually sends to a real pty on Unix, and
+      # #[cfg(windows)] tests that execute the composed command through a real
+      # powershell.exe/cmd.exe on Windows (src/app/agent_resume.rs; nothing in
+      # src/platform/ carries an agent_launcher_ test any more - the fix has no per-shell
+      # serialization to test there). 10 + 1 + 1 + 2 = 14 on both platforms. The count
+      # check fails the job if the filter matches fewer (or more) tests than expected, so
+      # a green run that skipped, or silently gained, one of them is red.
       - name: Run the fork tests by name
         shell: bash
         run: |
@@ -81,21 +84,20 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=10
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=9
-          fi
+          expected=14
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
   agent-launcher-override-disabled-mutant:
-    # The whole fix is that apply_launcher() rewrites argv[0] from the configured
-    # launcher. This reapplies the disabled-override bug directly (as if
-    # [session.agent_launchers] were silently ignored) and requires the tests that
-    # exercise the override to fail: two pure apply_launcher tests, the pure
-    # resume_shell_command seam test, and the app-level test that only reaches its
-    # marker when the override actually ran. A green run here would mean those tests
-    # assert nothing about the override.
+    # The whole fix is that resume_command() types the configured launcher as a
+    # verbatim prefix ahead of the stock resume arguments. This reapplies the
+    # disabled-override bug directly (as if [session.agent_launchers] were silently
+    # ignored, always falling back to the stock command) and requires the tests that
+    # exercise the override to fail: five pure resume_command tests, the pure seam
+    # test that pins the launcher-vs-no-launcher difference, and the app-level test
+    # that only reaches its marker when the override actually ran (measured: exactly
+    # these 7 of the 14 agent_launcher_ tests go red under the mutant). A green run
+    # here would mean those tests assert nothing about the override.
     name: mutant - a disabled agent launcher override must be caught
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -126,8 +128,8 @@ jobs:
 
       - name: Disable the launcher override and require the override tests to fail
         run: |
-          perl -0pi -e 's/if launcher\n                \.first\(\)\n                \.is_some_and\(\|first\| !first\.trim\(\)\.is_empty\(\)\) =>/if false \/\* MUTANT agent launcher override disabled \*\/ =>/' src/agent_resume.rs
-          landed=$(grep -c 'MUTANT agent launcher override disabled' src/agent_resume.rs || true)
+          perl -0777 -pi -e 's/let prefix = launcher\n        \.map\(\|launcher\| launcher\.trim\(\)\)\n        \.filter\(\|launcher\| !launcher\.is_empty\(\) && !launcher\.chars\(\)\.any\(char::is_control\)\);/let prefix: Option<&str> = None \/* MUTANT agent launcher override disabled *\/;/' src/app/agent_resume.rs
+          landed=$(grep -c 'MUTANT agent launcher override disabled' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
           rc=0
@@ -137,9 +139,12 @@ jobs:
             echo "MUTANT SURVIVED: every agent launcher test passed with the override disabled"
             exit 1
           fi
-          for test in agent_launcher_override_replaces_argv0_and_keeps_args \
-                      agent_launcher_multi_element_launcher_prefixes_every_element \
-                      agent_launcher_resume_command_uses_launcher_rewritten_argv \
+          for test in agent_launcher_prefix_types_stock_arguments_after_it \
+                      agent_launcher_prefix_is_never_quoted \
+                      agent_launcher_prefix_whitespace_is_trimmed \
+                      agent_launcher_prefix_with_no_extra_arguments \
+                      agent_launcher_stock_arguments_keep_upstream_quoting \
+                      agent_launcher_resume_command_matches_launcher_composition \
                       agent_launcher_overrides_the_typed_resume_command; do
             grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
           done

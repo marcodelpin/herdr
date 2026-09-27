@@ -85,18 +85,29 @@ Herdr resumes panes that reported a native session reference through a current o
 
 By default, Herdr types the agent's standard resume command into the restored pane's shell, for
 example `claude --resume <id>`. If you normally start an agent through a wrapper, such as a script
-that selects an account or adds flags, configure a launcher override for that agent id:
+that selects an account or adds flags, configure a launcher override for that agent id. The value
+is typed VERBATIM as a prefix in the restored pane's own shell, so write it in that shell's syntax.
+A bash launcher:
 
 ```toml
 [session.agent_launchers]
-claude = ["cas"]
+claude = "cas"
 ```
 
-The launcher's elements replace the resume command's own executable; the rest of the command (for
-example `--resume <id>`) is appended unchanged, so `claude = ["cas"]` types `cas --resume <id>`
-instead of `claude --resume <id>`. A launcher can have more than one element, for example
-`["claude-as", "08"]`. Leaving an agent out of `agent_launchers`, or giving it an empty list, keeps
-the stock resume command for that agent.
+or, for a pane whose shell is PowerShell:
+
+```toml
+[session.agent_launchers]
+claude = "& 'C:\\Agent Tools\\cas.ps1'"
+```
+
+The launcher is typed exactly as written, followed by a space and the stock resume arguments (for
+example `--resume <id>`), so `claude = "cas"` types `cas --resume <id>` instead of
+`claude --resume <id>`. Leaving an agent out of `agent_launchers`, or giving it an empty or
+all-whitespace value, keeps the stock resume command for that agent. A value containing a control
+character (a newline, a carriage return, or any other control character) is rejected with a
+warning and treated the same as no override, so a config value can never type more than one
+command line.
 
 After a client attaches and provides terminal size and theme context, Herdr resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 

@@ -325,31 +325,6 @@ pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> S
     )
 }
 
-/// Rewrite a resume plan's argv through a configured per-agent launcher.
-///
-/// The launcher's elements replace `argv[0]`; the rest of `argv` is appended
-/// unchanged. A missing launcher, an empty launcher, or a launcher whose first
-/// element is empty or all whitespace leaves `argv` untouched. This is how
-/// `[session.agent_launchers]` lets a restored pane run through an account or
-/// flag wrapper (for example `cas --resume <id>`) instead of the bare agent
-/// binary.
-pub fn apply_launcher(argv: &[String], launcher: Option<&Vec<String>>) -> Vec<String> {
-    match launcher {
-        Some(launcher)
-            if launcher
-                .first()
-                .is_some_and(|first| !first.trim().is_empty()) =>
-        {
-            launcher
-                .iter()
-                .cloned()
-                .chain(argv.iter().skip(1).cloned())
-                .collect()
-        }
-        _ => argv.to_vec(),
-    }
-}
-
 pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
@@ -975,55 +950,5 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
-    }
-
-    fn resume_argv() -> Vec<String> {
-        vec!["claude".into(), "--resume".into(), "sid".into()]
-    }
-
-    #[test]
-    fn agent_launcher_override_replaces_argv0_and_keeps_args() {
-        let launcher = vec!["cas".to_string()];
-        assert_eq!(
-            apply_launcher(&resume_argv(), Some(&launcher)),
-            vec!["cas".to_string(), "--resume".to_string(), "sid".to_string()]
-        );
-    }
-
-    #[test]
-    fn agent_launcher_multi_element_launcher_prefixes_every_element() {
-        let launcher = vec!["claude-as".to_string(), "08".to_string()];
-        assert_eq!(
-            apply_launcher(&resume_argv(), Some(&launcher)),
-            vec![
-                "claude-as".to_string(),
-                "08".to_string(),
-                "--resume".to_string(),
-                "sid".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn agent_launcher_none_leaves_argv_unchanged() {
-        assert_eq!(apply_launcher(&resume_argv(), None), resume_argv());
-    }
-
-    #[test]
-    fn agent_launcher_empty_vec_leaves_argv_unchanged() {
-        let launcher: Vec<String> = Vec::new();
-        assert_eq!(
-            apply_launcher(&resume_argv(), Some(&launcher)),
-            resume_argv()
-        );
-    }
-
-    #[test]
-    fn agent_launcher_empty_first_element_leaves_argv_unchanged() {
-        let launcher = vec!["   ".to_string()];
-        assert_eq!(
-            apply_launcher(&resume_argv(), Some(&launcher)),
-            resume_argv()
-        );
     }
 }
