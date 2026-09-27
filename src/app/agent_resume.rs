@@ -394,16 +394,17 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// True when `launcher` is configured (non-empty after trimming) but its
-/// text contains a control character (CR, LF, or any other control
-/// character), so a config value can never type more than one command line.
+/// True when `launcher` is configured and not blank but its text contains a
+/// control character anywhere, including at either end (CR, LF, tab, or any
+/// other C0/C1 control character), so a config value can never type more than
+/// one command line.
 /// Kept separate from `resume_command` below purely so the caller can log a
 /// warning naming the pane and agent; `resume_command` itself treats this
 /// case identically to no launcher at all.
 fn launcher_has_control_character(launcher: Option<&String>) -> bool {
-    launcher
-        .map(|launcher| launcher.trim())
-        .is_some_and(|launcher| !launcher.is_empty() && launcher.chars().any(char::is_control))
+    launcher.is_some_and(|launcher| {
+        !launcher.trim().is_empty() && launcher.chars().any(char::is_control)
+    })
 }
 
 /// Composes the text to type into a restored pane's shell for `argv` (a
@@ -415,15 +416,15 @@ fn launcher_has_control_character(launcher: Option<&String>) -> bool {
 /// stock resume command, byte-identical to what upstream types with no
 /// launcher configured (ADR-0001).
 ///
-/// Otherwise, `launcher` trimmed is typed VERBATIM as a prefix - never
+/// Otherwise, `launcher` is typed VERBATIM as a prefix - never trimmed,
 /// quoted or escaped, because it is already exactly what the operator would
 /// type into that pane's own shell - followed by a space and `argv[1..]`
 /// serialized exactly as upstream serializes the stock resume arguments, or
 /// nothing if `argv` has no arguments beyond `argv[0]`.
 fn resume_command(argv: &[String], launcher: Option<&String>) -> Option<String> {
     let prefix = launcher
-        .map(|launcher| launcher.trim())
-        .filter(|launcher| !launcher.is_empty() && !launcher.chars().any(char::is_control));
+        .map(String::as_str)
+        .filter(|launcher| !launcher.trim().is_empty() && !launcher.chars().any(char::is_control));
     let Some(prefix) = prefix else {
         return shell_command_from_argv(argv);
     };
@@ -1265,23 +1266,35 @@ mod tests {
     }
 
     #[test]
-    fn agent_launcher_prefix_whitespace_is_trimmed() {
-        let launcher = "  cas  ".to_string();
+    fn agent_launcher_prefix_is_typed_verbatim_with_its_spaces() {
+        // ADR-0001: the prefix is typed exactly as configured. Surrounding
+        // spaces are harmless to a shell, and trimming would also strip
+        // characters that are part of a name (a trailing no-break space).
+        let launcher = "  cas\u{a0} ".to_string();
         assert_eq!(
             resume_command(&resume_command_test_argv(), Some(&launcher)).as_deref(),
-            Some("cas --resume sid")
+            Some("  cas\u{a0}  --resume sid")
         );
     }
 
     #[test]
     fn agent_launcher_control_character_falls_back_to_stock_command() {
-        for control in ['\n', '\r', '\t'] {
-            let launcher = format!("cas{control}--resume-elsewhere");
-            assert_eq!(
-                resume_command(&resume_command_test_argv(), Some(&launcher)),
-                shell_command_from_argv(&resume_command_test_argv()),
-                "a launcher containing {control:?} must fall back to the stock command"
-            );
+        // Inside the prefix and at either end: a control character at the
+        // boundary must not be trimmed away and accepted (codex r4). U+0085
+        // (NEL) is a C1 control that str::trim would also have removed.
+        for control in ['\n', '\r', '\t', '\u{85}'] {
+            for launcher in [
+                format!("cas{control}--resume-elsewhere"),
+                format!("cas{control}"),
+                format!("{control}cas"),
+            ] {
+                assert!(launcher_has_control_character(Some(&launcher)));
+                assert_eq!(
+                    resume_command(&resume_command_test_argv(), Some(&launcher)),
+                    shell_command_from_argv(&resume_command_test_argv()),
+                    "a launcher {launcher:?} must fall back to the stock command"
+                );
+            }
         }
     }
 
