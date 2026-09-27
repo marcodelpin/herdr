@@ -1746,6 +1746,22 @@ impl<'a> PaneShellConfig<'a> {
             mode,
         }
     }
+
+    /// The shell program a pane launched with this config actually runs,
+    /// resolved the same way `pane_shell_command_builder` resolves it: an
+    /// explicit `default_shell` wins, otherwise `$SHELL` on Unix or the
+    /// Windows default (the first `pwsh.exe` on `PATH`, else
+    /// `powershell.exe`).
+    ///
+    /// A caller that needs the shell name for something other than
+    /// launching the pane itself (serializing a typed command through
+    /// `crate::platform::interactive_shell_command`, say) should use this
+    /// rather than probing the pane's foreground process: right after
+    /// `TerminalRuntime::spawn` the freshly spawned shell has not
+    /// necessarily settled enough for that probe to answer yet.
+    pub(crate) fn resolved_shell_name(&self) -> String {
+        pane_shell(self.default_shell)
+    }
 }
 
 /// Target platform for shell launch policy. Parameterized (instead of raw
