@@ -155,12 +155,13 @@ jobs:
     needs: [crate-tests, agent-launcher-override-disabled-mutant]
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # Same LIBGHOSTTY_VT_* defaults as build-artifacts-manual.yml's workflow_dispatch
-    # inputs (ReleaseSafe / false); this push-triggered workflow has no inputs to read
-    # them from.
+    # Same LIBGHOSTTY_VT_* settings as preview.yml's release builds (ReleaseFast / SIMD
+    # on), which is what the dcc server ran before this binary replaced it and what the
+    # fork's Windows package uses. The build-artifacts-manual.yml input defaults
+    # (ReleaseSafe / false) would silently swap the server's VT engine for a slower one.
     env:
-      LIBGHOSTTY_VT_OPTIMIZE: ReleaseSafe
-      LIBGHOSTTY_VT_SIMD: 'false'
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
