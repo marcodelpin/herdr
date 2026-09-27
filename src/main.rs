@@ -406,6 +406,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
 
+# Per-agent launcher override for native agent session restore, keyed by agent
+# id (for example "claude"). When set, its elements replace argv[0] of the
+# resume command and the rest of the stock argv is appended unchanged, so a
+# restored pane runs through an account or flag wrapper instead of the bare
+# agent binary. Missing or empty means no override.
+# [session.agent_launchers]
+# claude = ["cas"]
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that

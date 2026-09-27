@@ -1447,6 +1447,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.agent_launchers",
+          "type": "table of argv lists",
+          "default": "{}",
+          "description": "Per-agent launcher override for native agent session restore, keyed by agent id. When set to a non-empty list, its elements replace argv[0] of the resume command and the rest of the plan's argv is appended unchanged, so a restored pane can run through an account or flag wrapper (for example [\"cas\"]) instead of the bare agent binary. Missing or empty means no override."
         }
       ]
     },
