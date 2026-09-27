@@ -103,11 +103,20 @@ mod tests {
 
     #[test]
     fn quiet_connection_is_probed_then_expires_without_a_reply() {
+        // Marking the endpoint ready disables the initial-snapshot timeout, so the Expired
+        // action below can only come from the probe reply window actually expiring, not from
+        // the unrelated 10 s snapshot deadline that would also cover this instant.
         let now = Instant::now();
         let mut health = EndpointHealth::new(now);
+        health.ready();
         assert_eq!(health.action(now), HealthAction::None);
         assert_eq!(health.action(now + HEARTBEAT_INTERVAL), HealthAction::Ping);
         health.ping_sent(now + HEARTBEAT_INTERVAL);
+        assert_eq!(
+            health.action(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT - Duration::from_millis(1)),
+            HealthAction::None,
+            "the probe reply window expired a millisecond early"
+        );
         assert_eq!(
             health.action(now + HEARTBEAT_INTERVAL + HEARTBEAT_TIMEOUT),
             HealthAction::Expired
