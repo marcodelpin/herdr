@@ -239,8 +239,18 @@ impl App {
         }
 
         let launcher = self.state.agent_launchers.get(&plan.agent);
-        let effective_argv = crate::agent_resume::apply_launcher(&plan.argv, launcher);
-        let Some(resume_command) = shell_command_from_argv(&effective_argv) else {
+        // Serialize through the shell the restored pane will actually run,
+        // resolved from the same PaneShellConfig that TerminalRuntime::spawn
+        // below uses to launch it - not by probing the pane's foreground
+        // process afterward. That process has just been spawned a few lines
+        // down and may not have settled enough for such a probe to answer
+        // yet, and this resume command must be computed and validated (the
+        // empty-argv check right below) before we decide whether to spawn
+        // anything at all.
+        let shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        let shell_name = shell_config.resolved_shell_name();
+        let Some(resume_command) = resume_shell_command(&plan.argv, launcher, &shell_name) else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -273,7 +283,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
             self.state.host_terminal_appearance,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            shell_config,
             &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
@@ -355,31 +365,18 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
-fn shell_command_from_argv(argv: &[String]) -> Option<String> {
-    let mut parts = argv.iter();
-    let first = shell_quote(parts.next()?);
-    let mut command = first;
-    for part in parts {
-        command.push(' ');
-        command.push_str(&shell_quote(part));
-    }
-    Some(command)
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='
-            )
-    }) {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// Applies the configured launcher override to `argv`, then serializes the
+/// result for typing into `shell_name` via
+/// `crate::platform::interactive_shell_command`. This is the one seam where
+/// the launcher rewrite and the shell serialization meet, so tests can pin
+/// both without spawning a real pane.
+fn resume_shell_command(
+    argv: &[String],
+    launcher: Option<&Vec<String>>,
+    shell_name: &str,
+) -> Option<String> {
+    let effective_argv = crate::agent_resume::apply_launcher(argv, launcher);
+    crate::platform::interactive_shell_command(&effective_argv, shell_name)
 }
 
 #[cfg(test)]
@@ -1136,18 +1133,42 @@ mod tests {
         }
     }
 
+    // Pure seam test (no pane, no shell process): resume_shell_command()
+    // must apply the configured launcher override before handing the
+    // resulting argv to crate::platform::interactive_shell_command(), not
+    // serialize the plan's stock argv directly. The assert_ne! is the one
+    // that actually distinguishes the two - it reddens under the same
+    // "agent launcher override disabled" mutant the CI mutant job applies
+    // to apply_launcher(), which is exactly the regression this seam guards.
     #[test]
-    fn shell_command_from_argv_quotes_resume_arguments() {
+    fn agent_launcher_resume_command_uses_launcher_rewritten_argv() {
         let argv = vec![
             "claude".to_string(),
             "--resume".to_string(),
             "session with ' quote".to_string(),
         ];
+        let launcher = vec!["cas".to_string()];
+        let shell = "bash";
+
+        let expected_argv = crate::agent_resume::apply_launcher(&argv, Some(&launcher));
+        assert_eq!(
+            expected_argv,
+            vec![
+                "cas".to_string(),
+                "--resume".to_string(),
+                "session with ' quote".to_string(),
+            ]
+        );
 
         assert_eq!(
-            shell_command_from_argv(&argv).as_deref(),
-            Some("claude --resume 'session with '\\'' quote'")
+            resume_shell_command(&argv, Some(&launcher), shell),
+            crate::platform::interactive_shell_command(&expected_argv, shell),
         );
-        assert_eq!(shell_command_from_argv(&[]), None);
+        assert_ne!(
+            resume_shell_command(&argv, Some(&launcher), shell),
+            crate::platform::interactive_shell_command(&argv, shell),
+            "a configured launcher must change the serialized resume command"
+        );
+        assert_eq!(resume_shell_command(&[], None, shell), None);
     }
 }
