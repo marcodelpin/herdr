@@ -66,7 +66,7 @@ jobs:
         run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
 
       # The fork's own tests, by name: 10 platform-agnostic pure tests of resume_command()
-      # (the stock path, the launcher-prefix composition, trimming, control-character
+      # (the stock path, the launcher-prefix composition, verbatim spacing, control-character
       # fallback, upstream argument quoting, and the mutant-killing seam test), the
       # [session.agent_launchers] config parse and reload (1 each), and 2 tests specific
       # to each platform - #[cfg(unix)] app-level tests that read back what
@@ -128,7 +128,7 @@ jobs:
 
       - name: Disable the launcher override and require the override tests to fail
         run: |
-          perl -0777 -pi -e 's/let prefix = launcher\n        \.map\(\|launcher\| launcher\.trim\(\)\)\n        \.filter\(\|launcher\| !launcher\.is_empty\(\) && !launcher\.chars\(\)\.any\(char::is_control\)\);/let prefix: Option<&str> = None \/* MUTANT agent launcher override disabled *\/;/' src/app/agent_resume.rs
+          perl -0777 -pi -e 's/let prefix = launcher\n        \.map\(String::as_str\)\n        \.filter\(\|launcher\| !launcher\.trim\(\)\.is_empty\(\) && !launcher\.chars\(\)\.any\(char::is_control\)\);/let prefix: Option<&str> = None \/* MUTANT agent launcher override disabled *\/;/' src/app/agent_resume.rs
           landed=$(grep -c 'MUTANT agent launcher override disabled' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
@@ -141,7 +141,7 @@ jobs:
           fi
           for test in agent_launcher_prefix_types_stock_arguments_after_it \
                       agent_launcher_prefix_is_never_quoted \
-                      agent_launcher_prefix_whitespace_is_trimmed \
+                      agent_launcher_prefix_is_typed_verbatim_with_its_spaces \
                       agent_launcher_prefix_with_no_extra_arguments \
                       agent_launcher_stock_arguments_keep_upstream_quoting \
                       agent_launcher_resume_command_matches_launcher_composition \
