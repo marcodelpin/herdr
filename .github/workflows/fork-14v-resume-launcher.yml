@@ -1,0 +1,208 @@
+# Fork-only workflow for fix/14v-resume-launcher (not for upstream): the operator launches
+# claude through an account/flag wrapper (cas), so a native agent resume that types the
+# bare "claude --resume <sid>" argv into a restored pane loses the wrapper. This adds
+# [session.agent_launchers], applied right before the resume command is sent to the pane
+# shell. This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on
+# both platforms (nextest, one process per test), the fork's own tests run again by name
+# with a count check so a green run cannot skip them, a mutant proves the override itself
+# can go red, and a Linux release build runs only once the tests pass, with the same
+# steps as build-artifacts-manual.yml's linux job (checksum uses blake3, not sha256, per
+# this fleet's hashing policy). bd herdr-14v.
+name: Fork 14v resume launcher
+
+on:
+  push:
+    branches: [fix/14v-resume-launcher]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      # nextest runs one process per test, like `just ci` upstream. A plain `cargo test`
+      # binary died with SIGPIPE (signal 13) in the plugins action tests on the first run
+      # of the animated-working-indicator workflow (run 34568308787), taking every later
+      # test with it.
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      # The fork's own tests, by name: apply_launcher (the pure argv rewrite), the
+      # [session.agent_launchers] config parse and reload, and the two app-level tests
+      # that read back what start_pending_agent_resume() actually sends to the pane
+      # shell. The count check fails the job if the filter matches fewer tests than the
+      # fork added, so a green run that skipped them is red.
+      - name: Run the fork tests by name
+        shell: bash
+        run: |
+          filter='test(/::agent_launcher_/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
+          cat fork-tests.txt
+          count=$(grep -c . fork-tests.txt || true)
+          [ "$count" = 9 ] || { echo "expected 9 fork tests, the filter matched $count"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
+
+  agent-launcher-override-disabled-mutant:
+    # The whole fix is that apply_launcher() rewrites argv[0] from the configured
+    # launcher. This reapplies the disabled-override bug directly (as if
+    # [session.agent_launchers] were silently ignored) and requires the tests that
+    # exercise the override to fail: two pure apply_launcher tests and the app-level
+    # test that only reaches its marker when the override actually ran. A green run
+    # here would mean those tests assert nothing about the override.
+    name: mutant - a disabled agent launcher override must be caught
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Disable the launcher override and require the override tests to fail
+        run: |
+          perl -0pi -e 's/if launcher\n                \.first\(\)\n                \.is_some_and\(\|first\| !first\.trim\(\)\.is_empty\(\)\) =>/if false \/\* MUTANT agent launcher override disabled \*\/ =>/' src/agent_resume.rs
+          landed=$(grep -c 'MUTANT agent launcher override disabled' src/agent_resume.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_launcher_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every agent launcher test passed with the override disabled"
+            exit 1
+          fi
+          for test in agent_launcher_override_replaces_argv0_and_keeps_args \
+                      agent_launcher_multi_element_launcher_prefixes_every_element \
+                      agent_launcher_overrides_the_typed_resume_command; do
+            grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
+          done
+          echo "mutant killed: the override tests failed with the launcher override disabled"
+
+  build-linux:
+    name: build herdr-linux-x86_64
+    needs: crate-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Same LIBGHOSTTY_VT_* defaults as build-artifacts-manual.yml's workflow_dispatch
+    # inputs (ReleaseSafe / false); this push-triggered workflow has no inputs to read
+    # them from.
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseSafe
+      LIBGHOSTTY_VT_SIMD: 'false'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Prefer official Ubuntu mirrors over Azure
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+            echo "Using apt mirrors:"
+            cat /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install Linux build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/herdr herdr-linux-x86_64
+          file herdr-linux-x86_64 > BUILD_INFO.txt
+          ldd herdr-linux-x86_64 2>&1 | tee -a BUILD_INFO.txt
+          grep -q "statically linked" BUILD_INFO.txt
+          if nm -u herdr-linux-x86_64 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
+            echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
+            exit 1
+          fi
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "target=x86_64-unknown-linux-musl"
+            echo "libghostty_vt_optimize=$LIBGHOSTTY_VT_OPTIMIZE"
+            echo "libghostty_vt_simd=$LIBGHOSTTY_VT_SIMD"
+          } >> BUILD_INFO.txt
+          python3 -m pip install --quiet blake3
+          python3 -c "import blake3, pathlib; artifact = pathlib.Path('herdr-linux-x86_64'); print(f'blake3={blake3.blake3(artifact.read_bytes()).hexdigest()}  {artifact.name}')" >> BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-linux-x86_64-fix14v
+          path: |
+            herdr-linux-x86_64
+            BUILD_INFO.txt
+          retention-days: 7
