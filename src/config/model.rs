@@ -1415,6 +1415,26 @@ resume_agents_on_restore = false
     }
 
     #[test]
+    fn agent_launcher_config_defaults_empty_and_parses_alongside_resume_flag() {
+        let default_config = Config::default();
+        assert!(default_config.session.agent_launchers.is_empty());
+
+        let toml = r#"
+[session]
+resume_agents_on_restore = false
+
+[session.agent_launchers]
+claude = ["cas"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(
+            config.session.agent_launchers.get("claude"),
+            Some(&vec!["cas".to_string()])
+        );
+    }
+
+    #[test]
     fn agent_panel_sort_config_parses_alias_and_defaults() {
         assert_eq!(
             Config::default().ui.agent_panel_sort,

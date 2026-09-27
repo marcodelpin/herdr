@@ -512,6 +512,173 @@ mod tests {
         }
     }
 
+    // Runs a real, short-lived /bin/sh -c command that prints a unique marker
+    // and then sleeps, the same technique marker_resume_test_argv uses. The
+    // marker only reaches the pane history if the typed command actually ran,
+    // so this proves what got sent to the shell rather than merely echoed.
+    #[cfg(unix)]
+    fn launcher_target_marker_argv(marker: &str) -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf '%s' '{marker}'; sleep 5"),
+        ]
+    }
+
+    #[cfg(unix)]
+    async fn assert_marker_reaches_pane(
+        runtime: &crate::terminal::TerminalRuntime,
+        marker: &str,
+        failure_context: &str,
+    ) {
+        for _ in 0..20 {
+            if runtime
+                .snapshot_history()
+                .is_some_and(|text| text.contains(marker))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            runtime
+                .snapshot_history()
+                .expect("runtime should expose terminal history")
+                .contains(marker),
+            "{failure_context}"
+        );
+    }
+
+    // App-level seam: start_pending_agent_resume() has no method that returns
+    // the resolved argv on its own, so this drives the same public entry
+    // point pending_agent_resume_waits_for_host_theme_before_launch uses and
+    // reads back what actually ran in the restored pane's shell, via its
+    // pty history. argv[0] in the plan is a name that cannot run; only the
+    // configured launcher resolves to something runnable, so the marker
+    // reaching the pane proves the launcher override was applied to the
+    // command sent to the shell, not merely computed and discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_overrides_the_typed_resume_command() {
+        let mut app = test_app();
+        app.state
+            .agent_launchers
+            .insert("claude".into(), vec!["/bin/sh".into()]);
+        let workspace = crate::workspace::Workspace::test_new("restored");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        let pane_infos = workspace.tabs[0]
+            .layout
+            .panes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.state.view.pane_infos = pane_infos;
+
+        let mut launcher_argv = launcher_target_marker_argv("launcher-override-marker");
+        launcher_argv[0] = "herdr-test-unresolved-agent-binary".into();
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: launcher_argv,
+            dedupe_key: "herdr:claude\0claude\0Id\0launcher-test-session".into(),
+        });
+        app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
+            foreground: Some(crate::terminal_theme::RgbColor {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 20,
+                g: 20,
+                b: 20,
+            }),
+            ..Default::default()
+        };
+
+        assert!(app.start_pending_agent_resumes(false));
+        let runtime = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("pending resume should launch");
+        assert_marker_reaches_pane(
+            runtime,
+            "launcher-override-marker",
+            "a configured agent launcher should replace argv[0] with a runnable command",
+        )
+        .await;
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // Mirror of agent_launcher_overrides_the_typed_resume_command: with no
+    // agent_launchers entry for "claude", the plan's own argv[0] ("/bin/sh")
+    // must run unmodified.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_absent_runs_the_stock_resume_argv() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("restored");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        let pane_infos = workspace.tabs[0]
+            .layout
+            .panes(ratatui::layout::Rect::new(0, 0, 100, 30));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.state.view.pane_infos = pane_infos;
+
+        let terminal = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist");
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: launcher_target_marker_argv("stock-argv-marker"),
+            dedupe_key: "herdr:claude\0claude\0Id\0stock-test-session".into(),
+        });
+        app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
+            foreground: Some(crate::terminal_theme::RgbColor {
+                r: 220,
+                g: 220,
+                b: 220,
+            }),
+            background: Some(crate::terminal_theme::RgbColor {
+                r: 20,
+                g: 20,
+                b: 20,
+            }),
+            ..Default::default()
+        };
+
+        assert!(app.start_pending_agent_resumes(false));
+        let runtime = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("pending resume should launch");
+        assert_marker_reaches_pane(
+            runtime,
+            "stock-argv-marker",
+            "an unconfigured agent should run its stock resume argv unchanged",
+        )
+        .await;
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn pending_agent_resume_can_launch_after_theme_wait_expires() {

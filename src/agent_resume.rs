@@ -856,4 +856,54 @@ mod tests {
         )
         .is_none());
     }
+
+    fn resume_argv() -> Vec<String> {
+        vec!["claude".into(), "--resume".into(), "sid".into()]
+    }
+
+    #[test]
+    fn agent_launcher_override_replaces_argv0_and_keeps_args() {
+        let launcher = vec!["cas".to_string()];
+        assert_eq!(
+            apply_launcher(&resume_argv(), Some(&launcher)),
+            vec!["cas".to_string(), "--resume".to_string(), "sid".to_string()]
+        );
+    }
+
+    #[test]
+    fn agent_launcher_multi_element_launcher_prefixes_every_element() {
+        let launcher = vec!["claude-as".to_string(), "08".to_string()];
+        assert_eq!(
+            apply_launcher(&resume_argv(), Some(&launcher)),
+            vec![
+                "claude-as".to_string(),
+                "08".to_string(),
+                "--resume".to_string(),
+                "sid".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_launcher_none_leaves_argv_unchanged() {
+        assert_eq!(apply_launcher(&resume_argv(), None), resume_argv());
+    }
+
+    #[test]
+    fn agent_launcher_empty_vec_leaves_argv_unchanged() {
+        let launcher: Vec<String> = Vec::new();
+        assert_eq!(
+            apply_launcher(&resume_argv(), Some(&launcher)),
+            resume_argv()
+        );
+    }
+
+    #[test]
+    fn agent_launcher_empty_first_element_leaves_argv_unchanged() {
+        let launcher = vec!["   ".to_string()];
+        assert_eq!(
+            apply_launcher(&resume_argv(), Some(&launcher)),
+            resume_argv()
+        );
+    }
 }
