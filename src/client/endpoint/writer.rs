@@ -336,6 +336,11 @@ mod tests {
             receipt.transmitted_at().is_none(),
             "a frame no peer has read reported itself transmitted"
         );
+        // A worker that stamps the receipt when it dequeues the frame, before write_frame ever
+        // blocks on the peer, would still satisfy `>= queued_at` below: that instant is only
+        // milliseconds after `queued_at`. Anchor on the end of the deliberately blocked phase
+        // instead, so a pre-write timestamp fails this assertion.
+        let blocked_phase_end = Instant::now();
 
         let (done, received) = mpsc::channel();
         let reader = std::thread::spawn(move || {
@@ -367,6 +372,11 @@ mod tests {
             .transmitted_at()
             .expect("the writer accepted every byte, so the receipt must report an instant");
         assert!(transmitted >= queued_at);
+        assert!(
+            transmitted >= blocked_phase_end,
+            "receipt reported an instant from before the peer drained the frame, \
+             not the instant the writer accepted its last byte"
+        );
         drop(transport);
         let _ = std::fs::remove_file(path);
     }

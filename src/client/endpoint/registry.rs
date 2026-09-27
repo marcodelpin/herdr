@@ -580,6 +580,10 @@ mod tests {
             negotiation(),
             false,
         );
+        // Ready disables the initial-snapshot timeout, so the survival check just before the
+        // probe deadline below (and the expiry right at it) can only come from the probe reply
+        // window itself, not from the unrelated 10 s snapshot deadline both cover otherwise.
+        registry.mark_ready(&ssh_id, 2);
         let now = Instant::now();
         registry.tick_health(now + super::super::health::HEARTBEAT_INTERVAL);
         assert!(matches!(
@@ -587,6 +591,16 @@ mod tests {
             [ClientMessage::EndpointControl { kind, .. }]
                 if kind == crate::protocol::endpoint::HEALTH_PING_KIND
         ));
+
+        registry.tick_health(
+            now + super::super::health::HEARTBEAT_INTERVAL
+                + super::super::health::HEARTBEAT_TIMEOUT
+                - std::time::Duration::from_millis(1),
+        );
+        assert!(
+            registry.connection(&ssh_id).is_some(),
+            "the connection expired a millisecond before the probe reply window closed"
+        );
 
         registry.tick_health(
             now + super::super::health::HEARTBEAT_INTERVAL
