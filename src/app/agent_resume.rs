@@ -217,7 +217,9 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        let launcher = self.state.agent_launchers.get(&plan.agent);
+        let effective_argv = crate::agent_resume::apply_launcher(&plan.argv, launcher);
+        let Some(resume_command) = shell_command_from_argv(&effective_argv) else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,

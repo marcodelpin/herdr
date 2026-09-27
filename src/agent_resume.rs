@@ -262,6 +262,31 @@ pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> S
     )
 }
 
+/// Rewrite a resume plan's argv through a configured per-agent launcher.
+///
+/// The launcher's elements replace `argv[0]`; the rest of `argv` is appended
+/// unchanged. A missing launcher, an empty launcher, or a launcher whose first
+/// element is empty or all whitespace leaves `argv` untouched. This is how
+/// `[session.agent_launchers]` lets a restored pane run through an account or
+/// flag wrapper (for example `cas --resume <id>`) instead of the bare agent
+/// binary.
+pub fn apply_launcher(argv: &[String], launcher: Option<&Vec<String>>) -> Vec<String> {
+    match launcher {
+        Some(launcher)
+            if launcher
+                .first()
+                .is_some_and(|first| !first.trim().is_empty()) =>
+        {
+            launcher
+                .iter()
+                .cloned()
+                .chain(argv.iter().skip(1).cloned())
+                .collect()
+        }
+        _ => argv.to_vec(),
+    }
+}
+
 pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),

@@ -83,6 +83,21 @@ resume_agents_on_restore = false
 
 Herdr only resumes panes that reported a native session reference through a current official Herdr integration.
 
+By default, Herdr types the agent's standard resume command into the restored pane's shell, for
+example `claude --resume <id>`. If you normally start an agent through a wrapper, such as a script
+that selects an account or adds flags, configure a launcher override for that agent id:
+
+```toml
+[session.agent_launchers]
+claude = ["cas"]
+```
+
+The launcher's elements replace the resume command's own executable; the rest of the command (for
+example `--resume <id>`) is appended unchanged, so `claude = ["cas"]` types `cas --resume <id>`
+instead of `claude --resume <id>`. A launcher can have more than one element, for example
+`["claude-as", "08"]`. Leaving an agent out of `agent_launchers`, or giving it an empty list, keeps
+the stock resume command for that agent.
+
 After a client attaches and provides terminal size and theme context, Herdr resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 
 Native session restore requires these Herdr integration versions or newer:

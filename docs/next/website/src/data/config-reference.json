@@ -1441,6 +1441,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Resume supported AI-agent panes into their native conversation sessions when restoring a Herdr session."
+        },
+        {
+          "key": "session.agent_launchers",
+          "type": "table of argv lists",
+          "default": "{}",
+          "description": "Per-agent launcher override for native agent session restore, keyed by agent id. When set to a non-empty list, its elements replace argv[0] of the resume command and the rest of the plan's argv is appended unchanged, so a restored pane can run through an account or flag wrapper (for example [\"cas\"]) instead of the bare agent binary. Missing or empty means no override."
         }
       ]
     },

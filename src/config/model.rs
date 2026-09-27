@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -268,12 +271,22 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Per-agent launcher override for native agent session restore, keyed by
+    /// the same agent id the resume plan carries (for example "claude").
+    /// When present and non-empty with a non-blank first element, its
+    /// elements replace argv[0] of the resume command and the rest of the
+    /// plan's argv is appended unchanged, so a restored pane can run through
+    /// an account or flag wrapper (for example `cas --resume <id>`) instead
+    /// of the bare agent binary. Missing or empty means no override.
+    /// Default: empty.
+    pub agent_launchers: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            agent_launchers: BTreeMap::new(),
         }
     }
 }

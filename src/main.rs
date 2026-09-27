@@ -404,6 +404,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
 
+# Per-agent launcher override for native agent session restore, keyed by agent
+# id (for example "claude"). When set, its elements replace argv[0] of the
+# resume command and the rest of the stock argv is appended unchanged, so a
+# restored pane runs through an account or flag wrapper instead of the bare
+# agent binary. Missing or empty means no override.
+# [session.agent_launchers]
+# claude = ["cas"]
+
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that
