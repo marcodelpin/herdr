@@ -65,8 +65,10 @@ jobs:
       # The fork's own tests, by name: apply_launcher (the pure argv rewrite), the
       # [session.agent_launchers] config parse and reload, and the two app-level tests
       # that read back what start_pending_agent_resume() actually sends to the pane
-      # shell. The count check fails the job if the filter matches fewer tests than the
-      # fork added, so a green run that skipped them is red.
+      # shell. The two app-level tests are #[cfg(unix)] (they drive a real pty), so
+      # Windows sees 7, not 9. The count check fails the job if the filter matches
+      # fewer tests than the platform should have, so a green run that skipped them
+      # is red.
       - name: Run the fork tests by name
         shell: bash
         run: |
@@ -74,7 +76,11 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          [ "$count" = 9 ] || { echo "expected 9 fork tests, the filter matched $count"; exit 1; }
+          expected=9
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            expected=7
+          fi
+          [ "$count" = "$expected" ] || { echo "expected $expected fork tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
   agent-launcher-override-disabled-mutant:

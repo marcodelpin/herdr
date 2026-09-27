@@ -616,17 +616,29 @@ mod tests {
         }
     }
 
-    // Runs a real, short-lived /bin/sh -c command that prints a unique marker
-    // and then sleeps, the same technique marker_resume_test_argv uses. The
-    // marker only reaches the pane history if the typed command actually ran,
-    // so this proves what got sent to the shell rather than merely echoed.
+    // Runs a real, short-lived /bin/sh -c command that prints a*b (computed by
+    // the spawned shell's own arithmetic expansion, not this test) wrapped in
+    // a distinctive marker, then sleeps. Terminal local echo reflects the
+    // RAW TYPED bytes regardless of whether the command that follows ever
+    // runs, so a literal marker string embedded in argv would reach the pane
+    // history just from being typed - a plan whose argv[0] cannot execute
+    // would still make an earlier version of this test pass. Checking for
+    // the PRODUCT instead of the typed factors means the check string never
+    // appears in the bytes sent to the shell; it can only appear in the pane
+    // history if a shell actually evaluated "$(( a * b ))", which only
+    // happens when the command that was typed actually ran.
     #[cfg(unix)]
-    fn launcher_target_marker_argv(marker: &str) -> Vec<String> {
+    fn launcher_target_check_argv(a: u64, b: u64, tag: &str) -> Vec<String> {
         vec![
             "/bin/sh".into(),
             "-c".into(),
-            format!("printf '%s' '{marker}'; sleep 5"),
+            format!("printf 'HERDR-CHECK-{tag}-%s-END' \"$(( {a} * {b} ))\"; sleep 5"),
         ]
+    }
+
+    #[cfg(unix)]
+    fn launcher_target_check_marker(a: u64, b: u64, tag: &str) -> String {
+        format!("HERDR-CHECK-{tag}-{}-END", a * b)
     }
 
     #[cfg(unix)]
@@ -680,7 +692,8 @@ mod tests {
         app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
         app.state.view.pane_infos = pane_infos;
 
-        let mut launcher_argv = launcher_target_marker_argv("launcher-override-marker");
+        let (a, b, tag) = (733u64, 617u64, "override");
+        let mut launcher_argv = launcher_target_check_argv(a, b, tag);
         launcher_argv[0] = "herdr-test-unresolved-agent-binary".into();
         let terminal = app
             .state
@@ -713,7 +726,7 @@ mod tests {
             .expect("pending resume should launch");
         assert_marker_reaches_pane(
             runtime,
-            "launcher-override-marker",
+            &launcher_target_check_marker(a, b, tag),
             "a configured agent launcher should replace argv[0] with a runnable command",
         )
         .await;
@@ -747,9 +760,10 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
+        let (a, b, tag) = (811u64, 601u64, "stock");
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "claude".into(),
-            argv: launcher_target_marker_argv("stock-argv-marker"),
+            argv: launcher_target_check_argv(a, b, tag),
             dedupe_key: "herdr:claude\0claude\0Id\0stock-test-session".into(),
         });
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
@@ -773,7 +787,7 @@ mod tests {
             .expect("pending resume should launch");
         assert_marker_reaches_pane(
             runtime,
-            "stock-argv-marker",
+            &launcher_target_check_marker(a, b, tag),
             "an unconfigured agent should run its stock resume argv unchanged",
         )
         .await;
