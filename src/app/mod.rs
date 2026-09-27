@@ -1745,6 +1745,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_launcher_config_reload_updates_live_map() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-agent-launchers");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[session.agent_launchers]\nclaude = [\"cas\"]\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(app.state.agent_launchers.is_empty());
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.state.agent_launchers.get("claude"),
+            Some(&vec!["cas".to_string()])
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn reload_config_keeps_kitty_graphics_until_restart() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-kitty-graphics");
