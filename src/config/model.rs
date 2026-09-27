@@ -272,14 +272,15 @@ pub struct SessionConfig {
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
     /// Per-agent launcher override for native agent session restore, keyed by
-    /// the same agent id the resume plan carries (for example "claude").
-    /// When present and non-empty with a non-blank first element, its
-    /// elements replace argv[0] of the resume command and the rest of the
-    /// plan's argv is appended unchanged, so a restored pane can run through
-    /// an account or flag wrapper (for example `cas --resume <id>`) instead
-    /// of the bare agent binary. Missing or empty means no override.
-    /// Default: empty.
-    pub agent_launchers: BTreeMap<String, Vec<String>>,
+    /// the same agent id the resume plan carries (for example "claude"). The
+    /// value is typed VERBATIM as a shell command prefix, written in the
+    /// pane's own shell syntax - for example `"cas"` for a bash pane, or
+    /// `"& 'C:\\Agent Tools\\cas.ps1'"` for a PowerShell pane - followed by a
+    /// space and the stock resume arguments, so a restored pane can run
+    /// through an account or flag wrapper instead of the bare agent binary.
+    /// Missing, empty, all-whitespace, or containing a control character
+    /// means no override. Default: empty.
+    pub agent_launchers: BTreeMap<String, String>,
 }
 
 impl Default for SessionConfig {
@@ -1437,13 +1438,13 @@ resume_agents_on_restore = false
 resume_agents_on_restore = false
 
 [session.agent_launchers]
-claude = ["cas"]
+claude = "cas"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(
             config.session.agent_launchers.get("claude"),
-            Some(&vec!["cas".to_string()])
+            Some(&"cas".to_string())
         );
     }
 

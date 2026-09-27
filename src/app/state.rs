@@ -850,8 +850,9 @@ pub struct AppState {
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
     /// Per-agent native resume launcher overrides, mirrored live from
-    /// `[session.agent_launchers]`. See `crate::agent_resume::apply_launcher`.
-    pub agent_launchers: std::collections::BTreeMap<String, Vec<String>>,
+    /// `[session.agent_launchers]`. Each value is typed verbatim as a shell
+    /// command prefix by `crate::app::agent_resume::resume_command`.
+    pub agent_launchers: std::collections::BTreeMap<String, String>,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
     pub pane_scrollback_limit_bytes: usize,
