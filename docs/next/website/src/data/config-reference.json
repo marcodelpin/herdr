@@ -1450,9 +1450,9 @@
         },
         {
           "key": "session.agent_launchers",
-          "type": "table of argv lists",
+          "type": "table of strings",
           "default": "{}",
-          "description": "Per-agent launcher override for native agent session restore, keyed by agent id. When set to a non-empty list, its elements replace argv[0] of the resume command and the rest of the plan's argv is appended unchanged, so a restored pane can run through an account or flag wrapper (for example [\"cas\"]) instead of the bare agent binary. Missing or empty means no override."
+          "description": "Per-agent launcher override for native agent session restore, keyed by agent id. When set to a non-empty, non-whitespace string with no control characters, herdr types it verbatim as a prefix in the pane's own shell syntax, followed by a space and the stock resume arguments (for example \"cas\" in bash, or \"& 'C:\\Agent Tools\\cas.ps1'\" in PowerShell). Missing, empty, whitespace-only, or containing a control character means no override."
         }
       ]
     },

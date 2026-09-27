@@ -1754,7 +1754,7 @@ mod tests {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-agent-launchers");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "[session.agent_launchers]\nclaude = [\"cas\"]\n").unwrap();
+        std::fs::write(&path, "[session.agent_launchers]\nclaude = \"cas\"\n").unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
@@ -1764,7 +1764,7 @@ mod tests {
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(
             app.state.agent_launchers.get("claude"),
-            Some(&vec!["cas".to_string()])
+            Some(&"cas".to_string())
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);

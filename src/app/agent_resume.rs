@@ -239,18 +239,15 @@ impl App {
         }
 
         let launcher = self.state.agent_launchers.get(&plan.agent);
-        // Serialize through the shell the restored pane will actually run,
-        // resolved from the same PaneShellConfig that TerminalRuntime::spawn
-        // below uses to launch it - not by probing the pane's foreground
-        // process afterward. That process has just been spawned a few lines
-        // down and may not have settled enough for such a probe to answer
-        // yet, and this resume command must be computed and validated (the
-        // empty-argv check right below) before we decide whether to spawn
-        // anything at all.
-        let shell_config =
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
-        let shell_name = shell_config.resolved_shell_name();
-        let Some(resume_command) = resume_shell_command(&plan.argv, launcher, &shell_name) else {
+        if launcher_has_control_character(launcher) {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                terminal = %terminal_id,
+                agent = %plan.agent,
+                "agent launcher contains a control character; using the stock resume command"
+            );
+        }
+        let Some(resume_command) = resume_command(&plan.argv, launcher) else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -283,7 +280,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
             self.state.host_terminal_appearance,
-            shell_config,
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
@@ -365,23 +362,85 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
-/// Applies the configured launcher override to `argv`, then serializes the
-/// result for typing into `shell_name` via
-/// `crate::platform::interactive_shell_command`. This is the one seam where
-/// the launcher rewrite and the shell serialization meet, so tests can pin
-/// both without spawning a real pane.
-fn resume_shell_command(
-    argv: &[String],
-    launcher: Option<&Vec<String>>,
-    shell_name: &str,
-) -> Option<String> {
-    let effective_argv = crate::agent_resume::apply_launcher(argv, launcher);
-    crate::platform::interactive_shell_command(&effective_argv, shell_name)
+/// Serializes `argv` the way upstream serializes the stock resume command:
+/// each element quoted only if it is not already a "plain word" (see
+/// `shell_quote`). Every stock resume argv is nothing but plain words (a
+/// name, a flag, a UUID), so the typed text this produces is identical
+/// across bash, zsh, Git Bash, PowerShell and cmd (ADR-0001).
+fn shell_command_from_argv(argv: &[String]) -> Option<String> {
+    let mut parts = argv.iter();
+    let first = shell_quote(parts.next()?);
+    let mut command = first;
+    for part in parts {
+        command.push(' ');
+        command.push_str(&shell_quote(part));
+    }
+    Some(command)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='
+            )
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// True when `launcher` is configured (non-empty after trimming) but its
+/// text contains a control character (CR, LF, or any other control
+/// character), so a config value can never type more than one command line.
+/// Kept separate from `resume_command` below purely so the caller can log a
+/// warning naming the pane and agent; `resume_command` itself treats this
+/// case identically to no launcher at all.
+fn launcher_has_control_character(launcher: Option<&String>) -> bool {
+    launcher
+        .map(|launcher| launcher.trim())
+        .is_some_and(|launcher| !launcher.is_empty() && launcher.chars().any(char::is_control))
+}
+
+/// Composes the text to type into a restored pane's shell for `argv` (a
+/// resume plan's argv), honoring an optional per-agent launcher prefix from
+/// `[session.agent_launchers]` (see `AppState::agent_launchers`).
+///
+/// With no launcher, or one that is empty, all whitespace, or containing a
+/// control character, this is exactly `shell_command_from_argv(argv)`: the
+/// stock resume command, byte-identical to what upstream types with no
+/// launcher configured (ADR-0001).
+///
+/// Otherwise, `launcher` trimmed is typed VERBATIM as a prefix - never
+/// quoted or escaped, because it is already exactly what the operator would
+/// type into that pane's own shell - followed by a space and `argv[1..]`
+/// serialized exactly as upstream serializes the stock resume arguments, or
+/// nothing if `argv` has no arguments beyond `argv[0]`.
+fn resume_command(argv: &[String], launcher: Option<&String>) -> Option<String> {
+    let prefix = launcher
+        .map(|launcher| launcher.trim())
+        .filter(|launcher| !launcher.is_empty() && !launcher.chars().any(char::is_control));
+    let Some(prefix) = prefix else {
+        return shell_command_from_argv(argv);
+    };
+    match argv.get(1..).and_then(shell_command_from_argv) {
+        Some(rest) => Some(format!("{prefix} {rest}")),
+        None => Some(prefix.to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    #[cfg(windows)]
+    use std::process::Command;
 
     #[cfg(unix)]
     fn test_app() -> App {
@@ -663,20 +722,22 @@ mod tests {
     }
 
     // App-level seam: start_pending_agent_resume() has no method that returns
-    // the resolved argv on its own, so this drives the same public entry
+    // the composed command on its own, so this drives the same public entry
     // point pending_agent_resume_waits_for_host_theme_before_launch uses and
-    // reads back what actually ran in the restored pane's shell, via its
-    // pty history. argv[0] in the plan is a name that cannot run; only the
-    // configured launcher resolves to something runnable, so the marker
-    // reaching the pane proves the launcher override was applied to the
-    // command sent to the shell, not merely computed and discarded.
+    // reads back what actually ran in the restored pane's shell, via its pty
+    // history. argv[0] in the plan is a name that cannot run; only the
+    // configured launcher PREFIX resolves to something runnable ("/bin/sh",
+    // typed verbatim ahead of argv[1..] exactly as the operator would type
+    // it), so the marker reaching the pane proves the launcher override was
+    // applied to the command typed into the shell, not merely computed and
+    // discarded.
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_launcher_overrides_the_typed_resume_command() {
         let mut app = test_app();
         app.state
             .agent_launchers
-            .insert("claude".into(), vec!["/bin/sh".into()]);
+            .insert("claude".into(), "/bin/sh".into());
         let workspace = crate::workspace::Workspace::test_new("restored");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
@@ -1133,42 +1194,266 @@ mod tests {
         }
     }
 
-    // Pure seam test (no pane, no shell process): resume_shell_command()
-    // must apply the configured launcher override before handing the
-    // resulting argv to crate::platform::interactive_shell_command(), not
-    // serialize the plan's stock argv directly. The assert_ne! is the one
-    // that actually distinguishes the two - it reddens under the same
-    // "agent launcher override disabled" mutant the CI mutant job applies
-    // to apply_launcher(), which is exactly the regression this seam guards.
+    // Restored byte-for-byte from upstream ddb19e68: the stock resume
+    // command has no launcher involved at all, so its quoting is exactly
+    // this and nothing else.
     #[test]
-    fn agent_launcher_resume_command_uses_launcher_rewritten_argv() {
+    fn shell_command_from_argv_quotes_resume_arguments() {
         let argv = vec![
             "claude".to_string(),
             "--resume".to_string(),
             "session with ' quote".to_string(),
         ];
-        let launcher = vec!["cas".to_string()];
-        let shell = "bash";
 
-        let expected_argv = crate::agent_resume::apply_launcher(&argv, Some(&launcher));
         assert_eq!(
-            expected_argv,
-            vec![
-                "cas".to_string(),
-                "--resume".to_string(),
-                "session with ' quote".to_string(),
-            ]
+            shell_command_from_argv(&argv).as_deref(),
+            Some("claude --resume 'session with '\\'' quote'")
         );
+        assert_eq!(shell_command_from_argv(&[]), None);
+    }
+
+    fn resume_command_test_argv() -> Vec<String> {
+        vec!["claude".into(), "--resume".into(), "sid".into()]
+    }
+
+    #[test]
+    fn agent_launcher_none_uses_stock_command() {
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), None),
+            shell_command_from_argv(&resume_command_test_argv())
+        );
+    }
+
+    #[test]
+    fn agent_launcher_empty_uses_stock_command() {
+        let launcher = String::new();
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), Some(&launcher)),
+            shell_command_from_argv(&resume_command_test_argv())
+        );
+    }
+
+    #[test]
+    fn agent_launcher_whitespace_only_uses_stock_command() {
+        let launcher = "   ".to_string();
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), Some(&launcher)),
+            shell_command_from_argv(&resume_command_test_argv())
+        );
+    }
+
+    #[test]
+    fn agent_launcher_prefix_types_stock_arguments_after_it() {
+        let launcher = "cas".to_string();
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), Some(&launcher)).as_deref(),
+            Some("cas --resume sid")
+        );
+    }
+
+    #[test]
+    fn agent_launcher_prefix_is_never_quoted() {
+        // The operator's own example (ADR-0001): a PowerShell call-operator
+        // prefix naming a path with a space. If this were quoted or escaped
+        // like an argument, PowerShell would read it as a string literal
+        // instead of running it.
+        let launcher = "& 'C:\\Agent Tools\\cas.ps1'".to_string();
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), Some(&launcher)).as_deref(),
+            Some("& 'C:\\Agent Tools\\cas.ps1' --resume sid")
+        );
+    }
+
+    #[test]
+    fn agent_launcher_prefix_whitespace_is_trimmed() {
+        let launcher = "  cas  ".to_string();
+        assert_eq!(
+            resume_command(&resume_command_test_argv(), Some(&launcher)).as_deref(),
+            Some("cas --resume sid")
+        );
+    }
+
+    #[test]
+    fn agent_launcher_control_character_falls_back_to_stock_command() {
+        for control in ['\n', '\r', '\t'] {
+            let launcher = format!("cas{control}--resume-elsewhere");
+            assert_eq!(
+                resume_command(&resume_command_test_argv(), Some(&launcher)),
+                shell_command_from_argv(&resume_command_test_argv()),
+                "a launcher containing {control:?} must fall back to the stock command"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_launcher_stock_arguments_keep_upstream_quoting() {
+        let argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "session with ' quote".to_string(),
+        ];
+        let launcher = "cas".to_string();
+        assert_eq!(
+            resume_command(&argv, Some(&launcher)).as_deref(),
+            Some("cas --resume 'session with '\\'' quote'")
+        );
+    }
+
+    #[test]
+    fn agent_launcher_prefix_with_no_extra_arguments() {
+        let argv = vec!["claude".to_string()];
+        let launcher = "cas".to_string();
+        assert_eq!(
+            resume_command(&argv, Some(&launcher)).as_deref(),
+            Some("cas")
+        );
+    }
+
+    // Pure seam test (no pane, no shell process): resume_command() must
+    // apply the configured launcher prefix, not serialize the plan's stock
+    // argv directly. The assert_ne! is the one that actually distinguishes
+    // the two - it reddens under the same "agent launcher override
+    // disabled" mutant the CI mutant job applies to resume_command(), which
+    // is exactly the regression this seam guards.
+    #[test]
+    fn agent_launcher_resume_command_matches_launcher_composition() {
+        let argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "session with ' quote".to_string(),
+        ];
+        let launcher = "cas".to_string();
 
         assert_eq!(
-            resume_shell_command(&argv, Some(&launcher), shell),
-            crate::platform::interactive_shell_command(&expected_argv, shell),
+            resume_command(&argv, Some(&launcher)).as_deref(),
+            Some("cas --resume 'session with '\\'' quote'")
         );
         assert_ne!(
-            resume_shell_command(&argv, Some(&launcher), shell),
-            crate::platform::interactive_shell_command(&argv, shell),
-            "a configured launcher must change the serialized resume command"
+            resume_command(&argv, Some(&launcher)),
+            resume_command(&argv, None),
+            "a configured launcher must change the composed resume command"
         );
-        assert_eq!(resume_shell_command(&[], None, shell), None);
+        assert_eq!(resume_command(&[], None), None);
+    }
+
+    // Windows execution tests use plain-word resume arguments throughout
+    // (the pure tests above already pin the exotic-quoting cases): ADR-0001
+    // holds because a stock resume argv is always plain words, and mixing
+    // that concern into an integration test that also spawns a real shell
+    // would test PowerShell/cmd quoting of POSIX-escaped text, which is not
+    // what this fix does or needs to do.
+
+    // r3's whole defect: routing the composed command through
+    // crate::platform::interactive_shell_command wrapped a non-script
+    // command in Start-Process, which resolves neither a PowerShell function
+    // nor an alias defined in the pane's own profile. resume_command types
+    // the launcher prefix verbatim, so a prefix that is itself the name of a
+    // function the pane shell already knows about resolves exactly as it
+    // would if the operator typed it by hand.
+    #[cfg(windows)]
+    #[test]
+    fn agent_launcher_prefix_resolves_as_a_powershell_function() {
+        let argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "session-abc".to_string(),
+        ];
+        let launcher = "cas".to_string();
+        let composed =
+            resume_command(&argv, Some(&launcher)).expect("non-empty argv always composes");
+        assert_eq!(composed, "cas --resume session-abc");
+
+        let script = format!(
+            "function cas {{ Write-Output \"CAS-CALLED:$($args -join ' ')\" }}; {composed}"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", &script])
+            .output()
+            .expect("powershell.exe should run");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("CAS-CALLED:--resume session-abc"),
+            "the composed command should invoke the pane-shell function named by the launcher, got: {stdout}"
+        );
+    }
+
+    // The operator's own example (ADR-0001): a launcher prefix naming a path
+    // with a space, typed verbatim into each pane shell's own syntax - the
+    // call operator for PowerShell, a quoted path for cmd.exe. resume_command
+    // never touches this text, so each shell parses it with its own rules,
+    // exactly as if the operator had typed it themselves.
+    #[cfg(windows)]
+    #[test]
+    fn agent_launcher_prefix_with_a_space_runs_via_the_pane_shells_own_syntax() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr agent launcher {}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let helper = base.join("cas launcher.cmd");
+        std::fs::write(
+            &helper,
+            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" (\r\necho(%~1\r\necho(%~2\r\n)\r\n",
+        )
+        .unwrap();
+        let helper_path = helper.to_str().unwrap().to_string();
+
+        let argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "session-xyz".to_string(),
+        ];
+
+        let cases = [
+            ("powershell.exe", format!("& '{helper_path}'")),
+            ("cmd.exe", format!("\"{helper_path}\"")),
+        ];
+
+        for (shell, launcher) in cases {
+            let composed =
+                resume_command(&argv, Some(&launcher)).expect("non-empty argv always composes");
+            let capture = base.join(format!("{shell}.txt"));
+            let status = if shell == "cmd.exe" {
+                // cmd.exe's own /C quote-preservation rule only fires for
+                // EXACTLY two quote characters in the command tail (see
+                // `cmd /?`); `composed` already carries exactly the two that
+                // wrap the launcher path, so it must reach cmd.exe verbatim.
+                // Command::args() would add a THIRD layer of quoting around
+                // the whole string (it contains a space), pushing the count
+                // past two and sending cmd.exe into its "old behaviour"
+                // quote-stripping instead - raw_arg() is the escape hatch.
+                Command::new("cmd.exe")
+                    .arg("/d")
+                    .arg("/c")
+                    .raw_arg(&composed)
+                    .env("HERDR_ARGV_CAPTURE", &capture)
+                    .status()
+            } else {
+                Command::new("powershell.exe")
+                    .args(["-NoLogo", "-NoProfile", "-Command", &composed])
+                    .env("HERDR_ARGV_CAPTURE", &capture)
+                    .env("PSExecutionPolicyPreference", "Bypass")
+                    .status()
+            }
+            .expect("shell should run");
+            assert!(
+                status.success(),
+                "{shell} failed to run the composed resume command"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&capture)
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+                "--resume\nsession-xyz\n",
+                "{shell} did not hand the launcher its exact resume arguments"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }
