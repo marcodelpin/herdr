@@ -36,9 +36,30 @@
 # removal of the agent directory falls back to the pane's cwd, not to the same directory that just
 # vanished.
 #
+# codex ar-r4 fix round (adversarial review, DO-NOT-LAND, 3 new P2 findings, all fixed at the root -
+# operator directive: this is the LAST code round; acceptance from here is a field measurement):
+# P2 #1 restore selected the agent's cwd BEFORE de-duplication, so a duplicate pane that lost its
+# session and resume plan to a sibling sharing the same session id still spawned its plain shell into
+# the AGENT's directory, permanently relocating it there. Agent-directory availability now only
+# admits a DEFERRED resume past the first gate; a pane that predicted the deferred branch but does
+# not get it (loses the de-dupe race) is caught by a second gate right before the immediate-spawn
+# path, and a plain shell always spawns into its OWN saved cwd. P2 #2 `process_exists`
+# (`kill(pid, 0)` on Unix) succeeds for a zombie - an exited, unreaped Claude whose surviving parent
+# has not reaped it blocked restoration across herdr restarts even though it could never write
+# anything again, and its `/proc/<pid>/stat` starttime does not change either, so the existing
+# start-marker comparison could not tell it apart from a live process. A new platform liveness
+# primitive (`process_is_zombie`, real on Linux via `/proc/<pid>/stat`'s state field, a documented
+# no-op elsewhere) positively rejects an observed `Z`/`X` state before any registry record is even
+# read. P2 #3 the new `agent_session_cwd` field participated in `layout_fingerprint()`, which hashes
+# the whole serialized snapshot - a PREVIOUS build's `PaneAgentSessionSnapshot` has no such field at
+# all, so its recomputed fingerprint could never match a NEW build's stored one, discarding EVERY
+# pane's history on a rollback over one field, not just the pane whose agent cwd changed. The
+# fingerprint now strips that one field before hashing, keeping the two builds' compatibility
+# projection identical while every cwd-sensitive restore decision elsewhere is unchanged.
+#
 # This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on both platforms
 # (nextest, one process per test), the new tests run again by name with a per-OS count gate so a
-# green run cannot silently skip or gain one, seven mutant jobs each prove one of the new tests is
+# green run cannot silently skip or gain one, ten mutant jobs each prove one of the new tests is
 # load-bearing rather than decorative, and a Linux release build runs only once the crate tests and
 # every mutant job pass - same build shape as fork-14v-resume-launcher.yml (checksum uses blake3,
 # per this fleet's hashing policy). bd herdr-3ir, herdr-4r8, herdr-ct9.
@@ -101,11 +122,17 @@ jobs:
       # string-procStart + pidDomain unit tests), P1-b (one persist/restore cold-restore test), P2-c
       # + P2-d (TerminalState unit tests + one App-level actions.rs test), plus the ADR-0002
       # amendment's codex ar-r3 fix round: P2 #1 (one TerminalState `p2c_amendment` test), P2 #2 (one
-      # TerminalState `p2_amendment` test), P2 #3 (one persist/restore `p2_amendment` test). The three
-      # App-level herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only, so Windows
-      # carries 3 fewer: 32 on Linux/macOS-shaped Unix, 29 on Windows. The count check fails the job
-      # if the filter matches fewer (or more) than expected, so a green run that skipped, or silently
-      # gained, one of them is red.
+      # TerminalState `p2_amendment` test), P2 #3 (one persist/restore `p2_amendment` test), plus the
+      # codex ar-r4 fix round: P2 #1 (one persist/restore duplicate-session test), P2 #2 (two
+      # agent_session_registry zombie-liveness unit tests). The three App-level herdr-4r8 tests spawn
+      # a real /bin/sh pty and are #[cfg(unix)] only, so Windows carries 3 fewer: 35 on
+      # Linux/macOS-shaped Unix, 32 on Windows. The count check fails the job if the filter matches
+      # fewer (or more) than expected, so a green run that skipped, or silently gained, one of them
+      # is red. (ar-r4's P2 #3 fingerprint fix has its own regression test,
+      # `layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility` in
+      # persist/snapshot.rs - it follows that file's own naming convention, not `agent_restore_`, so
+      # it runs as part of the plain crate-tests step above and is guarded by its own mutant job
+      # below rather than this by-name count.)
       - name: Run the new agent-restore tests by name
         shell: bash
         run: |
@@ -114,9 +141,9 @@ jobs:
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=29
-          else
             expected=32
+          else
+            expected=35
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -529,6 +556,164 @@ jobs:
           grep -q "FAIL.*agent_restore_p2_amendment_removed_agent_dir_falls_back_to_pane_cwd_after_restore" mutant.log && { echo "the persist/restore amendment test should stay green - it never reaches this replacement path"; exit 1; }
           echo "mutant killed: exactly the replacement-installed test failed with the stale cwd injected"
 
+  agent-restore-ar4-p2-1-duplicate-cwd-leak-mutant:
+    # codex ar-r4 P2 #1: a duplicate pane that loses the de-dupe race (a sibling pane already
+    # reserved the same agent session) must spawn its plain shell into its OWN saved cwd, never into
+    # the shared agent directory - the availability gate only ever admits it past the FIRST check on
+    # the hypothesis it would take the deferred-resume branch instead. Reintroducing the
+    # availability-merged cwd at the immediate-spawn call site reproduces the measured incident
+    # directly: the second pane of two sharing one session permanently relocates into the first
+    # pane's agent directory. Only the new duplicate-session test can observe this - every other
+    # `agent_restore_` test whose pane carries an `agent_session_cwd` takes the deferred-resume
+    # branch instead (a different call site, untouched by this mutation).
+    name: mutant - the ar-r4 P2 #1 duplicate-pane own-cwd fix is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Make the immediate-spawn path use the agent cwd again and require the duplicate test to fail
+        run: |
+          sed -i 's/let mut terminal = TerminalState::new(terminal_id.clone(), saved_cwd.clone());/let mut terminal = TerminalState::new(terminal_id.clone(), agent_cwd_override.clone().unwrap_or_else(|| saved_cwd.clone()) \/* MUTANT ar4 p2-1 cwd leak *\/);/' src/persist/restore.rs
+          landed=$(grep -c 'MUTANT ar4 p2-1 cwd leak' src/persist/restore.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_duplicate_session_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: the duplicate-session test passed with the agent cwd leaking into the plain shell"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_duplicate_session_plain_shell_keeps_its_own_pane_cwd" mutant.log || { echo "expected the duplicate-session test to FAIL"; exit 1; }
+          echo "mutant killed: the duplicate-session test failed with the agent cwd leaking into the plain shell"
+
+  agent-restore-ar4-p2-2-zombie-liveness-mutant:
+    # codex ar-r4 P2 #2: `process_exists` (`kill(pid, 0)` on Unix) succeeds for a zombie, so a
+    # positively-observed zombie/exited pid must be rejected as a live holder on its own, before the
+    # registry record is even read. Disabling the new `process_is_zombie` gate in
+    # `find_live_holder_in_dirs` reproduces the exact defect: a crashed, unreaped Claude blocks
+    # restoration across herdr restarts forever. The mirror non-zombie test must stay green - its
+    # injected closure already returns `false`, so the gate being disabled changes nothing for it.
+    name: mutant - the ar-r4 P2 #2 zombie-liveness gate is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Disable the zombie gate and require the zombie test to fail
+        run: |
+          sed -i 's/if process_is_zombie(pid) {/if process_is_zombie(pid) \&\& false \/* MUTANT ar4 p2-2 zombie check disabled *\/ {/' src/agent_session_registry.rs
+          landed=$(grep -c 'MUTANT ar4 p2-2 zombie check disabled' src/agent_session_registry.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_p2_2_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every p2-2 test passed with the zombie gate disabled"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_p2_2_find_live_holder_zombie_pid_is_not_live" mutant.log || { echo "expected the zombie test to FAIL"; exit 1; }
+          grep -q "FAIL.*agent_restore_p2_2_find_live_holder_non_zombie_pid_is_live" mutant.log && { echo "the non-zombie test should stay green under this mutant (its own closure already returns false)"; exit 1; }
+          echo "mutant killed: exactly the zombie test failed with the gate disabled"
+
+  agent-restore-ar4-p2-3-fingerprint-strip-mutant:
+    # codex ar-r4 P2 #3: `layout_fingerprint()` must strip `agent_session_cwd` before hashing, so a
+    # PREVIOUS build (whose struct has no such field) recomputes the SAME fingerprint a NEW build
+    # stored. Retargeting the strip at a key that never appears in the JSON reproduces the exact
+    # defect: the field participates in the hash again, and the compatibility test's first assertion
+    # (with-cwd fingerprint == without-cwd fingerprint) fails. The test's second assertion (a
+    # genuinely different session id still changes the fingerprint) is unaffected by this mutation
+    # and would keep the test failing on the first assertion regardless.
+    name: mutant - the ar-r4 P2 #3 fingerprint strip is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Retarget the fingerprint strip at a nonexistent key and require the compatibility test to fail
+        run: |
+          sed -i 's/strip_json_key_recursive(&mut value, "agent_session_cwd");/strip_json_key_recursive(\&mut value, "agent_session_cwd_mutated" \/* MUTANT ar4 p2-3 fingerprint strip disabled *\/);/' src/persist/snapshot.rs
+          landed=$(grep -c 'MUTANT ar4 p2-3 fingerprint strip disabled' src/persist/snapshot.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: the compatibility test passed with the strip retargeted at a nonexistent key"
+            exit 1
+          fi
+          grep -q "FAIL.*layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility" mutant.log || { echo "expected the compatibility test to FAIL"; exit 1; }
+          echo "mutant killed: the compatibility test failed with the strip retargeted at a nonexistent key"
+
   build-linux:
     name: build herdr-linux-x86_64
     needs:
@@ -541,6 +726,9 @@ jobs:
         agent-restore-p1a-string-proc-start-mutant,
         agent-restore-p2c-amendment-same-id-passthrough-mutant,
         agent-restore-p2-amendment-cwd-survives-replacement-mutant,
+        agent-restore-ar4-p2-1-duplicate-cwd-leak-mutant,
+        agent-restore-ar4-p2-2-zombie-liveness-mutant,
+        agent-restore-ar4-p2-3-fingerprint-strip-mutant,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 90

@@ -1176,6 +1176,15 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2): no positive
+/// zombie signal wired here yet - same UNMEASURED gap as `process_start_marker`
+/// above, no macOS host available this session to confirm a `proc_bsdinfo`
+/// state field. Fails open, keeping today's behaviour: `process_exists`
+/// alone still decides liveness on this platform.
+pub fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

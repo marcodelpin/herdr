@@ -86,6 +86,7 @@ pub fn find_live_holder(session_id: &str) -> Option<LiveHolder> {
         &registry_session_dirs(&root),
         session_id,
         crate::platform::process_exists,
+        crate::platform::process_is_zombie,
         crate::platform::process_start_marker,
         crate::platform::local_pid_domain,
     )
@@ -95,6 +96,7 @@ fn find_live_holder_in_dirs(
     dirs: &[PathBuf],
     session_id: &str,
     process_exists: impl Fn(u32) -> bool,
+    process_is_zombie: impl Fn(u32) -> bool,
     process_start_marker: impl Fn(u32) -> Option<u64>,
     local_pid_domain: impl Fn() -> Option<String>,
 ) -> Option<LiveHolder> {
@@ -121,6 +123,17 @@ fn find_live_holder_in_dirs(
             // are stale, and a dead pid can never be the live holder we are
             // looking for regardless of what its JSON contains.
             if !process_exists(pid) {
+                continue;
+            }
+            // codex ar-r4 (P2 #2): `process_exists` (`kill(pid, 0)` on Unix)
+            // SUCCEEDS for a zombie - its pid slot is reserved until a
+            // parent reaps it, and its `/proc/<pid>/stat` starttime does not
+            // change either, so `record_matches_live_process` below cannot
+            // tell it apart from a genuinely running process. A crashed
+            // Claude whose parent has not reaped it yet must not block
+            // restoration across herdr restarts just because its pid is
+            // still technically allocated.
+            if process_is_zombie(pid) {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
@@ -285,6 +298,7 @@ mod tests {
             &[sessions],
             "target-session",
             |pid| pid == 4242,
+            |_pid| false,
             |pid| (pid == 4242).then_some(100),
             || None,
         );
@@ -312,6 +326,7 @@ mod tests {
             &[sessions],
             "target-session",
             |_pid| false,
+            |_pid| false,
             |pid| (pid == 4242).then_some(100),
             || None,
         );
@@ -333,6 +348,7 @@ mod tests {
             &[sessions],
             "target-session",
             |pid| pid == 4242,
+            |_pid| false,
             |pid| (pid == 4242).then_some(100),
             || None,
         );
@@ -354,6 +370,7 @@ mod tests {
             &[sessions],
             "target-session",
             |pid| pid == 4242,
+            |_pid| false,
             |_pid| None,
             || None,
         );
@@ -388,6 +405,7 @@ mod tests {
             &[sessions],
             "target-session",
             |pid| pid == 4242,
+            |_pid| false,
             // The OS DOES have an answer here - unlike the "incomparable"
             // test above, where the OS itself has no answer.
             |pid| (pid == 4242).then_some(100),
@@ -421,6 +439,7 @@ mod tests {
             &[sessions],
             "target-session",
             |pid| pid == 4242,
+            |_pid| false,
             |pid| (pid == 4242).then_some(999),
             || None,
         );
@@ -428,6 +447,71 @@ mod tests {
         assert!(
             holder.is_none(),
             "a start-marker mismatch on both sides present must be treated as pid reuse, not live"
+        );
+    }
+
+    // codex ar-r4 (P2 #2): a positively-observed zombie/exited pid must not
+    // be reported as a live holder even though `process_exists` (its
+    // `kill(pid, 0)` stand-in here) says the pid still exists and the start
+    // marker still matches - exactly the state an unreaped crashed Claude
+    // leaves behind.
+    #[test]
+    fn agent_restore_p2_2_find_live_holder_zombie_pid_is_not_live() {
+        let tmp = TestDir::new("zombie-pid");
+        let sessions = tmp.path().join("sessions");
+        write_registry_entry(
+            &sessions,
+            4242,
+            r#"{"sessionId":"target-session","cwd":"/work/project","procStart":100}"#,
+        );
+
+        let holder = find_live_holder_in_dirs(
+            &[sessions],
+            "target-session",
+            |pid| pid == 4242,
+            // Positively observed as a zombie - the seam this test exists
+            // to exercise.
+            |pid| pid == 4242,
+            |pid| (pid == 4242).then_some(100),
+            || None,
+        );
+
+        assert!(
+            holder.is_none(),
+            "a positively observed zombie must never be reported as a live holder, \
+             even with a matching start marker"
+        );
+    }
+
+    // The mirror of the test above: the SAME pid, exists and matches, but is
+    // NOT a zombie - it must still be reported live. Guards against a fix
+    // that rejects every pid regardless of the zombie predicate's answer.
+    #[test]
+    fn agent_restore_p2_2_find_live_holder_non_zombie_pid_is_live() {
+        let tmp = TestDir::new("non-zombie-pid");
+        let sessions = tmp.path().join("sessions");
+        write_registry_entry(
+            &sessions,
+            4242,
+            r#"{"sessionId":"target-session","cwd":"/work/project","procStart":100}"#,
+        );
+
+        let holder = find_live_holder_in_dirs(
+            &[sessions],
+            "target-session",
+            |pid| pid == 4242,
+            |_pid| false,
+            |pid| (pid == 4242).then_some(100),
+            || None,
+        );
+
+        assert_eq!(
+            holder,
+            Some(LiveHolder {
+                pid: 4242,
+                cwd: Some("/work/project".into()),
+            }),
+            "a running (non-zombie) pid with a matching marker must still be reported live"
         );
     }
 
@@ -450,6 +534,7 @@ mod tests {
             &[sessions],
             "00000000-0000-4000-8000-000000000000",
             |pid| pid == 1194606,
+            |_pid| false,
             |pid| (pid == 1194606).then_some(43881434),
             || Some("linux:884aaaeda1474ac68c9851276f5b6c04:pid:[4026535542]".into()),
         );
@@ -479,6 +564,7 @@ mod tests {
             &[sessions],
             "00000000-0000-4000-8000-000000000000",
             |pid| pid == 1194606,
+            |_pid| false,
             |pid| (pid == 1194606).then_some(99999999),
             || Some("linux:884aaaeda1474ac68c9851276f5b6c04:pid:[4026535542]".into()),
         );
@@ -504,6 +590,7 @@ mod tests {
             &[sessions],
             "00000000-0000-4000-8000-000000000000",
             |pid| pid == 1194606,
+            |_pid| false,
             |pid| (pid == 1194606).then_some(43881434),
             || Some("linux:884aaaeda1474ac68c9851276f5b6c04:pid:[4026535542]".into()),
         );
@@ -529,6 +616,7 @@ mod tests {
             &[sessions],
             "00000000-0000-4000-8000-000000000000",
             |pid| pid == 1194606,
+            |_pid| false,
             |pid| (pid == 1194606).then_some(43881434),
             || Some("linux:884aaaeda1474ac68c9851276f5b6c04:pid:[4026535542]".into()),
         );

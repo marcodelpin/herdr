@@ -2283,6 +2283,15 @@ pub fn process_exists(pid: u32) -> bool {
     ok && exit_code == STILL_ACTIVE
 }
 
+/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2): Windows has no
+/// zombie-process concept - `process_exists` above already checks
+/// `GetExitCodeProcess` against `STILL_ACTIVE`, so an exited process is
+/// already reported as not existing and never reaches this predicate.
+/// Documented no-op, keeping today's behaviour.
+pub fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 pub fn write_clipboard(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;

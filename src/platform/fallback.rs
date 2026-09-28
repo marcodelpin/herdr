@@ -240,6 +240,12 @@ pub fn process_exists(_pid: u32) -> bool {
     false
 }
 
+/// Unsupported platform stub (ADR-0002, herdr-3ir/4r8/ct9 fix round, codex
+/// ar-r4 P2 #2).
+pub fn process_is_zombie(_pid: u32) -> bool {
+    false
+}
+
 /// Unsupported platform stub.
 pub fn write_clipboard(_bytes: &[u8]) -> bool {
     false

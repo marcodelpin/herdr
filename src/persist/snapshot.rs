@@ -401,12 +401,43 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let mut value = serde_json::to_value(snapshot).ok()?;
+    // codex ar-r4 (P2 #3): `agent_session_cwd` (ADR-0002, herdr-ct9) is a
+    // NEW optional field a PREVIOUS build's `PaneAgentSessionSnapshot` does
+    // not know about at all - its deserializer silently drops the unknown
+    // JSON key, so recomputing the fingerprint there can never include it,
+    // while a NEW build's stored fingerprint did. That single-field
+    // mismatch fails the whole-session equality check below, discarding
+    // EVERY pane's history on a rollback, not just the pane whose agent cwd
+    // changed. Strip it before hashing so the two builds always agree on
+    // this projection; the field itself is still persisted and still read
+    // for restore's own cwd decisions (`restore_tab`) - only the
+    // HISTORY-compatibility fingerprint excludes it.
+    strip_json_key_recursive(&mut value, "agent_session_cwd");
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Remove every occurrence of `key` from any JSON object anywhere in
+/// `value`, recursively through arrays and nested objects.
+fn strip_json_key_recursive(value: &mut serde_json::Value, key: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove(key);
+            for nested in map.values_mut() {
+                strip_json_key_recursive(nested, key);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_json_key_recursive(item, key);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Capture pane screen history separately from the structural session snapshot.
@@ -646,6 +677,69 @@ mod tests {
         assert_ne!(
             layout_fingerprint(&snapshot).as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    // codex ar-r4 (P2 #3): a PREVIOUS build's `PaneAgentSessionSnapshot` has
+    // no `agent_session_cwd` field at all, so it can never include one in
+    // its own recomputed fingerprint. The fingerprint of a snapshot
+    // carrying the field must equal the fingerprint of the same snapshot
+    // with the field stripped entirely - that IS the projection a previous
+    // build's deserializer actually produces - or a rollback discards every
+    // pane's history over a field it never knew existed.
+    #[test]
+    fn layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility() {
+        let session_with_cwd = |cwd: Option<&str>| PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "fingerprint-session".into(),
+            agent_session_cwd: cwd.map(String::from),
+        };
+
+        let mut with_cwd = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        with_cwd.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(session_with_cwd(Some("/work/agent-cwd")));
+
+        let mut without_cwd = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        without_cwd.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(session_with_cwd(None));
+
+        assert_eq!(
+            layout_fingerprint(&with_cwd),
+            layout_fingerprint(&without_cwd),
+            "the agent's reported cwd must not affect the history-compatibility fingerprint"
+        );
+
+        // The strip must be targeted: a genuine difference elsewhere in the
+        // same agent_session (a different session id) still changes it.
+        let mut different_session = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        let mut other = session_with_cwd(Some("/work/agent-cwd"));
+        other.value = "a-different-session".into();
+        different_session.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(other);
+        assert_ne!(
+            layout_fingerprint(&with_cwd),
+            layout_fingerprint(&different_session),
+            "stripping agent_session_cwd must not stop the fingerprint from noticing other changes"
         );
     }
 

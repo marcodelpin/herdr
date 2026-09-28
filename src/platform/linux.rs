@@ -828,6 +828,27 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2): `process_exists`
+/// above answers `kill(pid, 0) == 0`, which SUCCEEDS for a zombie - its pid
+/// slot stays reserved until a parent reaps it, so a crashed Claude whose
+/// surviving parent has not reaped it yet reads as a live holder and blocks
+/// restoration across herdr restarts even though it can never write anything
+/// to the session again (`/proc/<pid>/stat`'s starttime field, which
+/// `process_start_marker` above compares, is also unchanged for a zombie, so
+/// that comparison cannot tell the two states apart either). This is a
+/// POSITIVE signal only: `Z` (zombie) and `X` (dead, briefly visible on some
+/// kernels between exit and reap) are the only states it rejects; a read
+/// failure or any other state answers `false` and falls open to the
+/// existing `process_exists` gate, matching this module's fail-open policy
+/// everywhere else - a pid this function cannot positively clear stays a
+/// live holder.
+pub fn process_is_zombie(pid: u32) -> bool {
+    let Some((_pgrp, _comm, state)) = process_pgrp_comm_and_state(pid) else {
+        return false;
+    };
+    matches!(state, 'Z' | 'X')
+}
+
 pub fn write_clipboard(bytes: &[u8]) -> bool {
     for command in clipboard_commands() {
         if run_clipboard_command(&command, bytes) {
