@@ -1618,12 +1618,31 @@ impl TerminalState {
             }
             return None;
         }
-        // P2-c: a READ-ONLY freshness check here - committing the seq
-        // watermark is deferred until every rejection check below (in
-        // particular the herdr-3ir foreground-ownership gate inside
-        // `conflicting_same_owner_session_ref`) has been passed. See
-        // `commit_hook_report_seq`'s doc comment for why.
-        if !unsequenced_selection && !self.hook_report_seq_is_fresh(&source, seq) {
+        // P2-c (herdr-3ir/4r8/ct9 fix round): checked BEFORE the seq
+        // freshness check below, so a report the herdr-3ir foreground gate
+        // is about to reject never advances the per-source seq watermark.
+        // Before this fix, `accept_hook_report` ran unconditionally here,
+        // so a rejected non-foreground report's (possibly higher) seq was
+        // committed regardless, and could make a later, legitimate,
+        // lower-seq foreground report fail the staleness check and be
+        // silently dropped.
+        //
+        // Scoped to the EXACT clause inside
+        // `session_report_allows_session_replacement` that can make THIS
+        // report the reason for its own rejection - every OTHER rejection
+        // reason (in particular an unrecognized `session_start_source` on a
+        // same-owner, differing-value report) is unchanged and still
+        // advances the watermark via the normal `accept_hook_report` call
+        // right below; see
+        // `different_same_agent_session_ref_is_ignored_until_current_session_clears`,
+        // which depends on exactly that and would otherwise regress.
+        if (source.as_str(), agent_label.as_str()) == ("herdr:claude", "claude")
+            && matches!(reporter_is_foreground, Some(false))
+            && self.same_owner_session_ref_differs(&source, &agent_label, &session_ref)
+        {
+            return None;
+        }
+        if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
             return None;
         }
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
@@ -1680,12 +1699,6 @@ impl TerminalState {
         );
         if replaced_hook_session.is_some() && !session_replacement_allowed {
             return None;
-        }
-
-        // P2-c: every rejection check above has passed - this report is
-        // accepted, so NOW is when the per-source seq watermark commits.
-        if !unsequenced_selection {
-            self.commit_hook_report_seq(&source, seq);
         }
 
         let now = Instant::now();
@@ -1787,43 +1800,46 @@ impl TerminalState {
     }
 
     fn accept_hook_report(&mut self, source: &str, seq: Option<u64>) -> bool {
-        if !self.hook_report_seq_is_fresh(source, seq) {
-            return false;
-        }
-        self.commit_hook_report_seq(source, seq);
-        true
-    }
-
-    /// Read-only half of `accept_hook_report` (P2-c, ADR-0002 herdr-3ir/
-    /// 4r8/ct9 fix round): whether `seq` would be accepted against the
-    /// per-source watermark, WITHOUT advancing it. Split out so a caller
-    /// that still has other rejection checks ahead of it (the herdr-3ir
-    /// foreground-ownership gate, in particular) can decide eligibility
-    /// first and commit the watermark only once every check has passed -
-    /// see `commit_hook_report_seq` and its call site.
-    fn hook_report_seq_is_fresh(&self, source: &str, seq: Option<u64>) -> bool {
         let Some(seq) = seq else {
             return !self.hook_report_sequences.contains_key(source);
         };
-        !self
+
+        if self
             .hook_report_sequences
             .get(source)
             .is_some_and(|last_seq| seq <= *last_seq)
+        {
+            return false;
+        }
+
+        self.hook_report_sequences.insert(source.to_string(), seq);
+        true
     }
 
-    /// Mutating half of `accept_hook_report` - advances the per-source
-    /// watermark. Callers MUST have already confirmed the report is fully
-    /// accepted (via `hook_report_seq_is_fresh` plus every other rejection
-    /// check) before calling this: committing on a report that is later
-    /// rejected for an unrelated reason lets that rejected report's seq
-    /// silently starve a legitimate, lower-seq report that arrives after it
-    /// (P2-c's measured shape: a non-foreground worker's report with a
-    /// higher seq arrives and is rejected by the herdr-3ir gate; a delayed
-    /// legitimate foreground report with a lower seq must still go through).
-    fn commit_hook_report_seq(&mut self, source: &str, seq: Option<u64>) {
-        if let Some(seq) = seq {
-            self.hook_report_sequences.insert(source.to_string(), seq);
-        }
+    /// P2-c (herdr-3ir/4r8/ct9 fix round): whether `session_ref` differs
+    /// from the pane's currently persisted session for this exact (source,
+    /// agent_label) owner, both sides Id-kind refs - the same shape
+    /// `conflicting_same_owner_session_ref` gates on, WITHOUT also asking
+    /// whether replacement is allowed. Used at the call site above to
+    /// decide, before the seq watermark is touched, whether the herdr-3ir
+    /// foreground gate is about to be the reason THIS specific report gets
+    /// rejected (as opposed to some other reason, which must still advance
+    /// the watermark exactly as before this fix).
+    fn same_owner_session_ref_differs(
+        &self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> bool {
+        self.current_session_identity_for_persistence().is_some_and(
+            |(current_source, current_agent, current_kind, current_value)| {
+                current_source == source
+                    && current_agent == agent_label
+                    && current_kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && current_value != session_ref.value
+            },
+        )
     }
 
     #[cfg(test)]
