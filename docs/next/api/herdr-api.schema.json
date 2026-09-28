@@ -3042,6 +3042,7 @@
               "type": "string"
             },
             "agent_pid": {
+              "description": "The reporter's own pid (ADR-0002, herdr-3ir), sent only by the Claude\nintegration hook from `$CLAUDE_PID`. Used server-side to refuse a\nsame-owner session replacement whenever the reporter is not the\npane's foreground process group. Optional and additive: an old\nclient that never sends it keeps today's behavior unchanged.",
               "format": "uint32",
               "minimum": 0,
               "type": [
@@ -3050,6 +3051,7 @@
               ]
             },
             "agent_session_cwd": {
+              "description": "The agent's own cwd at the moment it bound this session id (ADR-0002,\nherdr-ct9), sent only by the Claude integration hook from the\nSessionStart payload's `cwd` field. Persisted alongside the session\nreference and used as the resume shell's cwd instead of the pane's\nshell cwd, when it names a directory that still exists. Optional and\nadditive.",
               "type": [
                 "string",
                 "null"
