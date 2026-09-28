@@ -97,6 +97,16 @@ pub(crate) struct TerminalTitleChange {
 pub struct TerminalStateMutation {
     pub effective_state_change: Option<EffectiveStateChange>,
     pub session_ref_changed: bool,
+    /// ADR-0002, herdr-ct9 (P2-d): whether `persisted_agent_session_cwd`
+    /// itself changed on this call, independent of `session_ref_changed`.
+    /// The two can disagree - a v10 -> v11 hook upgrade can report the SAME
+    /// session id (identity unchanged) with a cwd for the first time - and
+    /// only the site that actually writes `persisted_agent_session_cwd`
+    /// (`set_agent_session_ref_for_session_start_with_reporter`) ever sets
+    /// this to anything but `false`. The caller must OR it into its own
+    /// persistence-dirty decision alongside `session_ref_changed`, or a
+    /// cwd-only update never gets saved.
+    pub persisted_agent_session_cwd_changed: bool,
     pub agent_released: bool,
 }
 
@@ -368,6 +378,7 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                persisted_agent_session_cwd_changed: false,
                 agent_released: false,
             };
         }
@@ -387,6 +398,7 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                persisted_agent_session_cwd_changed: false,
                 agent_released: false,
             };
         }
@@ -602,6 +614,7 @@ impl TerminalState {
             ),
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed: false,
             agent_released,
         }
     }
@@ -765,6 +778,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed: false,
             agent_released: false,
         })
     }
@@ -1598,12 +1612,18 @@ impl TerminalState {
                         now,
                     ),
                     session_ref_changed: previous_session != current_session,
+                    persisted_agent_session_cwd_changed: false,
                     agent_released: false,
                 });
             }
             return None;
         }
-        if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
+        // P2-c: a READ-ONLY freshness check here - committing the seq
+        // watermark is deferred until every rejection check below (in
+        // particular the herdr-3ir foreground-ownership gate inside
+        // `conflicting_same_owner_session_ref`) has been passed. See
+        // `commit_hook_report_seq`'s doc comment for why.
+        if !unsequenced_selection && !self.hook_report_seq_is_fresh(&source, seq) {
             return None;
         }
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
@@ -1662,12 +1682,22 @@ impl TerminalState {
             return None;
         }
 
+        // P2-c: every rejection check above has passed - this report is
+        // accepted, so NOW is when the per-source seq watermark commits.
+        if !unsequenced_selection {
+            self.commit_hook_report_seq(&source, seq);
+        }
+
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        // P2-d: captured so the mutation can report a cwd-only change even
+        // when the session identity itself did not move (see the new field's
+        // doc comment on `TerminalStateMutation`).
+        let previous_persisted_agent_session_cwd = self.persisted_agent_session_cwd.clone();
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -1696,6 +1726,8 @@ impl TerminalState {
         self.persisted_agent_session = Some(persisted_session);
         self.persisted_agent_session_cwd = agent_session_cwd;
         let current_session = self.current_session_identity_for_persistence();
+        let persisted_agent_session_cwd_changed =
+            previous_persisted_agent_session_cwd != self.persisted_agent_session_cwd;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1705,6 +1737,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed,
             agent_released: false,
         })
     }
@@ -1754,20 +1787,43 @@ impl TerminalState {
     }
 
     fn accept_hook_report(&mut self, source: &str, seq: Option<u64>) -> bool {
+        if !self.hook_report_seq_is_fresh(source, seq) {
+            return false;
+        }
+        self.commit_hook_report_seq(source, seq);
+        true
+    }
+
+    /// Read-only half of `accept_hook_report` (P2-c, ADR-0002 herdr-3ir/
+    /// 4r8/ct9 fix round): whether `seq` would be accepted against the
+    /// per-source watermark, WITHOUT advancing it. Split out so a caller
+    /// that still has other rejection checks ahead of it (the herdr-3ir
+    /// foreground-ownership gate, in particular) can decide eligibility
+    /// first and commit the watermark only once every check has passed -
+    /// see `commit_hook_report_seq` and its call site.
+    fn hook_report_seq_is_fresh(&self, source: &str, seq: Option<u64>) -> bool {
         let Some(seq) = seq else {
             return !self.hook_report_sequences.contains_key(source);
         };
-
-        if self
+        !self
             .hook_report_sequences
             .get(source)
             .is_some_and(|last_seq| seq <= *last_seq)
-        {
-            return false;
-        }
+    }
 
-        self.hook_report_sequences.insert(source.to_string(), seq);
-        true
+    /// Mutating half of `accept_hook_report` - advances the per-source
+    /// watermark. Callers MUST have already confirmed the report is fully
+    /// accepted (via `hook_report_seq_is_fresh` plus every other rejection
+    /// check) before calling this: committing on a report that is later
+    /// rejected for an unrelated reason lets that rejected report's seq
+    /// silently starve a legitimate, lower-seq report that arrives after it
+    /// (P2-c's measured shape: a non-foreground worker's report with a
+    /// higher seq arrives and is rejected by the herdr-3ir gate; a delayed
+    /// legitimate foreground report with a lower seq must still go through).
+    fn commit_hook_report_seq(&mut self, source: &str, seq: Option<u64>) {
+        if let Some(seq) = seq {
+            self.hook_report_sequences.insert(source.to_string(), seq);
+        }
     }
 
     #[cfg(test)]
@@ -1823,6 +1879,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session.is_some(),
+            persisted_agent_session_cwd_changed: false,
             agent_released: false,
         })
     }
@@ -1888,6 +1945,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed: false,
             agent_released: !process_owns_agent,
         })
     }
@@ -2432,6 +2490,142 @@ mod tests {
                 .map(|session| session.session_ref.value.as_str()),
             Some("headless-session")
         );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-c: a report REJECTED by the
+    // herdr-3ir foreground gate must not commit its seq to the per-source
+    // watermark - otherwise its (higher) seq can starve a legitimate,
+    // lower-seq report that was simply delayed and arrives afterwards.
+    #[test]
+    fn agent_restore_p2c_rejected_report_does_not_starve_a_later_lower_seq_foreground_report() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+        });
+
+        // A non-foreground (nested worker) report arrives FIRST, with a
+        // HIGHER seq than the legitimate foreground report still in flight,
+        // and is correctly rejected by the herdr-3ir gate.
+        let rejected = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(201),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+        assert!(
+            rejected.is_none(),
+            "the non-foreground report must still be rejected"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session"),
+            "a rejected report must not replace the session"
+        );
+
+        // The legitimate foreground report, delayed, arrives afterwards with
+        // a LOWER seq than the report just rejected. Before this fix, the
+        // rejected report's seq=201 was already committed to the watermark
+        // (accept_hook_report ran before the foreground gate), so this
+        // seq=200 report would fail the staleness check (200 <= 201) and be
+        // silently dropped - exactly the failure this test guards against.
+        let accepted = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("foreground-session"),
+                Some(200),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a rejected report must not consume the seq a later legitimate report needs");
+
+        assert!(accepted.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("foreground-session")
+        );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-d: the SAME session id is reported
+    // again, this time carrying a cwd for the first time (the shape of a
+    // v10 -> v11 hook upgrade's first post-upgrade report). The session
+    // identity does not change, but the cwd does, and the mutation must say
+    // so through its OWN field rather than only through `session_ref_changed`.
+    #[test]
+    fn agent_restore_p2d_cwd_only_change_sets_its_own_changed_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+        });
+        assert_eq!(terminal.persisted_agent_session_cwd, None);
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("a same-identity report with a new cwd must still be accepted");
+
+        assert!(
+            !mutation.session_ref_changed,
+            "the session identity did not change"
+        );
+        assert!(
+            mutation.persisted_agent_session_cwd_changed,
+            "the cwd DID change and must be reported so a caller can persist it"
+        );
+        assert_eq!(
+            terminal.persisted_agent_session_cwd.as_deref(),
+            Some("/work/project")
+        );
+    }
+
+    // The mirror: neither the identity nor the cwd changes - both flags stay
+    // false, so an unrelated re-report of unchanged state never marks the
+    // session dirty.
+    #[test]
+    fn agent_restore_p2d_unchanged_cwd_does_not_set_the_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+        });
+        terminal.persisted_agent_session_cwd = Some("/work/project".into());
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("an unchanged report should still be accepted");
+
+        assert!(!mutation.session_ref_changed);
+        assert!(!mutation.persisted_agent_session_cwd_changed);
     }
 
     fn test_session_path(name: &str) -> String {

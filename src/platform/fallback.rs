@@ -217,6 +217,11 @@ pub fn process_start_marker(_pid: u32) -> Option<u64> {
     None
 }
 
+/// Unsupported platform stub (ADR-0002, herdr-4r8, P1-a).
+pub fn local_pid_domain() -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None

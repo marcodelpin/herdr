@@ -674,6 +674,31 @@ pub fn process_start_marker(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
+/// This process's own pid-namespace + host identity, in the same format
+/// Claude Code's session registry stores as `pidDomain` (ADR-0002, herdr-4r8,
+/// P1-a): `linux:<machine-id>:<pid-namespace-symlink>`, e.g.
+/// `linux:884aaaeda1474ac68c9851276f5b6c04:pid:[4026535542]`. A registry
+/// record whose `pidDomain` does not match this is a live pid in some OTHER
+/// pid namespace or on some OTHER machine (reachable, for example, through a
+/// shared/synced Claude config dir) - `process_exists`/`process_start_marker`
+/// only ever see whichever process the KERNEL currently maps to that pid
+/// number in OUR OWN namespace, which pid reuse across namespaces can make
+/// an entirely unrelated process.
+///
+/// Fails open (`None`) when either read fails, exactly like every other
+/// primitive in this module - the caller must treat `None` as "cannot
+/// compare", never as "foreign".
+pub fn local_pid_domain() -> Option<String> {
+    let machine_id = std::fs::read_to_string("/etc/machine-id").ok()?;
+    let machine_id = machine_id.trim();
+    if machine_id.is_empty() {
+        return None;
+    }
+    let pid_ns = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    let pid_ns = pid_ns.to_str()?;
+    Some(format!("linux:{machine_id}:{pid_ns}"))
+}
+
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.

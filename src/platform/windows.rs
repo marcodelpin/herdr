@@ -1436,6 +1436,14 @@ pub fn process_start_marker(pid: u32) -> Option<u64> {
     process_creation_time(process.0)
 }
 
+/// ADR-0002, herdr-4r8, P1-a: Windows has no pid-namespace concept.
+/// Documented no-op so a registry record's `pidDomain` is never treated as
+/// foreign here - it is simply incomparable, and the caller falls open to
+/// the existing pid+start-marker check.
+pub fn local_pid_domain() -> Option<String> {
+    None
+}
+
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
     let process_parameters = read_process_parameters(process.0)?;

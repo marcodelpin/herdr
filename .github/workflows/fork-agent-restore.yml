@@ -6,13 +6,27 @@
 # holds open, by scanning the local Claude Code session registries. herdr-ct9 resumes a pane in the
 # agent's own reported cwd, not the pane shell's cwd, when that directory still exists. All three
 # fail open to today's behavior whenever their new input is absent (old client, Windows, an
-# unreadable registry, a vanished pid). This host cannot build the crate (no Zig 0.16.0), so the
-# crate tests run here on both platforms (nextest, one process per test), the new tests run again
-# by name with a per-OS count gate so a green run cannot silently skip or gain one, four mutant
-# jobs each prove one of the new tests is load-bearing rather than decorative, and a Linux release
-# build runs only once the crate tests and every mutant job pass - same build shape as
-# fork-14v-resume-launcher.yml (checksum uses blake3, per this fleet's hashing policy). bd
-# herdr-3ir, herdr-4r8, herdr-ct9.
+# unreadable registry, a vanished pid).
+#
+# codex ar-r2 fix round (adversarial review, DO-NOT-LAND, 5 findings, all fixed at the root):
+# P1-a the real registry stores procStart/procStartFt as JSON STRINGS, not numbers, so a plain
+# Option<u64> field rejected every one of 1201 live records measured on this host and the herdr-4r8
+# gate never fired in production; also validates pidDomain (pid namespace + machine-id) so a record
+# from another namespace/machine is never mistaken for a local live holder. P1-b a pane's own saved
+# cwd being unavailable no longer blocks a resumable native agent session whose OWN reported cwd
+# still exists. P2-c a report rejected by the herdr-3ir foreground gate no longer commits its seq to
+# the per-source watermark, so it cannot starve a later, legitimate, lower-seq report. P2-d a
+# cwd-only change (session identity unchanged) now schedules a session save through its own
+# TerminalStateMutation field, not only through session_ref_changed. P2-e the herdr-4r8 liveness
+# check now models three outcomes (proven match, proven mismatch, evidence unavailable on either
+# side) instead of misreading "the record itself carries no start marker" as a proven mismatch.
+#
+# This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on both platforms
+# (nextest, one process per test), the new tests run again by name with a per-OS count gate so a
+# green run cannot silently skip or gain one, five mutant jobs each prove one of the new tests is
+# load-bearing rather than decorative, and a Linux release build runs only once the crate tests and
+# every mutant job pass - same build shape as fork-14v-resume-launcher.yml (checksum uses blake3,
+# per this fleet's hashing policy). bd herdr-3ir, herdr-4r8, herdr-ct9.
 name: Fork agent restore (3ir/4r8/ct9)
 
 on:
@@ -68,10 +82,13 @@ jobs:
       # The new ADR-0002 tests, by name: herdr-3ir (TerminalState unit tests + one hook-asset
       # content test), herdr-4r8 (agent_session_registry pure unit tests + App-level deferred-resume
       # tests), herdr-ct9 (pure agent_resume_cwd tests + persist/restore round-trip tests + one
-      # hook-asset content test). The three App-level herdr-4r8 tests spawn a real /bin/sh pty and
-      # are #[cfg(unix)] only, so Windows carries 3 fewer: 18 on Linux/macOS-shaped Unix, 15 on
-      # Windows. The count check fails the job if the filter matches fewer (or more) than expected,
-      # so a green run that skipped, or silently gained, one of them is red.
+      # hook-asset content test), plus the codex ar-r2 fix round: P1-a (agent_session_registry
+      # string-procStart + pidDomain unit tests), P1-b (one persist/restore cold-restore test), P2-c
+      # + P2-d (TerminalState unit tests + one App-level actions.rs test). The three App-level
+      # herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only, so Windows carries 3
+      # fewer: 29 on Linux/macOS-shaped Unix, 26 on Windows. The count check fails the job if the
+      # filter matches fewer (or more) than expected, so a green run that skipped, or silently
+      # gained, one of them is red.
       - name: Run the new agent-restore tests by name
         shell: bash
         run: |
@@ -80,9 +97,9 @@ jobs:
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=15
+            expected=26
           else
-            expected=18
+            expected=29
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -304,6 +321,72 @@ jobs:
           done
           echo "mutant killed: exactly the cwd-preference test failed with the cwd ignored"
 
+  agent-restore-p1a-string-proc-start-mutant:
+    # herdr-4r8's whole P1-a fix is accepting procStart/procStartFt as a JSON STRING (the real
+    # registry's actual shape, measured against 1201 live records on this host) rather than only a
+    # number. Making the deserializer reject the string form again (mapping it to None instead of
+    # parsing it) reproduces the exact defect that made the gate a no-op in production while CI's
+    # original numeric-only fixtures stayed green.
+    #
+    # A record with a rejected procStart and no procStartFt at all falls into the herdr-3ir/4r8/ct9
+    # P2-e fail-open path ("the record itself carries no start marker at all -> treat as live"), so
+    # the two POSITIVE-outcome string tests (matches_string_proc_start,
+    # missing_pid_domain_keeps_current_behavior) still read Some(holder) either way and do NOT
+    # detect this mutant on their own - they are asserted to STAY GREEN below, not because the
+    # mutant is inert for them, but because P2-e's own fail-open policy legitimately masks it there.
+    # Only the MISMATCH test can observe the difference: with a real string-to-u64 parse, a
+    # DIFFERENT OS-observed start marker is a PROVEN mismatch (not live); with the string rejected,
+    # the record has no marker to compare, evidence is unavailable, and P2-e's fail-open makes it
+    # read as live instead - flipping that one test from None to Some(holder).
+    name: mutant - the P1-a string procStart parsing is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Make the procStart deserializer reject strings again and require the mismatch test to fail
+        run: |
+          sed -i 's/StringOrU64::String(s) => s.parse::<u64>().ok(),/StringOrU64::String(_s) => None, \/* MUTANT p1a string procStart rejected *\//' src/agent_session_registry.rs
+          landed=$(grep -c 'MUTANT p1a string procStart rejected' src/agent_session_registry.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_p1a_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every p1a test passed with string procStart rejected"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_p1a_find_live_holder_string_proc_start_mismatch_is_not_live" mutant.log || { echo "expected the string-proc-start mismatch test to FAIL"; exit 1; }
+          for test in agent_restore_p1a_find_live_holder_matches_string_proc_start \
+                      agent_restore_p1a_find_live_holder_ignores_foreign_pid_domain \
+                      agent_restore_p1a_find_live_holder_missing_pid_domain_keeps_current_behavior; do
+            grep -q "FAIL.*$test" mutant.log && { echo "$test should stay green under this mutant (see the job's own comment for why)"; exit 1; }
+          done
+          echo "mutant killed: exactly the mismatch test failed with string procStart rejected"
+
   build-linux:
     name: build herdr-linux-x86_64
     needs:
@@ -313,6 +396,7 @@ jobs:
         agent-restore-3ir-guard-deleted-mutant,
         agent-restore-4r8-scoping-mutant,
         agent-restore-ct9-cwd-ignored-mutant,
+        agent-restore-p1a-string-proc-start-mutant,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 90

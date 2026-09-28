@@ -440,6 +440,15 @@ pub fn process_start_marker(_pid: u32) -> Option<u64> {
     None
 }
 
+/// ADR-0002, herdr-4r8, P1-a: no pid-namespace concept confirmed on this
+/// platform (Linux-only container/namespace semantics). Documented no-op so
+/// a registry record's `pidDomain` is never treated as foreign here - it is
+/// simply incomparable, and the caller falls open to the existing
+/// pid+start-marker check.
+pub fn local_pid_domain() -> Option<String> {
+    None
+}
+
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     if child_pid == 0 {

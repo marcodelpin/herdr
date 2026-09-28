@@ -511,9 +511,32 @@ fn restore_tab(
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
 
-        let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
+        // ADR-0002, herdr-ct9 (herdr-3ir/4r8/ct9 fix round, P1-b): a pane
+        // whose own persisted cwd was deleted or moved is not necessarily
+        // unrestorable - when it carries a resumable native agent session
+        // whose own reported cwd still exists, that is the cwd the restored
+        // terminal (and its deferred resume, via `agent_resume_cwd()`) will
+        // actually use once `pending_native_agent_restore` fires below, so it
+        // satisfies the availability check in its place. This is a *pure*
+        // re-derivation of `restore_plan_for_snapshot` - it never touches
+        // `resumed_agent_sessions`, so it cannot steal the dedupe reservation
+        // from a sibling pane that shares the same session id and does have
+        // a resumable plan; the real (mutating) `pane_restore_startup` call
+        // below is unchanged and still runs exactly once, at the same point
+        // in the same iteration order as before this fix.
+        let agent_cwd_override = saved_agent_session
+            .filter(|session| {
+                restore_plan_for_snapshot(session, runtime_context.resume_agents_on_restore)
+                    .is_some()
+            })
+            .and_then(|session| session.agent_session_cwd.as_deref())
+            .map(PathBuf::from)
+            .filter(|agent_cwd| agent_cwd.is_dir());
+
+        let cwd = agent_cwd_override.unwrap_or(saved_cwd);
         if !has_import && !cwd.is_dir() {
             let terminal = unavailable_restored_terminal(
                 saved_pane,
@@ -532,7 +555,6 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
-        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -1506,6 +1528,108 @@ mod tests {
         assert_eq!(
             terminal.persisted_agent_session_cwd.as_deref(),
             Some(agent_cwd.display().to_string().as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P1-b: a cold restore whose PANE cwd was
+    // deleted or moved must still resume the agent when the agent's own
+    // reported cwd exists and resume is enabled - the availability check at
+    // the top of the pane loop must not reject the pane before
+    // `pending_native_agent_restore` is even considered.
+    #[tokio::test]
+    async fn agent_restore_p1b_cold_restore_with_missing_pane_cwd_resumes_via_agent_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let missing_pane_cwd = cwd.join("__herdr_p1b_missing_pane_cwd__");
+        assert!(!missing_pane_cwd.exists());
+        let agent_cwd = cwd.join("__herdr_p1b_agent_cwd__");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: missing_pane_cwd.clone(),
+                            label: Some("keep my pane".into()),
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "p1b-claude-session".into(),
+                                agent_session_cwd: Some(agent_cwd.display().to_string()),
+                            }),
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert!(
+            terminal.restore_error.is_none(),
+            "an existing agent cwd must satisfy the availability check, got: {:?}",
+            terminal.restore_error
+        );
+        assert_eq!(
+            terminal.cwd, agent_cwd,
+            "the restored terminal must use the agent's own cwd, not the missing pane cwd"
+        );
+        assert_eq!(
+            terminal.persisted_agent_session_cwd.as_deref(),
+            Some(agent_cwd.display().to_string().as_str())
+        );
+        assert!(
+            terminal.pending_agent_resume_plan.is_some(),
+            "resume must still be pending - the bug this test guards against skipped it entirely"
+        );
+        assert_eq!(terminal.manual_label.as_deref(), Some("keep my pane"));
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        assert!(
+            runtimes.get(&terminal.id).is_none(),
+            "a pending native resume must not spawn a plain shell yet"
         );
 
         let _ = std::fs::remove_dir_all(&agent_cwd);
