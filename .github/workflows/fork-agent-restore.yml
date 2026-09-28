@@ -1,0 +1,385 @@
+# Fork-only workflow for fix/3ir-4r8-ct9-agent-restore (not for upstream): ADR-0002 gives herdr
+# three trust gates around agent-pane restore. herdr-3ir refuses a `herdr:claude` session-replace
+# report from a reporter that is not the pane's foreground process group (a nested headless
+# `claude -p` worker overwriting the interactive session it was launched from). herdr-4r8 refuses
+# to type a deferred `--resume`/`-c` command onto a claude session id another live process already
+# holds open, by scanning the local Claude Code session registries. herdr-ct9 resumes a pane in the
+# agent's own reported cwd, not the pane shell's cwd, when that directory still exists. All three
+# fail open to today's behavior whenever their new input is absent (old client, Windows, an
+# unreadable registry, a vanished pid). This host cannot build the crate (no Zig 0.16.0), so the
+# crate tests run here on both platforms (nextest, one process per test), the new tests run again
+# by name with a per-OS count gate so a green run cannot silently skip or gain one, four mutant
+# jobs each prove one of the new tests is load-bearing rather than decorative, and a Linux release
+# build runs only once the crate tests and every mutant job pass - same build shape as
+# fork-14v-resume-launcher.yml (checksum uses blake3, per this fleet's hashing policy). bd
+# herdr-3ir, herdr-4r8, herdr-ct9.
+name: Fork agent restore (3ir/4r8/ct9)
+
+on:
+  push:
+    branches: [fix/3ir-4r8-ct9-agent-restore]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      # nextest runs one process per test, matching upstream `just ci` and this fork's own
+      # fork-14v-resume-launcher.yml precedent (a plain `cargo test` binary died to SIGPIPE there).
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      # The new ADR-0002 tests, by name: herdr-3ir (TerminalState unit tests + one hook-asset
+      # content test), herdr-4r8 (agent_session_registry pure unit tests + App-level deferred-resume
+      # tests), herdr-ct9 (pure agent_resume_cwd tests + persist/restore round-trip tests + one
+      # hook-asset content test). The three App-level herdr-4r8 tests spawn a real /bin/sh pty and
+      # are #[cfg(unix)] only, so Windows carries 3 fewer: 18 on Linux/macOS-shaped Unix, 15 on
+      # Windows. The count check fails the job if the filter matches fewer (or more) than expected,
+      # so a green run that skipped, or silently gained, one of them is red.
+      - name: Run the new agent-restore tests by name
+        shell: bash
+        run: |
+          filter='test(/agent_restore_/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > agent-restore-tests.txt
+          cat agent-restore-tests.txt
+          count=$(grep -c . agent-restore-tests.txt || true)
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            expected=15
+          else
+            expected=18
+          fi
+          [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
+
+  agent-restore-3ir-guard-inverted-mutant:
+    # herdr-3ir's whole fix is refusing a same-owner claude session replacement when the reporter
+    # is known not to be the pane's foreground process group. Inverting the sense of the new guard
+    # (fire on Some(true) instead of Some(false)) reproduces the measured incident directly: a
+    # foreground reporter's legitimate resume report is now wrongly rejected, and a non-foreground
+    # (nested worker) report is wrongly accepted. Exactly 2 of the 4 new 3ir TerminalState tests
+    # depend on the guard's sense; the other 2 (no pid / unresolvable pid) fail open regardless of
+    # the sense and must stay green.
+    name: mutant - the 3ir foreground guard's sense is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Invert the guard's sense and require the affected tests to fail
+        run: |
+          sed -i 's/reporter_is_foreground == Some(false)/reporter_is_foreground == Some(true) \/* MUTANT 3ir guard inverted *\//' src/terminal/state.rs
+          landed=$(grep -c 'MUTANT 3ir guard inverted' src/terminal/state.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every 3ir test passed with the guard's sense inverted"
+            exit 1
+          fi
+          for test in agent_restore_3ir_resume_report_from_pane_foreground_replaces_session \
+                      agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected; do
+            grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
+          done
+          for test in agent_restore_3ir_report_without_agent_pid_keeps_todays_behavior \
+                      agent_restore_3ir_report_reporter_pid_unresolvable_keeps_todays_behavior; do
+            grep -q "FAIL.*$test" mutant.log && { echo "$test should stay green under this mutant (it fails open on None regardless of the guard's sense)"; exit 1; }
+          done
+          echo "mutant killed: exactly the sense-dependent tests failed with the guard inverted"
+
+  agent-restore-3ir-guard-deleted-mutant:
+    # Kills the "the guard exists but is unreachable" class: deleting it entirely must still turn
+    # the non-foreground-rejection test red (the guard inverted above could in principle be dead
+    # code reached by neither branch; this proves it is reached).
+    name: mutant - the 3ir foreground guard must exist
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Delete the guard and require the non-foreground rejection test to fail
+        run: |
+          perl -0777 -pi -e 's/        if \(source, agent_label\) == \("herdr:claude", "claude"\)\n            && reporter_is_foreground == Some\(false\)\n        \{\n            return false;\n        \}\n/        \/* MUTANT 3ir guard deleted *\/\n/' src/terminal/state.rs
+          landed=$(grep -c 'MUTANT 3ir guard deleted' src/terminal/state.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every 3ir test passed with the guard deleted"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected" mutant.log || { echo "expected the non-foreground rejection test to FAIL"; exit 1; }
+          echo "mutant killed: the rejection test failed with the guard deleted"
+
+  agent-restore-4r8-scoping-mutant:
+    # herdr-4r8's live-elsewhere check must be scoped to ("herdr:claude", "claude") sessions only -
+    # the registry it scans only ever holds Claude Code sessions, so consulting it for a non-claude
+    # plan can only produce a false positive. Widening "if plan.agent == claude" to fire
+    # unconditionally must turn the scoping test red without disturbing the two claude-scoped tests.
+    name: mutant - the 4r8 claude-only scoping is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Widen the claude-only scoping and require the scoping test to fail
+        run: |
+          sed -i 's/if plan.agent == "claude" {/if true \/* MUTANT 4r8 scoping removed *\/ {/' src/app/agent_resume.rs
+          landed=$(grep -c 'MUTANT 4r8 scoping removed' src/app/agent_resume.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_4r8_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every 4r8 test passed with the scoping widened to every agent"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_4r8_scoping_is_limited_to_claude_sessions" mutant.log || { echo "expected the scoping test to FAIL"; exit 1; }
+          for test in agent_restore_4r8_deferred_resume_onto_live_elsewhere_session_sets_restore_error_and_keeps_session \
+                      agent_restore_4r8_deferred_resume_onto_not_live_session_spawns_normally; do
+            grep -q "FAIL.*$test" mutant.log && { echo "$test should stay green under this mutant (both plans are already claude-scoped)"; exit 1; }
+          done
+          echo "mutant killed: exactly the scoping test failed with the guard widened"
+
+  agent-restore-ct9-cwd-ignored-mutant:
+    # herdr-ct9's whole fix is preferring the agent's own reported cwd over the pane's shell cwd.
+    # Forcing agent_resume_cwd to always return the pane cwd reproduces "the field is persisted but
+    # never actually used" and must turn the one test that asserts the agent cwd wins red, without
+    # disturbing the fallback test (which already expects the pane cwd).
+    name: mutant - the ct9 agent cwd preference is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Ignore the reported agent cwd and require the preference test to fail
+        run: |
+          perl -0777 -pi -e 's/fn agent_resume_cwd\(terminal: &crate::terminal::TerminalState\) -> std::path::PathBuf \{\n    terminal\n        \.persisted_agent_session_cwd\n        \.as_deref\(\)\n        \.map\(std::path::Path::new\)\n        \.filter\(\|cwd\| cwd\.is_dir\(\)\)\n        \.map\(std::path::Path::to_path_buf\)\n        \.unwrap_or_else\(\|\| terminal\.cwd\.clone\(\)\)\n\}/fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {\n    \/* MUTANT ct9 agent cwd ignored *\/\n    terminal.cwd.clone()\n}/' src/app/agent_resume.rs
+          landed=$(grep -c 'MUTANT ct9 agent cwd ignored' src/app/agent_resume.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_ct9_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every ct9 test passed while the agent cwd was ignored"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_ct9_resume_uses_agent_cwd_when_it_exists" mutant.log || { echo "expected the agent-cwd-preference test to FAIL"; exit 1; }
+          for test in agent_restore_ct9_resume_falls_back_to_pane_cwd_when_agent_cwd_missing_or_not_dir \
+                      agent_restore_ct9_old_snapshot_without_cwd_field_still_loads \
+                      agent_restore_ct9_restore_carries_agent_session_cwd; do
+            grep -q "FAIL.*$test" mutant.log && { echo "$test should stay green under this mutant"; exit 1; }
+          done
+          echo "mutant killed: exactly the cwd-preference test failed with the cwd ignored"
+
+  build-linux:
+    name: build herdr-linux-x86_64
+    needs:
+      [
+        crate-tests,
+        agent-restore-3ir-guard-inverted-mutant,
+        agent-restore-3ir-guard-deleted-mutant,
+        agent-restore-4r8-scoping-mutant,
+        agent-restore-ct9-cwd-ignored-mutant,
+      ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Same LIBGHOSTTY_VT_* settings as preview.yml's release builds and
+    # fork-14v-resume-launcher.yml (ReleaseFast / SIMD on) - the
+    # build-artifacts-manual.yml input defaults (ReleaseSafe / false) would
+    # silently swap the server's VT engine for a slower one.
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Prefer official Ubuntu mirrors over Azure
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+            echo "Using apt mirrors:"
+            cat /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install Linux build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/herdr herdr-linux-x86_64
+          file herdr-linux-x86_64 > BUILD_INFO.txt
+          ldd herdr-linux-x86_64 2>&1 | tee -a BUILD_INFO.txt
+          grep -q "statically linked" BUILD_INFO.txt
+          if nm -u herdr-linux-x86_64 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
+            echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
+            exit 1
+          fi
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "target=x86_64-unknown-linux-musl"
+            echo "libghostty_vt_optimize=$LIBGHOSTTY_VT_OPTIMIZE"
+            echo "libghostty_vt_simd=$LIBGHOSTTY_VT_SIMD"
+          } >> BUILD_INFO.txt
+          python3 -m pip install --quiet blake3
+          python3 -c "import blake3, pathlib; artifact = pathlib.Path('herdr-linux-x86_64'); print(f'blake3={blake3.blake3(artifact.read_bytes()).hexdigest()}  {artifact.name}')" >> BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-linux-x86_64-agent-restore
+          path: |
+            herdr-linux-x86_64
+            BUILD_INFO.txt
+          retention-days: 7

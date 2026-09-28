@@ -2212,6 +2212,147 @@ mod tests {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
     }
 
+    // herdr-3ir (ADR-0002): a `herdr:claude` report that would replace the
+    // pane's persisted session is refused when the reporter is known not to
+    // be the pane's foreground process group. `reporter_is_foreground` is
+    // computed by the API layer from the reporter's own pid, never inside
+    // `TerminalState` itself - these tests pass it in directly.
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_pane_foreground_replaces_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+        });
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a foreground reporter's resume report should replace the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+        });
+
+        // This is the measured incident: a nested `claude -p` worker (a
+        // child in its own process group) fires the same SessionStart hook
+        // and reports its own headless session id with session_start_source
+        // "resume". It must not overwrite the pane's interactive session.
+        let mutation = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(21),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+
+        assert!(
+            mutation.is_none(),
+            "a nested worker's resume report must not replace the pane's session"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_without_agent_pid_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+        });
+
+        // The 5-arg entry point every existing caller uses (an old client
+        // with no pid plumbing, or any non-claude report) has no reporter
+        // identity to give at all - it must keep replacing the session
+        // exactly as before this fix.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+            )
+            .expect("a report with no reporter pid should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_reporter_pid_unresolvable_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+        });
+
+        // The caller sent an agent_pid, but resolving it (or the pane's own
+        // foreground group) failed - e.g. the pid raced and exited between
+        // the report and the lookup, or this build is Windows. The API
+        // layer reduces that to `None`, same as no pid at all: fail open.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                None,
+                None,
+            )
+            .expect("an unresolvable reporter should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
             .unwrap()

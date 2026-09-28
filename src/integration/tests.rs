@@ -3194,6 +3194,35 @@ fn bundled_integration_asset_versions_match_expected_versions() {
     }
 }
 
+// ADR-0002 (herdr-3ir, herdr-ct9): a regression guard against "the version
+// marker bumped but the field was never actually added" - cheap
+// string-presence checks, not a behavioral test of the hook. CLAUDE_HOOK_ASSET
+// is the `.sh` asset on Unix and the `.ps1` asset on Windows (`cfg!(windows)`
+// in `mod.rs`); the `.sh` builds a JSON params dict directly (`agent_pid`,
+// `agent_session_cwd`), while the `.ps1` shells out to the CLI with hyphenated
+// flags (`--agent-pid`, `--agent-session-cwd`) - either spelling satisfies the
+// check, since CI runs this on both `ubuntu-latest` and `windows-latest`.
+#[test]
+fn agent_restore_3ir_claude_hook_asset_reports_agent_pid() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("CLAUDE_PID"),
+        "the claude hook should read the reporter's own pid from $CLAUDE_PID"
+    );
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_pid") || CLAUDE_HOOK_ASSET.contains("agent-pid"),
+        "the claude hook should report the reporter's pid to pane.report_agent_session"
+    );
+}
+
+#[test]
+fn agent_restore_ct9_claude_hook_asset_reports_session_cwd() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_session_cwd")
+            || CLAUDE_HOOK_ASSET.contains("agent-session-cwd"),
+        "the claude hook should report the agent's own cwd to pane.report_agent_session"
+    );
+}
+
 #[test]
 fn process_owned_integration_assets_do_not_report_release() {
     for (name, asset) in [

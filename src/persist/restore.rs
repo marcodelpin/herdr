@@ -1372,6 +1372,107 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+        assert_eq!(
+            terminal.persisted_agent_session_cwd, None,
+            "a snapshot without an agent_session_cwd should restore with none"
+        );
+    }
+
+    // herdr-ct9 (ADR-0002): a snapshot written before this field existed has
+    // no `agent_session_cwd` key at all in its JSON. `#[serde(default)]`
+    // must let it deserialize anyway, with the field defaulting to `None`,
+    // rather than fail the whole restore over one missing optional key.
+    #[test]
+    fn agent_restore_ct9_old_snapshot_without_cwd_field_still_loads() {
+        let json = r#"{
+            "source": "herdr:opencode",
+            "agent": "opencode",
+            "kind": "id",
+            "value": "opencode-session"
+        }"#;
+
+        let session: super::super::snapshot::PaneAgentSessionSnapshot =
+            serde_json::from_str(json).expect("a pre-ct9 snapshot must still deserialize");
+
+        assert_eq!(session.source, "herdr:opencode");
+        assert_eq!(session.value, "opencode-session");
+        assert_eq!(session.agent_session_cwd, None);
+    }
+
+    #[tokio::test]
+    async fn agent_restore_ct9_restore_carries_agent_session_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let agent_cwd = cwd.join("agent-subdir");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "claude-session".into(),
+                                agent_session_cwd: Some(agent_cwd.display().to_string()),
+                            }),
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert_eq!(
+            terminal.persisted_agent_session_cwd.as_deref(),
+            Some(agent_cwd.display().to_string().as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
     }
 
     #[tokio::test]
