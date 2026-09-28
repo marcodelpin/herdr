@@ -369,7 +369,10 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
-                    agent_session_cwd: terminal.persisted_agent_session_cwd.clone(),
+                    // ADR-0002, herdr-ct9 amendment: the cwd lives INSIDE the
+                    // session value itself, so it can never disagree with
+                    // which session it is captured alongside.
+                    agent_session_cwd: session.cwd.clone(),
                 })
         });
         panes.insert(
@@ -1271,6 +1274,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            cwd: None,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1312,6 +1316,7 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+                cwd: None,
             });
 
         let snapshot = capture_from_state(&state);
@@ -1327,6 +1332,75 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Id
         );
         assert_eq!(agent_session.value, "opencode-session");
+    }
+
+    // ADR-0002 amendment companion to
+    // `agent_restore_p2_amendment_cwd_does_not_survive_a_session_replaced_by_another_agents_startup`
+    // in terminal/state.rs - the state-level regression proves the runtime
+    // value is correct; this proves a snapshot CAPTURED off that runtime
+    // value carries the same correct `None`, not a stale cwd resurrected
+    // from a sibling field the capture code used to read separately.
+    #[test]
+    fn capture_contract_does_not_resurrect_a_stale_cwd_after_session_replacement() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Claude),
+            crate::detect::AgentState::Working,
+        );
+        let buffered = terminal.set_agent_session_ref_for_session_start(
+            "herdr:mastracode".into(),
+            "mastracode".into(),
+            crate::agent_resume::AgentSessionRef::id("mastracode-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            buffered.is_none(),
+            "mastracode's session should not activate before its process is detected"
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Claude),
+            crate::detect::AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            std::time::Instant::now(),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Mastracode),
+            crate::detect::AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("mastracode's session should be captured");
+
+        assert_eq!(agent_session.source, "herdr:mastracode");
+        assert_eq!(agent_session.value, "mastracode-session");
+        assert_eq!(
+            agent_session.agent_session_cwd, None,
+            "claude's stale cwd must not appear in a snapshot of mastracode's session"
+        );
     }
 
     #[test]

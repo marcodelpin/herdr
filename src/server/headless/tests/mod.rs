@@ -6824,6 +6824,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                     .to_string(),
             )
             .unwrap(),
+            cwd: None,
         });
     server
         .app

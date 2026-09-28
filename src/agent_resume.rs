@@ -25,11 +25,45 @@ pub struct AgentResumePlan {
     pub dedupe_key: String,
 }
 
+/// ADR-0002, herdr-ct9 amendment: the agent's own reported cwd travels AS
+/// PART OF the session value it belongs to, not as a sibling field on
+/// `TerminalState`. Two adversarial review rounds found the sibling-field
+/// shape structurally unsafe - every place that sets, replaces or clears a
+/// `PersistedAgentSession` has to remember the cwd too, and three call sites
+/// did not (a same-id non-foreground report rewrote it, a session removal
+/// left it for the next agent's session to inherit, a cold restore
+/// overwrote the pane's own cwd with it and lost the fallback). Embedding it
+/// here makes the compiler enforce the discipline: every construction site
+/// must say what the cwd is, so `None` is a decision, never an omission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAgentSession {
     pub source: String,
     pub agent: String,
     pub session_ref: AgentSessionRef,
+    pub cwd: Option<String>,
+}
+
+impl PersistedAgentSession {
+    /// Replaces the cwd, keeping the rest of the session identity as-is.
+    /// The one place production code should reach for after building or
+    /// cloning a session whose cwd is not yet known at construction time.
+    pub fn with_cwd(mut self, cwd: Option<String>) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
+    /// Whether `self` and `other` name the SAME session (source, agent,
+    /// session ref), ignoring `cwd`. The `cwd` a later report attaches to an
+    /// otherwise-unchanged session must not make an identity check that
+    /// predates ADR-0002's cwd field start reporting "different session" -
+    /// full `PartialEq` (which DOES compare `cwd`) is for asserting the
+    /// value is byte-for-byte unchanged, this is for "is it still the same
+    /// conversation".
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.agent == other.agent
+            && self.session_ref == other.session_ref
+    }
 }
 
 impl AgentSessionRef {
@@ -84,6 +118,7 @@ pub fn persisted_session_from_launch_args(
         source: "herdr:codex".into(),
         agent: "codex".into(),
         session_ref: AgentSessionRef::id(session_id.clone())?,
+        cwd: None,
     })
 }
 
@@ -130,6 +165,7 @@ pub fn session_ref_from_snapshot(
         source: source.to_string(),
         agent: agent.to_string(),
         session_ref,
+        cwd: None,
     })
 }
 

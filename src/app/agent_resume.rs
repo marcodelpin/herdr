@@ -23,10 +23,11 @@ struct PendingAgentResumeCandidate {
 /// this fix whenever no agent cwd was reported or it no longer resolves -
 /// the existing "Saved directory is unavailable" handling in
 /// `start_pending_agent_resume` is unchanged either way.
-fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {
+pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {
     terminal
-        .persisted_agent_session_cwd
-        .as_deref()
+        .persisted_agent_session
+        .as_ref()
+        .and_then(|session| session.cwd.as_deref())
         .map(std::path::Path::new)
         .filter(|cwd| cwd.is_dir())
         .map(std::path::Path::to_path_buf)
@@ -518,7 +519,12 @@ mod tests {
 
         let mut terminal =
             crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), pane_cwd);
-        terminal.persisted_agent_session_cwd = Some(agent_cwd.display().to_string());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("ct9-test-session").unwrap(),
+            cwd: Some(agent_cwd.display().to_string()),
+        });
 
         assert_eq!(agent_resume_cwd(&terminal), agent_cwd);
 
@@ -539,12 +545,17 @@ mod tests {
             "no agent cwd was ever reported"
         );
 
-        terminal.persisted_agent_session_cwd = Some(
-            pane_cwd
-                .join("__herdr_ct9_agent_cwd_does_not_exist__")
-                .display()
-                .to_string(),
-        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("ct9-test-session-2").unwrap(),
+            cwd: Some(
+                pane_cwd
+                    .join("__herdr_ct9_agent_cwd_does_not_exist__")
+                    .display()
+                    .to_string(),
+            ),
+        });
         assert_eq!(
             agent_resume_cwd(&terminal),
             pane_cwd,
@@ -620,6 +631,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-live-session").unwrap(),
+            cwd: None,
         };
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.persisted_agent_session = Some(session.clone());
@@ -678,6 +690,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-stale-session").unwrap(),
+            cwd: None,
         });
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "claude".into(),
@@ -732,6 +745,7 @@ mod tests {
                 "mismatched-session-that-collides",
             )
             .unwrap(),
+            cwd: None,
         });
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "claude".into(),
@@ -778,6 +792,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("resume-test").unwrap(),
+                cwd: None,
             };
             terminal.persisted_agent_session = Some(session.clone());
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {

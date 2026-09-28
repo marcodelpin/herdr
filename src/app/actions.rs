@@ -1735,7 +1735,7 @@ impl AppState {
             )
         };
         // P2-d (ADR-0002, herdr-ct9): a cwd-only update (the session
-        // identity is unchanged, only `persisted_agent_session_cwd` moved -
+        // identity is unchanged, only the persisted session's `cwd` moved -
         // e.g. the first report after a v10 -> v11 hook upgrade) must still
         // schedule a save, or it is silently lost on the next restart.
         if mutation.session_ref_changed
@@ -3534,6 +3534,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            cwd: None,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),
@@ -3714,13 +3715,16 @@ mod tests {
                 source: "herdr:claude".into(),
                 agent: "claude".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+                cwd: None,
             });
         assert_eq!(
             state
                 .terminals
                 .get(&terminal_id)
                 .unwrap()
-                .persisted_agent_session_cwd,
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone()),
             None
         );
         state.session_dirty = false;
@@ -3741,8 +3745,9 @@ mod tests {
                 .terminals
                 .get(&terminal_id)
                 .unwrap()
-                .persisted_agent_session_cwd
-                .as_deref(),
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
             Some("/work/project"),
             "the cwd should have been persisted onto the terminal"
         );

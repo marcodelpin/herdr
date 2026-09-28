@@ -21,9 +21,24 @@
 # check now models three outcomes (proven match, proven mismatch, evidence unavailable on either
 # side) instead of misreading "the record itself carries no start marker" as a proven mismatch.
 #
+# ADR-0002 amendment, codex ar-r3 fix round (adversarial review, DO-NOT-LAND, 3 new P2 findings, all
+# fixed at the root - the SAME root, this time): the cwd lived in its own `TerminalState` field,
+# sibling to `persisted_agent_session`, so every place that set, replaced or cleared the session had
+# to remember the cwd too - and three did not. The fix moves `cwd` INSIDE `PersistedAgentSession`
+# itself: P2 #1 a `herdr:claude` report from a known non-foreground reporter is now rejected before
+# ANY state change, including the session's cwd, even when its reported session id matches the
+# pane's current one (before: only a DIFFERING id was rejected, so a same-id worker report still
+# overwrote the cwd). P2 #2 the buffered-report replacement path that installs a session for a
+# newly-detected agent now embeds that session's own cwd (`None`, since it never reports one) instead
+# of leaving a sibling field to silently keep whatever a DIFFERENT, already-exited agent's session had
+# left there. P2 #3 cold restore keeps the pane's own saved cwd and the agent's reported cwd as two
+# separate values; the deferred resume picks between them only when it actually starts, so a later
+# removal of the agent directory falls back to the pane's cwd, not to the same directory that just
+# vanished.
+#
 # This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on both platforms
 # (nextest, one process per test), the new tests run again by name with a per-OS count gate so a
-# green run cannot silently skip or gain one, five mutant jobs each prove one of the new tests is
+# green run cannot silently skip or gain one, seven mutant jobs each prove one of the new tests is
 # load-bearing rather than decorative, and a Linux release build runs only once the crate tests and
 # every mutant job pass - same build shape as fork-14v-resume-launcher.yml (checksum uses blake3,
 # per this fleet's hashing policy). bd herdr-3ir, herdr-4r8, herdr-ct9.
@@ -84,10 +99,12 @@ jobs:
       # tests), herdr-ct9 (pure agent_resume_cwd tests + persist/restore round-trip tests + one
       # hook-asset content test), plus the codex ar-r2 fix round: P1-a (agent_session_registry
       # string-procStart + pidDomain unit tests), P1-b (one persist/restore cold-restore test), P2-c
-      # + P2-d (TerminalState unit tests + one App-level actions.rs test). The three App-level
-      # herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only, so Windows carries 3
-      # fewer: 29 on Linux/macOS-shaped Unix, 26 on Windows. The count check fails the job if the
-      # filter matches fewer (or more) than expected, so a green run that skipped, or silently
+      # + P2-d (TerminalState unit tests + one App-level actions.rs test), plus the ADR-0002
+      # amendment's codex ar-r3 fix round: P2 #1 (one TerminalState `p2c_amendment` test), P2 #2 (one
+      # TerminalState `p2_amendment` test), P2 #3 (one persist/restore `p2_amendment` test). The three
+      # App-level herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only, so Windows
+      # carries 3 fewer: 32 on Linux/macOS-shaped Unix, 29 on Windows. The count check fails the job
+      # if the filter matches fewer (or more) than expected, so a green run that skipped, or silently
       # gained, one of them is red.
       - name: Run the new agent-restore tests by name
         shell: bash
@@ -97,9 +114,9 @@ jobs:
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=26
-          else
             expected=29
+          else
+            expected=32
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -281,6 +298,13 @@ jobs:
     # Forcing agent_resume_cwd to always return the pane cwd reproduces "the field is persisted but
     # never actually used" and must turn the one test that asserts the agent cwd wins red, without
     # disturbing the fallback test (which already expects the pane cwd).
+    #
+    # Retargeted for the ADR-0002 amendment (ar-r3 fix round): `agent_resume_cwd` now reads the cwd
+    # off `terminal.persisted_agent_session.as_ref().and_then(|s| s.cwd...)` instead of the removed
+    # sibling `persisted_agent_session_cwd` field, and is `pub(crate)` (persist/restore.rs's own
+    # amendment regression test calls it directly). The mutation target is the same FUNCTION, its BODY
+    # changed; the assertions below are unchanged, since the observable behavior this test suite
+    # checks did not move.
     name: mutant - the ct9 agent cwd preference is load-bearing
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -311,7 +335,7 @@ jobs:
 
       - name: Ignore the reported agent cwd and require the preference test to fail
         run: |
-          perl -0777 -pi -e 's/fn agent_resume_cwd\(terminal: &crate::terminal::TerminalState\) -> std::path::PathBuf \{\n    terminal\n        \.persisted_agent_session_cwd\n        \.as_deref\(\)\n        \.map\(std::path::Path::new\)\n        \.filter\(\|cwd\| cwd\.is_dir\(\)\)\n        \.map\(std::path::Path::to_path_buf\)\n        \.unwrap_or_else\(\|\| terminal\.cwd\.clone\(\)\)\n\}/fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {\n    \/* MUTANT ct9 agent cwd ignored *\/\n    terminal.cwd.clone()\n}/' src/app/agent_resume.rs
+          perl -0777 -pi -e 's/pub\(crate\) fn agent_resume_cwd\(terminal: &crate::terminal::TerminalState\) -> std::path::PathBuf \{\n    terminal\n        \.persisted_agent_session\n        \.as_ref\(\)\n        \.and_then\(\|session\| session\.cwd\.as_deref\(\)\)\n        \.map\(std::path::Path::new\)\n        \.filter\(\|cwd\| cwd\.is_dir\(\)\)\n        \.map\(std::path::Path::to_path_buf\)\n        \.unwrap_or_else\(\|\| terminal\.cwd\.clone\(\)\)\n\}/pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {\n    \/* MUTANT ct9 agent cwd ignored *\/\n    terminal.cwd.clone()\n}/' src/app/agent_resume.rs
           landed=$(grep -c 'MUTANT ct9 agent cwd ignored' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
@@ -396,6 +420,115 @@ jobs:
           done
           echo "mutant killed: exactly the mismatch test failed with string procStart rejected"
 
+  agent-restore-p2c-amendment-same-id-passthrough-mutant:
+    # ADR-0002 amendment, codex ar-r3 P2 #1: the pre-seq-watermark herdr-3ir gate must reject a
+    # non-foreground `herdr:claude` report UNCONDITIONALLY - identity and cwd together - never only
+    # when the reported session id DIFFERS from the pane's current one. Reintroducing a same-id
+    # passthrough (bypass the rejection whenever the reported value matches the currently persisted
+    # one) reproduces the exact regression this amendment closed: a nested worker resuming the SAME
+    # session id from a DIFFERENT directory silently moved the pane's cwd. Scoped to the `p2c_` test
+    # family - disjoint from `agent-restore-3ir-guard-*-mutant`'s `agent_restore_3ir_*` filter above,
+    # which neuters the SHARED `claude_report_rejected_for_non_foreground_reporter` predicate itself
+    # (both its call sites at once) rather than this call site's own added condition.
+    name: mutant - the p2c amendment's same-id rejection is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Let a same-id non-foreground report through and require the amendment test to fail
+        run: |
+          perl -0777 -pi -e 's/if Self::claude_report_rejected_for_non_foreground_reporter\(\n            &source,\n            &agent_label,\n            reporter_is_foreground,\n        \) \{\n            return None;\n        \}/if Self::claude_report_rejected_for_non_foreground_reporter(\n            &source,\n            &agent_label,\n            reporter_is_foreground,\n        ) && self.persisted_agent_session.as_ref().is_none_or(|s| s.session_ref.value != session_ref.value) \/* MUTANT p2c same-id passthrough *\/ {\n            return None;\n        }/' src/terminal/state.rs
+          landed=$(grep -c 'MUTANT p2c same-id passthrough' src/terminal/state.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_p2c_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every p2c test passed with a same-id passthrough reintroduced"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_p2c_amendment_same_id_non_foreground_report_leaves_cwd_and_watermark_unchanged" mutant.log || { echo "expected the amendment's same-id test to FAIL"; exit 1; }
+          grep -q "FAIL.*agent_restore_p2c_rejected_report_does_not_starve_a_later_lower_seq_foreground_report" mutant.log && { echo "the differing-id p2c test should stay green under this mutant (it never matches the persisted session id)"; exit 1; }
+          echo "mutant killed: exactly the same-id amendment test failed with the passthrough reintroduced"
+
+  agent-restore-p2-amendment-cwd-survives-replacement-mutant:
+    # ADR-0002 amendment, codex ar-r3 P2 #2: the buffered-report replacement path in
+    # clear_full_lifecycle_hook_suppression_for_detected_agent installs a session for whichever agent
+    # was just (re)detected - this call site has no cwd of its own to report, so `cwd: None` here is
+    # the only correct value, and the field being embedded in PersistedAgentSession is what makes a
+    # stale value from a DIFFERENT, already-exited agent's session structurally impossible to carry
+    # over. Forcing a non-None cwd back in reproduces the pre-amendment defect's OBSERVABLE effect
+    # (a stale cwd attached to the newly-installed session) even though the exact old code shape - a
+    # sibling field nobody re-set - no longer exists to mutate directly.
+    name: mutant - the p2 amendment's cwd-cleared replacement is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Make the replacement carry a stale cwd and require the amendment test to fail
+        run: |
+          perl -0777 -pi -e 's/self\.persisted_agent_session = Some\(crate::agent_resume::PersistedAgentSession \{\n                source: source\.clone\(\),\n                agent: agent_label,\n                session_ref,\n                cwd: None,\n            \}\);/self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {\n                source: source.clone(),\n                agent: agent_label,\n                session_ref,\n                cwd: Some("mutant-p2-stale-cwd".into()), \/* MUTANT p2 cwd survives replacement *\/\n            });/' src/terminal/state.rs
+          landed=$(grep -c 'MUTANT p2 cwd survives replacement' src/terminal/state.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_p2_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every p2 amendment test passed with a stale cwd injected"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_p2_amendment_cwd_does_not_survive_a_session_replaced_by_another_agents_startup" mutant.log || { echo "expected the state.rs amendment test to FAIL"; exit 1; }
+          grep -q "FAIL.*agent_restore_p2_amendment_removed_agent_dir_falls_back_to_pane_cwd_after_restore" mutant.log && { echo "the persist/restore amendment test should stay green - it never reaches this replacement path"; exit 1; }
+          echo "mutant killed: exactly the replacement-installed test failed with the stale cwd injected"
+
   build-linux:
     name: build herdr-linux-x86_64
     needs:
@@ -406,6 +539,8 @@ jobs:
         agent-restore-4r8-scoping-mutant,
         agent-restore-ct9-cwd-ignored-mutant,
         agent-restore-p1a-string-proc-start-mutant,
+        agent-restore-p2c-amendment-same-id-passthrough-mutant,
+        agent-restore-p2-amendment-cwd-survives-replacement-mutant,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 90
