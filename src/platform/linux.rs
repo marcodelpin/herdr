@@ -828,25 +828,77 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
-/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2): `process_exists`
-/// above answers `kill(pid, 0) == 0`, which SUCCEEDS for a zombie - its pid
-/// slot stays reserved until a parent reaps it, so a crashed Claude whose
-/// surviving parent has not reaped it yet reads as a live holder and blocks
-/// restoration across herdr restarts even though it can never write anything
-/// to the session again (`/proc/<pid>/stat`'s starttime field, which
-/// `process_start_marker` above compares, is also unchanged for a zombie, so
-/// that comparison cannot tell the two states apart either). This is a
-/// POSITIVE signal only: `Z` (zombie) and `X` (dead, briefly visible on some
-/// kernels between exit and reap) are the only states it rejects; a read
-/// failure or any other state answers `false` and falls open to the
-/// existing `process_exists` gate, matching this module's fail-open policy
-/// everywhere else - a pid this function cannot positively clear stays a
-/// live holder.
+/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2), sharpened by
+/// codex ar-r5: `process_exists` above answers `kill(pid, 0) == 0`, which
+/// SUCCEEDS for a zombie - its pid slot stays reserved until a parent reaps
+/// it, so a crashed Claude whose surviving parent has not reaped it yet
+/// reads as a live holder and blocks restoration across herdr restarts even
+/// though it can never write anything to the session again
+/// (`/proc/<pid>/stat`'s starttime field, which `process_start_marker` above
+/// compares, is also unchanged for a zombie, so that comparison cannot tell
+/// the two states apart either).
+///
+/// A zombie THREAD-GROUP LEADER does not by itself prove the whole process
+/// has exited: `/proc/<pid>/stat` reports only the leader's own state, and a
+/// leader that called `pthread_exit()` while a sibling thread of the same
+/// process keeps running reads `Z` right there while the process is still
+/// very much alive - `kill(pid, 0)` still succeeds and the surviving thread
+/// can still write to the session. So this answers `true` only when the
+/// leader AND every thread listed under `/proc/<pid>/task/` are `Z`/`X`; a
+/// read or parse failure anywhere along the way (task dir unreadable, a
+/// thread's stat file unreadable or unparsable - including a thread that
+/// exits mid-scan, ordinary churn on a live process) answers `false` and
+/// falls open, matching this module's fail-open policy everywhere else - a
+/// pid this function cannot positively clear stays a live holder.
 pub fn process_is_zombie(pid: u32) -> bool {
-    let Some((_pgrp, _comm, state)) = process_pgrp_comm_and_state(pid) else {
+    let Some((_pgrp, _comm, leader_state)) = process_pgrp_comm_and_state(pid) else {
         return false;
     };
-    matches!(state, 'Z' | 'X')
+    if !matches!(leader_state, 'Z' | 'X') {
+        return false;
+    }
+    let Some(task_states) = read_thread_group_states(pid) else {
+        return false;
+    };
+    thread_group_exited(leader_state, &task_states)
+}
+
+/// The pure decision `process_is_zombie` above makes once it has both
+/// readings, kept separate so it is unit-testable without touching `/proc`:
+/// the leader alone reading `Z`/`X` is not enough when a sibling thread of
+/// the same thread group is still running.
+fn thread_group_exited(leader_state: char, task_states: &[char]) -> bool {
+    matches!(leader_state, 'Z' | 'X') && task_states.iter().all(|&state| matches!(state, 'Z' | 'X'))
+}
+
+/// Every thread's state character in `pid`'s thread group, read from
+/// `/proc/<pid>/task/<tid>/stat` (this always includes the leader's own
+/// entry at `task/<pid>/stat`, alongside every other thread). `None` on any
+/// failure - the task directory is unreadable, or any single thread's stat
+/// file cannot be read or parsed - so the caller falls open exactly like
+/// every other primitive in this module: a state this function cannot
+/// positively establish for every thread must not be read as "all exited".
+fn read_thread_group_states(pid: u32) -> Option<Vec<char>> {
+    let entries = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut states = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        let file_name = entry.file_name();
+        if file_name
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            // Not a thread-id entry; /proc/<pid>/task/ holds only tid
+            // directories, but skip anything else defensively rather than
+            // failing the whole read over it.
+            continue;
+        }
+        let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+        let (_, _, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+        states.push(state);
+    }
+    (!states.is_empty()).then_some(states)
 }
 
 pub fn write_clipboard(bytes: &[u8]) -> bool {
@@ -2239,5 +2291,92 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    // codex ar-r5: `thread_group_exited` is the pure decision behind
+    // `process_is_zombie` - a zombie LEADER with a still-running SIBLING
+    // thread must not read as exited.
+    #[test]
+    fn agent_restore_ar5_thread_group_exited_leader_zombie_with_live_sibling_is_not_exited() {
+        assert!(!thread_group_exited('Z', &['Z', 'R']));
+    }
+
+    #[test]
+    fn agent_restore_ar5_thread_group_exited_leader_and_every_task_zombie_is_exited() {
+        assert!(thread_group_exited('Z', &['Z', 'X']));
+    }
+
+    #[test]
+    fn agent_restore_ar5_thread_group_exited_running_leader_is_not_exited() {
+        // A running leader answers "not exited" regardless of what the task
+        // scan would say - guards against a fix that inspects only the task
+        // list and drops the leader-state check entirely.
+        assert!(!thread_group_exited('R', &['R']));
+    }
+
+    // codex ar-r5: exercise `process_is_zombie` against REAL processes, not
+    // injected closures, so a regression in the /proc/<pid>/task wiring
+    // itself (not just in the pure `thread_group_exited` decision) would be
+    // caught here too.
+    #[cfg(target_os = "linux")]
+    fn wait_until_leader_is_zombie(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if matches!(
+                process_pgrp_comm_and_state(pid).map(|(_, _, state)| state),
+                Some('Z') | Some('X')
+            ) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} did not become a zombie within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_restore_ar5_process_is_zombie_true_for_unreaped_exited_child() {
+        let mut child = Command::new("true").spawn().expect("spawn `true`");
+        let pid = child.id();
+        wait_until_leader_is_zombie(pid);
+
+        assert!(
+            process_is_zombie(pid),
+            "an unreaped exited single-threaded child must read as a zombie"
+        );
+
+        child.wait().expect("reap the zombie child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_restore_ar5_process_is_zombie_false_for_live_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(
+            !process_is_zombie(pid),
+            "a running child must never read as a zombie"
+        );
+
+        child.kill().expect("kill the sleep child");
+        child.wait().expect("reap the killed child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_restore_ar5_process_is_zombie_false_for_current_multithreaded_process() {
+        // This very test binary: a live leader whose thread group can carry
+        // more than one thread. Guards against a fix that treats any
+        // non-leader task entry as evidence of exit instead of requiring
+        // every entry to be Z/X.
+        assert!(!process_is_zombie(std::process::id()));
     }
 }

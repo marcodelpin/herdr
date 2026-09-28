@@ -57,9 +57,20 @@
 # fingerprint now strips that one field before hashing, keeping the two builds' compatibility
 # projection identical while every cwd-sensitive restore decision elsewhere is unchanged.
 #
+# codex ar-r5 fix round (adversarial review, DO-NOT-LAND, 1 new P2 finding, fixed at the root): the
+# ar-r4 P2 #2 zombie gate above checked only the thread-group LEADER's `/proc/<pid>/stat` state,
+# which reads `Z` even while a sibling thread of the SAME process keeps running - a leader that
+# called `pthread_exit()` rather than exiting the whole group. `process_is_zombie` now answers
+# `true` only when the leader AND every thread under `/proc/<pid>/task/` are `Z`/`X`; any read or
+# parse failure anywhere in that scan falls open (stays "not exited"), matching this module's policy
+# everywhere else. The decision is a pure `thread_group_exited(leader_state, task_states)` helper,
+# unit-tested directly, plus real-process tests (a real exited-and-unreaped child, a real running
+# child, this test binary's own live leader) and a real end-to-end `find_live_holder` pair driven by
+# the real platform predicates rather than injected closures.
+#
 # This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on both platforms
 # (nextest, one process per test), the new tests run again by name with a per-OS count gate so a
-# green run cannot silently skip or gain one, ten mutant jobs each prove one of the new tests is
+# green run cannot silently skip or gain one, eleven mutant jobs each prove one of the new tests is
 # load-bearing rather than decorative, and a Linux release build runs only once the crate tests and
 # every mutant job pass - same build shape as fork-14v-resume-launcher.yml (checksum uses blake3,
 # per this fleet's hashing policy). bd herdr-3ir, herdr-4r8, herdr-ct9.
@@ -124,11 +135,19 @@ jobs:
       # amendment's codex ar-r3 fix round: P2 #1 (one TerminalState `p2c_amendment` test), P2 #2 (one
       # TerminalState `p2_amendment` test), P2 #3 (one persist/restore `p2_amendment` test), plus the
       # codex ar-r4 fix round: P2 #1 (one persist/restore duplicate-session test), P2 #2 (two
-      # agent_session_registry zombie-liveness unit tests). The three App-level herdr-4r8 tests spawn
-      # a real /bin/sh pty and are #[cfg(unix)] only, so Windows carries 3 fewer: 35 on
-      # Linux/macOS-shaped Unix, 32 on Windows. The count check fails the job if the filter matches
-      # fewer (or more) than expected, so a green run that skipped, or silently gained, one of them
-      # is red. (ar-r4's P2 #3 fingerprint fix has its own regression test,
+      # agent_session_registry zombie-liveness unit tests), plus the codex ar-r5 fix round: the
+      # zombie-liveness gate itself only checked the thread-group LEADER's `/proc/<pid>/stat` state,
+      # which reads `Z` even while a sibling thread of the same process keeps running (main thread
+      # called `pthread_exit()`) - three pure `thread_group_exited` unit tests plus three real-process
+      # `process_is_zombie` tests (platform/linux.rs) and two real-process `find_live_holder`
+      # end-to-end tests through the real platform predicates (agent_session_registry.rs). The three
+      # App-level herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only; the eight ar-r5
+      # tests are all #[cfg(target_os = "linux")] (three of them only via platform/linux.rs itself
+      # being Linux-only - real zombie/liveness detection is a documented no-op on macOS/Windows), so
+      # Windows carries those 3 + 8 = 11 fewer: 43 on Linux/macOS-shaped Unix, 32 on Windows. The
+      # count check fails the job if the filter matches fewer (or more) than expected, so a green run
+      # that skipped, or silently gained, one of them is red. (ar-r4's P2 #3 fingerprint fix has its
+      # own regression test,
       # `layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility` in
       # persist/snapshot.rs - it follows that file's own naming convention, not `agent_restore_`, so
       # it runs as part of the plain crate-tests step above and is guarded by its own mutant job
@@ -143,7 +162,7 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             expected=32
           else
-            expected=35
+            expected=43
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -662,6 +681,62 @@ jobs:
           grep -q "FAIL.*agent_restore_p2_2_find_live_holder_non_zombie_pid_is_live" mutant.log && { echo "the non-zombie test should stay green under this mutant (its own closure already returns false)"; exit 1; }
           echo "mutant killed: exactly the zombie test failed with the gate disabled"
 
+  agent-restore-ar5-thread-group-check-mutant:
+    # codex ar-r5: `process_is_zombie` must not treat a zombie THREAD-GROUP LEADER alone as proof
+    # the whole process has exited - a leader that called pthread_exit() while a sibling thread of
+    # the same process keeps running reads Z right there. Reverting `thread_group_exited` to a
+    # leader-only check (ignoring the /proc/<pid>/task scan entirely) reproduces the exact defect:
+    # `agent_restore_ar5_thread_group_exited_leader_zombie_with_live_sibling_is_not_exited` must go
+    # red, since with the task scan disabled a zombie leader alone now answers "exited" regardless
+    # of the still-running sibling task the fixture carries. The other two pure tests must stay
+    # green - the all-zombie test's task states are all Z/X either way, and the running-leader test
+    # fails on the leader check before the task scan is ever reached.
+    name: mutant - the ar-r5 thread-group liveness check is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Disable the thread-group task scan and require the leader-with-live-sibling test to fail
+        run: |
+          sed -i "s/task_states.iter().all(|\&state| matches!(state, 'Z' | 'X'))/true \/* MUTANT ar5 thread-group task scan disabled *\//" src/platform/linux.rs
+          landed=$(grep -c 'MUTANT ar5 thread-group task scan disabled' src/platform/linux.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_ar5_thread_group_exited_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every ar5 thread-group-exited test passed with the task scan disabled"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_ar5_thread_group_exited_leader_zombie_with_live_sibling_is_not_exited" mutant.log || { echo "expected the leader-with-live-sibling test to FAIL"; exit 1; }
+          grep -q "FAIL.*agent_restore_ar5_thread_group_exited_leader_and_every_task_zombie_is_exited" mutant.log && { echo "the all-zombie test should stay green under this mutant (its task states are all Z/X either way)"; exit 1; }
+          grep -q "FAIL.*agent_restore_ar5_thread_group_exited_running_leader_is_not_exited" mutant.log && { echo "the running-leader test should stay green under this mutant (it fails the leader check before the task scan)"; exit 1; }
+          echo "mutant killed: exactly the leader-with-live-sibling test failed with the task scan disabled"
+
   agent-restore-ar4-p2-3-fingerprint-strip-mutant:
     # codex ar-r4 P2 #3: `layout_fingerprint()` must strip `agent_session_cwd` before hashing, so a
     # PREVIOUS build (whose struct has no such field) recomputes the SAME fingerprint a NEW build
@@ -728,6 +803,7 @@ jobs:
         agent-restore-p2-amendment-cwd-survives-replacement-mutant,
         agent-restore-ar4-p2-1-duplicate-cwd-leak-mutant,
         agent-restore-ar4-p2-2-zombie-liveness-mutant,
+        agent-restore-ar5-thread-group-check-mutant,
         agent-restore-ar4-p2-3-fingerprint-strip-mutant,
       ]
     runs-on: ubuntu-latest

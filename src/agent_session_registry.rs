@@ -653,4 +653,104 @@ mod tests {
 
         assert_eq!(dirs, expected);
     }
+
+    // codex ar-r5: exercise `find_live_holder_in_dirs` against REAL child
+    // processes with the REAL platform predicates
+    // (`crate::platform::process_exists`/`process_is_zombie`/
+    // `process_start_marker`), not injected closures - so a regression in
+    // how those are WIRED into the registry scan, not just in each
+    // primitive's own logic, would be caught here. Real zombie/liveness
+    // detection is Linux-only (a documented no-op on macOS/Windows), so
+    // these are Linux-only too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_restore_ar5_find_live_holder_real_zombie_child_is_not_live() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::platform::process_is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} did not become a zombie within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let proc_start = crate::platform::process_start_marker(pid)
+            .expect("an unreaped exited pid must still have a readable start marker");
+
+        let tmp = TestDir::new("real-zombie-child");
+        let sessions = tmp.path().join("sessions");
+        write_registry_entry(
+            &sessions,
+            pid,
+            &format!(
+                r#"{{"sessionId":"target-session","cwd":"/work/project","procStart":{proc_start}}}"#
+            ),
+        );
+
+        let holder = find_live_holder_in_dirs(
+            &[sessions],
+            "target-session",
+            crate::platform::process_exists,
+            crate::platform::process_is_zombie,
+            crate::platform::process_start_marker,
+            || None,
+        );
+
+        assert!(
+            holder.is_none(),
+            "an unreaped exited child must never be reported as a live holder"
+        );
+
+        child.wait().expect("reap the zombie child");
+    }
+
+    // The mirror: a genuinely running child, through the same real-primitive
+    // path, must still be reported live.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_restore_ar5_find_live_holder_real_live_child_is_live() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn `sleep 30`");
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let proc_start = crate::platform::process_start_marker(pid)
+            .expect("a running pid must have a readable start marker");
+
+        let tmp = TestDir::new("real-live-child");
+        let sessions = tmp.path().join("sessions");
+        write_registry_entry(
+            &sessions,
+            pid,
+            &format!(
+                r#"{{"sessionId":"target-session","cwd":"/work/project","procStart":{proc_start}}}"#
+            ),
+        );
+
+        let holder = find_live_holder_in_dirs(
+            &[sessions],
+            "target-session",
+            crate::platform::process_exists,
+            crate::platform::process_is_zombie,
+            crate::platform::process_start_marker,
+            || None,
+        );
+
+        assert_eq!(
+            holder,
+            Some(LiveHolder {
+                pid,
+                cwd: Some("/work/project".into()),
+            })
+        );
+
+        child.kill().expect("kill the sleep child");
+        child.wait().expect("reap the killed child");
+    }
 }
