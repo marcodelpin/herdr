@@ -167,6 +167,15 @@ jobs:
     # Kills the "the guard exists but is unreachable" class: deleting it entirely must still turn
     # the non-foreground-rejection test red (the guard inverted above could in principle be dead
     # code reached by neither branch; this proves it is reached).
+    #
+    # Retargeted in the P2-c fix round (fix round 6): the guard's condition now lives in ONE shared
+    # predicate, claude_report_rejected_for_non_foreground_reporter, called both from
+    # session_report_allows_session_replacement (the original site this mutant targeted) and from the
+    # new pre-seq-watermark gate in set_agent_session_ref_for_session_start_with_reporter - a
+    # deliberate de-duplication (P2-c would otherwise have had to reimplement the same rule twice,
+    # which is exactly the "one drifts from the other" trap quality-standards.md warns about).
+    # Neutering the SHARED predicate (always return false) is now the equivalent "delete the guard
+    # entirely" mutation, since it removes the rule from BOTH call sites at once.
     name: mutant - the 3ir foreground guard must exist
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -197,7 +206,7 @@ jobs:
 
       - name: Delete the guard and require the non-foreground rejection test to fail
         run: |
-          perl -0777 -pi -e 's/        if \(source, agent_label\) == \("herdr:claude", "claude"\)\n            && reporter_is_foreground == Some\(false\)\n        \{\n            return false;\n        \}\n/        \/* MUTANT 3ir guard deleted *\/\n/' src/terminal/state.rs
+          perl -0777 -pi -e 's/\(source, agent_label\) == \("herdr:claude", "claude"\) && reporter_is_foreground == Some\(false\)/false \/* MUTANT 3ir guard deleted *\//' src/terminal/state.rs
           landed=$(grep -c 'MUTANT 3ir guard deleted' src/terminal/state.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run

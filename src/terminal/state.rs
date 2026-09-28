@@ -1349,24 +1349,46 @@ impl TerminalState {
                 })
     }
 
+    /// herdr-3ir: whether the reporter is known NOT to be the pane's
+    /// foreground process group for a `herdr:claude` report - the report
+    /// came from a nested, non-interactive worker (e.g. a headless
+    /// `claude -p` run from inside the pane's own Bash tool), not the
+    /// session the operator is looking at. `reporter_is_foreground` is
+    /// computed by the caller from the reporter's own pid (ADR-0002);
+    /// `None` (old client, Windows, or a vanished pid) fails open to
+    /// today's behavior.
+    ///
+    /// Extracted to a single named predicate (P2-c, herdr-3ir/4r8/ct9 fix
+    /// round) so `session_report_allows_session_replacement` below and the
+    /// pre-seq-watermark gate in
+    /// `set_agent_session_ref_for_session_start_with_reporter` share ONE
+    /// implementation rather than two independently-maintained copies of
+    /// the same rule - a duplicate would let one drift from the other, and
+    /// would make a mutation to either copy alone fail to prove the OTHER
+    /// is load-bearing.
+    fn claude_report_rejected_for_non_foreground_reporter(
+        source: &str,
+        agent_label: &str,
+        reporter_is_foreground: Option<bool>,
+    ) -> bool {
+        (source, agent_label) == ("herdr:claude", "claude") && reporter_is_foreground == Some(false)
+    }
+
     /// herdr-3ir: a `herdr:claude` report that would replace the pane's
     /// persisted session is refused when the reporter is known NOT to be the
-    /// pane's foreground process group - the report came from a nested,
-    /// non-interactive worker (e.g. a headless `claude -p` run from inside
-    /// the pane's own Bash tool), not the session the operator is looking
-    /// at. `reporter_is_foreground` is computed by the caller from the
-    /// reporter's own pid (ADR-0002); `None` (old client, Windows, or a
-    /// vanished pid) fails open to today's behavior, matching every other
-    /// agent's allow-list below.
+    /// pane's foreground process group - see
+    /// `claude_report_rejected_for_non_foreground_reporter` above.
     fn session_report_allows_session_replacement(
         source: &str,
         agent_label: &str,
         session_start_source: Option<&str>,
         reporter_is_foreground: Option<bool>,
     ) -> bool {
-        if (source, agent_label) == ("herdr:claude", "claude")
-            && reporter_is_foreground == Some(false)
-        {
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            source,
+            agent_label,
+            reporter_is_foreground,
+        ) {
             return false;
         }
         matches!(
@@ -1627,18 +1649,21 @@ impl TerminalState {
         // lower-seq foreground report fail the staleness check and be
         // silently dropped.
         //
-        // Scoped to the EXACT clause inside
-        // `session_report_allows_session_replacement` that can make THIS
-        // report the reason for its own rejection - every OTHER rejection
-        // reason (in particular an unrecognized `session_start_source` on a
+        // Shares `claude_report_rejected_for_non_foreground_reporter` with
+        // `session_report_allows_session_replacement` below (ONE predicate,
+        // not two), so this is the EXACT clause that can make THIS report
+        // the reason for its own rejection - every OTHER rejection reason
+        // (in particular an unrecognized `session_start_source` on a
         // same-owner, differing-value report) is unchanged and still
         // advances the watermark via the normal `accept_hook_report` call
         // right below; see
         // `different_same_agent_session_ref_is_ignored_until_current_session_clears`,
         // which depends on exactly that and would otherwise regress.
-        if (source.as_str(), agent_label.as_str()) == ("herdr:claude", "claude")
-            && matches!(reporter_is_foreground, Some(false))
-            && self.same_owner_session_ref_differs(&source, &agent_label, &session_ref)
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            &source,
+            &agent_label,
+            reporter_is_foreground,
+        ) && self.same_owner_session_ref_differs(&source, &agent_label, &session_ref)
         {
             return None;
         }
