@@ -75,7 +75,7 @@ jobs:
       - name: Run the new agent-restore tests by name
         shell: bash
         run: |
-          filter='test(/agent_restore_/)'
+          filter='test(/::agent_restore_/)'
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > agent-restore-tests.txt
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
@@ -130,7 +130,7 @@ jobs:
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
           cat mutant.log
           if [ "$rc" = 0 ]; then
             echo "MUTANT SURVIVED: every 3ir test passed with the guard's sense inverted"
@@ -185,7 +185,7 @@ jobs:
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
           cat mutant.log
           if [ "$rc" = 0 ]; then
             echo "MUTANT SURVIVED: every 3ir test passed with the guard deleted"
@@ -237,7 +237,7 @@ jobs:
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_4r8_/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_4r8_/)' > mutant.log 2>&1 || rc=$?
           cat mutant.log
           if [ "$rc" = 0 ]; then
             echo "MUTANT SURVIVED: every 4r8 test passed with the scoping widened to every agent"
@@ -290,7 +290,7 @@ jobs:
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agent_restore_ct9_/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_ct9_/)' > mutant.log 2>&1 || rc=$?
           cat mutant.log
           if [ "$rc" = 0 ]; then
             echo "MUTANT SURVIVED: every ct9 test passed while the agent cwd was ignored"
