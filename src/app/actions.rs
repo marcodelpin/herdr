@@ -1570,14 +1570,18 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                reporter_is_foreground,
+                agent_session_cwd,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_reporter(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        reporter_is_foreground,
+                        agent_session_cwd,
                     )
                 })
                 .into_iter()

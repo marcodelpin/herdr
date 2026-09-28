@@ -14,11 +14,12 @@ mod version;
 pub(crate) use actions::{
     install_experimental_letta, install_target, uninstall_experimental_letta, uninstall_target,
 };
-#[cfg(test)]
-pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
-    apply_pane_base_env, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,
+    apply_pane_base_env, claude_dir, CLAUDE_CONFIG_DIR_ENV_VAR, HERDR_PANE_ID_ENV_VAR,
+    HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,
 };
+#[cfg(test)]
+pub(crate) use env::{integration_env_lock, IntegrationEnvLock};
 pub(crate) use registry::{
     experimental_letta_integration_status, installed_integration_statuses,
     integration_recommendations, integration_target_label, print_outdated_update_notice,
@@ -49,7 +50,7 @@ const CLAUDE_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/claude/herdr-agent-state.sh")
 };
-const CLAUDE_INTEGRATION_VERSION: u32 = 10;
+const CLAUDE_INTEGRATION_VERSION: u32 = 11;
 const CODEX_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
     "herdr-agent-state.ps1"
 } else {

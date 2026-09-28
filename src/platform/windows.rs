@@ -1417,6 +1417,25 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
 }
 
+/// ADR-0002, herdr-3ir: Windows has no POSIX process-group/controlling-
+/// terminal model, and the Job-Object heuristic `foreground_process_group_id`
+/// above uses does not discriminate a nested worker the way `setsid()` does
+/// on Unix (a Job Object assigned at pane-spawn is typically inherited down
+/// the whole descendant tree). Documented no-op: the herdr-3ir reporter-
+/// foreground gate fails open on Windows rather than ship a heuristic that
+/// cannot tell a nested worker from the interactive session.
+pub fn process_group_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// ADR-0002, herdr-4r8: a monotonic marker for when `pid` started, reusing
+/// the same `GetProcessTimes` creation-FILETIME read `process_creation_time`
+/// already performs for other callers.
+pub fn process_start_marker(pid: u32) -> Option<u64> {
+    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    process_creation_time(process.0)
+}
+
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
     let process_parameters = read_process_parameters(process.0)?;

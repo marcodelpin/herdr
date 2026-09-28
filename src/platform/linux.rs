@@ -648,6 +648,32 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
+/// The process group id the given pid itself belongs to (ADR-0002,
+/// herdr-3ir) - not the foreground group of a controlling terminal, which is
+/// what `foreground_process_group_id` answers below. A thin wrapper over the
+/// same `/proc/<pid>/stat` field 2 parse `process_pgrp_comm_and_state`
+/// already does for other callers.
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    let (pgrp, _comm, _state) = process_pgrp_comm_and_state(pid)?;
+    (pgrp > 0).then_some(pgrp as u32)
+}
+
+/// A monotonic marker for when `pid` started (ADR-0002, herdr-4r8), used to
+/// tell a live process from a dead pid that has been reused by an unrelated
+/// process since a registry entry recorded it. `/proc/<pid>/stat` field 22
+/// (starttime, in clock ticks since boot) is stable for the process's whole
+/// lifetime and comparable across two reads of the same still-running pid.
+pub fn process_start_marker(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
+    // flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11)
+    // stime(12) cutime(13) cstime(14) priority(15) nice(16) num_threads(17)
+    // itrealvalue(18) starttime(19)
+    fields.get(19)?.parse().ok()
+}
+
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.

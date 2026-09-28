@@ -14,6 +14,25 @@ struct PendingAgentResumeCandidate {
     cols: u16,
 }
 
+/// ADR-0002, herdr-ct9: prefer the agent's own reported cwd over the pane's
+/// shell cwd for a deferred resume, when it names a directory that still
+/// exists - a claude tab whose shell sits in one project while its agent
+/// works in another otherwise comes back in the wrong folder, or (if the
+/// shell's own folder was moved or retired) in a discard directory neither
+/// side ever meant. Falls back to the pane's shell cwd exactly as before
+/// this fix whenever no agent cwd was reported or it no longer resolves -
+/// the existing "Saved directory is unavailable" handling in
+/// `start_pending_agent_resume` is unchanged either way.
+fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {
+    terminal
+        .persisted_agent_session_cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|cwd| cwd.is_dir())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| terminal.cwd.clone())
+}
+
 impl App {
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
@@ -107,7 +126,7 @@ impl App {
                     pending.push(PendingAgentResumeCandidate {
                         pane_id: info.id,
                         terminal_id: pane.attached_terminal_id.clone(),
-                        cwd: terminal.cwd.clone(),
+                        cwd: agent_resume_cwd(terminal),
                         plan,
                         rows: info.inner_rect.height,
                         cols: info.inner_rect.width,
@@ -175,7 +194,7 @@ impl App {
                     let terminal = self.state.terminals.get(terminal_id)?;
                     Some((
                         pane_id,
-                        terminal.cwd.clone(),
+                        agent_resume_cwd(terminal),
                         terminal.pending_agent_resume_plan.clone()?,
                     ))
                 })
@@ -249,6 +268,45 @@ impl App {
                 terminal.revision = terminal.revision.saturating_add(1);
             }
             return true;
+        }
+
+        // ADR-0002, herdr-4r8: refuse to resume onto a claude session id
+        // that some other live process already has open (measured: two
+        // separate interactive `claude` processes ended up attached to the
+        // same session through exactly this path). Scoped to
+        // ("herdr:claude", "claude") - the one agent this ADR's registry
+        // scan and its liveness marker were built and verified against; a
+        // registry miss, a non-claude plan, or any I/O failure inside the
+        // scan all fail open to today's unconditional resume.
+        if plan.agent == "claude" {
+            let target_id = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+                .filter(|session| {
+                    session.source == "herdr:claude"
+                        && session.agent == "claude"
+                        && session.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                })
+                .map(|session| session.session_ref.value.clone());
+            if let Some(target_id) = target_id {
+                if let Some(holder) = crate::agent_session_registry::find_live_holder(&target_id) {
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.pending_agent_resume_plan = None;
+                        terminal.restore_error = Some(format!(
+                            "This conversation is already open in another running Claude session (pid {}{}). Close it and restart this session.",
+                            holder.pid,
+                            holder
+                                .cwd
+                                .map(|cwd| format!(", {cwd}"))
+                                .unwrap_or_default(),
+                        ));
+                        terminal.revision = terminal.revision.saturating_add(1);
+                    }
+                    return true;
+                }
+            }
         }
 
         let runtime = match crate::terminal::TerminalRuntime::spawn(

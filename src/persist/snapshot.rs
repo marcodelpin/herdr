@@ -117,6 +117,11 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// The agent's own reported cwd at the moment it bound this session id
+    /// (ADR-0002, herdr-ct9). `#[serde(default)]` so a snapshot written
+    /// before this field existed still loads with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -349,6 +354,10 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        // A live hook-authoritative session has no reported
+                        // resume cwd of its own - it is not a candidate for
+                        // deferred resume while it holds authority.
+                        agent_session_cwd: None,
                     });
                 }
             }
@@ -360,6 +369,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    agent_session_cwd: terminal.persisted_agent_session_cwd.clone(),
                 })
         });
         panes.insert(

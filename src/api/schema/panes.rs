@@ -473,6 +473,21 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    /// The reporter's own pid (ADR-0002, herdr-3ir), sent only by the Claude
+    /// integration hook from `$CLAUDE_PID`. Used server-side to refuse a
+    /// same-owner session replacement whenever the reporter is not the
+    /// pane's foreground process group. Optional and additive: an old
+    /// client that never sends it keeps today's behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pid: Option<u32>,
+    /// The agent's own cwd at the moment it bound this session id (ADR-0002,
+    /// herdr-ct9), sent only by the Claude integration hook from the
+    /// SessionStart payload's `cwd` field. Persisted alongside the session
+    /// reference and used as the resume shell's cwd instead of the pane's
+    /// shell cwd, when it names a directory that still exists. Optional and
+    /// additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

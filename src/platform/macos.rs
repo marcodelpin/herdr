@@ -417,6 +417,29 @@ pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
     super::available_pane_shell_from_job(child_pid, foreground_job(child_pid)?)
 }
 
+/// The process group id the given pid itself belongs to (ADR-0002,
+/// herdr-3ir) - not the foreground group of a controlling terminal, which is
+/// what `foreground_job`/`foreground_process_group_id` answer below. Reuses
+/// the `proc_bsdinfo` lookup other callers in this file already do for the
+/// same pid.
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    let info = process_bsdinfo(pid)?;
+    (info.pbi_pgid > 0).then_some(info.pbi_pgid)
+}
+
+/// A monotonic marker for when `pid` started (ADR-0002, herdr-4r8). UNMEASURED:
+/// `proc_bsdinfo`'s start-time field name and units through the `libc`
+/// binding this crate uses were not confirmed against a real build this
+/// session (no macOS host available) - shipping a guessed field risks a
+/// build break on the one platform nothing here can test. Fails open like
+/// every other platform gap in this ADR: a missing marker on macOS means the
+/// herdr-4r8 duplicate-resume check treats a matching pid as live rather
+/// than asserting it from a start-time comparison. Follow-up: confirm the
+/// field name on a macOS build and replace this with a real read.
+pub fn process_start_marker(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     if child_pid == 0 {
