@@ -196,9 +196,12 @@ jobs:
 
   agent-restore-4r8-scoping-mutant:
     # herdr-4r8's live-elsewhere check must be scoped to ("herdr:claude", "claude") sessions only -
-    # the registry it scans only ever holds Claude Code sessions, so consulting it for a non-claude
-    # plan can only produce a false positive. Widening "if plan.agent == claude" to fire
-    # unconditionally must turn the scoping test red without disturbing the two claude-scoped tests.
+    # the registry it scans only ever holds Claude Code sessions, so consulting it for any other
+    # session can only produce a false positive. The outer "if plan.agent == claude" and the inner
+    # session.source/session.agent filter are two independent checks over two independent pieces of
+    # state (plan vs. terminal.persisted_agent_session), so only widening the INNER filter (drop the
+    # source/agent conditions, keep kind==Id) actually removes the scoping - widening the outer `if`
+    # alone changes nothing observable, since the inner filter still gates on its own.
     name: mutant - the 4r8 claude-only scoping is load-bearing
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -229,7 +232,7 @@ jobs:
 
       - name: Widen the claude-only scoping and require the scoping test to fail
         run: |
-          sed -i 's/if plan.agent == "claude" {/if true \/* MUTANT 4r8 scoping removed *\/ {/' src/app/agent_resume.rs
+          perl -0777 -pi -e 's/\.filter\(\|session\| \{\n                    session\.source == "herdr:claude"\n                        && session\.agent == "claude"\n                        && session\.session_ref\.kind == crate::agent_resume::AgentSessionRefKind::Id\n                \}\)/.filter(|session| {\n                    session.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id \/* MUTANT 4r8 scoping removed *\/\n                })/' src/app/agent_resume.rs
           landed=$(grep -c 'MUTANT 4r8 scoping removed' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run

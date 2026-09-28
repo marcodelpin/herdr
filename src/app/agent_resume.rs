@@ -701,19 +701,24 @@ mod tests {
     }
 
     // Mutant killer for "the 4r8 scoping is load-bearing, not decorative":
-    // if `plan.agent == "claude"` were widened to fire for every agent, this
-    // codex resume would incorrectly consult the (claude-only) registry,
-    // find its session id reported live under a claude-shaped fixture, and
-    // get blocked exactly like the claude test above - even though nothing
-    // about a codex session should ever be looked up there.
+    // the gate reads `plan.agent == "claude"` (cheap outer check) AND filters
+    // the target id on `session.source == "herdr:claude" && session.agent ==
+    // "claude"` (the actual scoping - `plan` and `terminal.persisted_agent_session`
+    // are two different pieces of state and are not guaranteed to agree). A
+    // claude PLAN whose terminal happens to carry a stale non-claude
+    // persisted session must not have that session's id looked up in the
+    // (claude-only) registry just because the plan says "claude" - if the
+    // source/agent filter were widened to accept any session kind==Id, this
+    // mismatched session would incorrectly get blocked by a live fixture
+    // that has nothing to do with it.
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_restore_4r8_scoping_is_limited_to_claude_sessions() {
         let fixture = ClaudeRegistryFixture::new("scoping");
-        fixture.register_self_as_live_holder("codex-session-that-collides");
+        fixture.register_self_as_live_holder("mismatched-session-that-collides");
 
         let mut app = test_app();
-        let workspace = crate::workspace::Workspace::test_new("codex-not-claude");
+        let workspace = crate::workspace::Workspace::test_new("mismatched-session");
         let pane_id = workspace.tabs[0].root_pane;
         let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
         app.state.workspaces = vec![workspace];
@@ -721,22 +726,24 @@ mod tests {
         app.state.ensure_test_terminals();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:codex".into(),
-            agent: "codex".into(),
-            session_ref: crate::agent_resume::AgentSessionRef::id("codex-session-that-collides")
-                .unwrap(),
+            source: "herdr:mastracode".into(),
+            agent: "mastracode".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id(
+                "mismatched-session-that-collides",
+            )
+            .unwrap(),
         });
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
-            agent: "codex".into(),
+            agent: "claude".into(),
             argv: long_running_test_argv(),
-            dedupe_key: "codex-session-that-collides".into(),
+            dedupe_key: "mismatched-session-that-collides".into(),
         });
 
         app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
 
         assert!(
             app.terminal_runtimes.get(&terminal_id).is_some(),
-            "a non-claude plan must never be scoped into the claude live-elsewhere check"
+            "a persisted session that is not herdr:claude/claude must never be looked up in the claude live-elsewhere registry"
         );
         let terminal = &app.state.terminals[&terminal_id];
         assert!(terminal.restore_error.is_none());

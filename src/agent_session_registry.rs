@@ -110,8 +110,15 @@ fn registry_session_dirs(root: &Path) -> Vec<PathBuf> {
         if !child.is_dir() {
             continue;
         }
+        let child_name = child.file_name().and_then(|name| name.to_str());
+        if child_name == Some("sessions") {
+            // Already covered by the unconditional push above - without this,
+            // <root>/sessions is itself a child of <root> and would also
+            // contribute the nonsensical <root>/sessions/sessions.
+            continue;
+        }
         dirs.push(child.join("sessions"));
-        if child.file_name().and_then(|name| name.to_str()) == Some("profiles") {
+        if child_name == Some("profiles") {
             let Ok(profiles) = std::fs::read_dir(&child) else {
                 continue;
             };
