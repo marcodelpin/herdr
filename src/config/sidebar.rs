@@ -145,10 +145,10 @@ impl AgentSidebarToken {
 
     // style_for resolves the style with `lookup` answering the other custom tokens of the same
     // pane, for rules that name a `source` (herdr-upm).
-    pub(crate) fn style_for(
+    pub(crate) fn style_for<'v>(
         &self,
         value: &str,
-        lookup: &dyn Fn(&str) -> Option<&str>,
+        lookup: &dyn Fn(&str) -> Option<&'v str>,
     ) -> Option<SidebarTokenStyle> {
         match self {
             Self::Styled { style, rules, .. } => {
@@ -173,10 +173,10 @@ impl SpaceSidebarToken {
 
     // style_for resolves the style with `lookup` answering the other custom tokens of the same
     // pane, for rules that name a `source` (herdr-upm).
-    pub(crate) fn style_for(
+    pub(crate) fn style_for<'v>(
         &self,
         value: &str,
-        lookup: &dyn Fn(&str) -> Option<&str>,
+        lookup: &dyn Fn(&str) -> Option<&'v str>,
     ) -> Option<SidebarTokenStyle> {
         match self {
             Self::Styled { style, rules, .. } => {
