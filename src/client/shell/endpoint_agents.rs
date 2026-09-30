@@ -44,6 +44,22 @@ pub(super) fn render_collapsed(
     }
 }
 
+/// The host-count sources of the agents header (herdr-8u7): every endpoint that is not disabled
+/// names a server; only an online one may contribute its counts.
+pub(super) fn host_sources(
+    endpoints: &[ClientShellEndpoint],
+) -> impl Iterator<Item = super::agent_sidebar::HostSource<'_>> {
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.status != crate::client::endpoint::ClientEndpointStatus::Disabled
+        })
+        .map(|endpoint| super::agent_sidebar::HostSource {
+            snapshot: endpoint.snapshot.as_deref(),
+            online: endpoint.status == crate::client::endpoint::ClientEndpointStatus::Online,
+        })
+}
+
 pub(super) fn render_expanded(
     buffer: &mut Buffer,
     area: Rect,
@@ -55,28 +71,10 @@ pub(super) fn render_expanded(
     hits: &mut ShellHitMap,
 ) {
     let rows = agent_rows(endpoints, active_endpoint_id, config);
-    // A disconnected endpoint keeps its last snapshot; its host counts are stale, so it does not
-    // contribute and instead marks the totals as a lower bound (codex r2 finding 3).
-    let online = |endpoint: &&ClientShellEndpoint| {
-        endpoint.status == crate::client::endpoint::ClientEndpointStatus::Online
-    };
-    let unreachable = endpoints
-        .iter()
-        .filter(|endpoint| endpoint.snapshot.is_some() && !online(endpoint))
-        .filter(|endpoint| {
-            endpoint.status != crate::client::endpoint::ClientEndpointStatus::Disabled
-        })
-        .count();
-    let counts = super::agent_sidebar::header_counts(
-        rows.len(),
-        &super::agent_sidebar::host_count_tokens(
-            endpoints
-                .iter()
-                .filter(online)
-                .filter_map(|endpoint| endpoint.snapshot.as_deref()),
-        ),
-        unreachable,
-    );
+    // One model for the host counts (herdr-8u7): every non-disabled endpoint names a server; only
+    // online ones contribute counts, and a total over fewer servers than known is a lower bound.
+    let host = super::agent_sidebar::host_counts(host_sources(endpoints));
+    let counts = super::agent_sidebar::header_counts(rows.len(), &host.token_sets, host.expected);
     if !super::agent_sidebar::render_agent_panel_header(
         buffer,
         area,
@@ -199,4 +197,45 @@ fn agent_rows(
         })
     })
     .collect()
+}
+
+#[cfg(test)]
+mod host_sources_tests {
+    use super::host_sources;
+    use crate::client::endpoint::ClientEndpointStatus;
+
+    fn endpoint(
+        status: ClientEndpointStatus,
+        boot: Option<(&str, &str)>,
+    ) -> super::ClientShellEndpoint {
+        let mut endpoint = super::super::endpoints::local_endpoint();
+        endpoint.status = status;
+        endpoint.snapshot = boot.map(|(boot_id, workers)| {
+            let mut snapshot = crate::client::shell::tests::snapshot();
+            snapshot.boot_id = boot_id.into();
+            snapshot.workspaces[0].tokens = vec![("agents_w".to_owned(), workers.to_owned())];
+            Box::new(snapshot)
+        });
+        endpoint
+    }
+
+    fn header(endpoints: &[super::ClientShellEndpoint]) -> String {
+        let host = super::super::agent_sidebar::host_counts(host_sources(endpoints));
+        super::super::agent_sidebar::header_counts(0, &host.token_sets, host.expected)
+    }
+
+    // herdr-8u7 through the real endpoint mapping: disabled endpoints name no server, an offline
+    // alias of an online server neither contributes its stale counts nor marks the total, and an
+    // unreachable endpoint with no snapshot marks it.
+    #[test]
+    fn host_sources_maps_endpoint_status_into_the_count_model() {
+        let online = endpoint(ClientEndpointStatus::Online, Some(("boot-1", "2")));
+        let alias = endpoint(ClientEndpointStatus::Reconnecting, Some(("boot-1", "9")));
+        let disabled = endpoint(ClientEndpointStatus::Disabled, Some(("boot-3", "5")));
+        assert_eq!(header(&[alias, online, disabled]), "P:0 W:2");
+
+        let online = endpoint(ClientEndpointStatus::Online, Some(("boot-1", "2")));
+        let connecting = endpoint(ClientEndpointStatus::Connecting, None);
+        assert_eq!(header(&[online, connecting]), "P:0 W:2?");
+    }
 }
