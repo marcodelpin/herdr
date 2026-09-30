@@ -59,11 +59,11 @@ jobs:
       - name: Run the new source-rule tests by name
         shell: bash
         run: |
-          filter='test(/agents_header_counts_sum_hosts_and_keep_zeros|agents_header_counts_without_host_tokens_show_only_panes|agents_header_counts_visible_at_default_sidebar_width|header_rule_text_fills_and_truncates|fit_counts_drops_whole_fields|host_count_tokens_selects_any_key_and_dedupes_boot|header_counts_marks_totals_when_a_host_is_unreachable/)'
+          filter='test(/agents_header_counts_sum_hosts_and_keep_zeros|agents_header_counts_without_host_tokens_show_only_panes|agents_header_counts_visible_at_default_sidebar_width|header_rule_text_fills_and_truncates|fit_counts_drops_whole_fields|host_counts_selects_any_key_and_dedupes_boot|host_counts_tokenless_server_makes_totals_partial|host_counts_tokenless_snapshot_does_not_hide_counts_of_same_server|host_counts_partial_is_per_server_not_per_connection|host_sources_maps_endpoint_status_into_the_count_model/)'
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > hdr-tests.txt
           n=$(wc -l < hdr-tests.txt)
           echo "new tests matched: $n"
-          if [ "$n" -ne 7 ]; then echo "expected 7 tests, got $n"; cat hdr-tests.txt; exit 1; fi
+          if [ "$n" -ne 10 ]; then echo "expected 10 tests, got $n"; cat hdr-tests.txt; exit 1; fi
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
   mutant-host-sum:

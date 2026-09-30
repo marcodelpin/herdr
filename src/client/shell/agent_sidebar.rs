@@ -58,7 +58,11 @@ pub(super) fn render_agent_panel(
     hits: &mut ShellHitMap,
 ) {
     let rows = agent_rows(snapshot, config, None);
-    let counts = header_counts(rows.len(), &host_count_tokens([snapshot]), 0);
+    let host = host_counts([HostSource {
+        snapshot: Some(snapshot),
+        online: true,
+    }]);
+    let counts = header_counts(rows.len(), &host.token_sets, host.expected);
     if !render_agent_panel_header(
         buffer,
         area,
@@ -98,20 +102,46 @@ const HOST_COUNT_TOKENS: [(&str, &str); 4] = [
     ("S", "agents_s"),
 ];
 
-/// One token set per server (per host): the first workspace that carries any host count. Every
-/// workspace carries the same values, so reading one per host avoids counting a host N times.
-/// Two endpoints connected to the same server process (local plus ssh-to-self, two aliases)
-/// share its boot_id and contribute once; an empty boot_id is never merged with another.
-pub(super) fn host_count_tokens<'a>(
-    snapshots: impl IntoIterator<Item = &'a ClientShellSnapshot>,
-) -> Vec<&'a [(String, String)]> {
-    let mut seen_boots = std::collections::HashSet::new();
-    snapshots
-        .into_iter()
-        .filter(|snapshot| {
-            snapshot.boot_id.is_empty() || seen_boots.insert(snapshot.boot_id.as_str())
-        })
-        .filter_map(|snapshot| {
+/// One endpoint's view of a server, as the host-count model sees it (herdr-8u7).
+pub(super) struct HostSource<'a> {
+    /// The last snapshot this endpoint delivered, if any.
+    pub(super) snapshot: Option<&'a ClientShellSnapshot>,
+    /// Whether the endpoint is connected now; a disconnected endpoint's snapshot is stale.
+    pub(super) online: bool,
+}
+
+/// The host counts the header sums, and how many servers it should have summed.
+pub(super) struct HostCounts<'a> {
+    /// One token set per server that reported through an online endpoint.
+    pub(super) token_sets: Vec<&'a [(String, String)]>,
+    /// Distinct servers the client knows about: every server identity any source names, plus one
+    /// per source that never delivered a snapshot. A total over fewer servers is a lower bound.
+    pub(super) expected: usize,
+}
+
+/// Groups the sources by server identity (boot_id; an empty or missing one is never merged) and
+/// takes, per server, the first token set an ONLINE source delivered - so a tokenless snapshot of a
+/// server never hides a later one that carries the counts, and an offline alias of a server that is
+/// online through another endpoint does not make the totals partial. Every workspace of a server
+/// carries the same values, so one workspace per server is read.
+pub(super) fn host_counts<'a>(sources: impl IntoIterator<Item = HostSource<'a>>) -> HostCounts<'a> {
+    let mut by_boot: std::collections::HashMap<&'a str, usize> = std::collections::HashMap::new();
+    let mut servers: Vec<Option<&'a [(String, String)]>> = Vec::new();
+    for source in sources {
+        let index = match source.snapshot.map(|snapshot| snapshot.boot_id.as_str()) {
+            Some(boot) if !boot.is_empty() => *by_boot.entry(boot).or_insert_with(|| {
+                servers.push(None);
+                servers.len() - 1
+            }),
+            _ => {
+                servers.push(None);
+                servers.len() - 1
+            }
+        };
+        if !source.online || servers[index].is_some() {
+            continue;
+        }
+        servers[index] = source.snapshot.and_then(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
@@ -121,19 +151,24 @@ pub(super) fn host_count_tokens<'a>(
                         .iter()
                         .any(|(key, _)| HOST_COUNT_TOKENS.iter().any(|(_, k)| key == k))
                 })
-        })
-        .collect()
+        });
+    }
+    HostCounts {
+        expected: servers.len(),
+        token_sets: servers.into_iter().flatten().collect(),
+    }
 }
 
 /// The suffix of the agents header: "P:<panes>" and, per host count some host reported,
 /// " <letter>:<sum over hosts>". A count no host reported (an older herdr-ccwait) is left out
-/// rather than shown as 0, which would state something nobody measured. A sum that misses a
-/// host - one that did not report that count (missing or non-numeric), or `unreachable_hosts`
-/// endpoints that are not online - is marked with a trailing '?': it is a lower bound.
+/// rather than shown as 0, which would state something nobody measured. A sum over fewer than
+/// `expected_hosts` servers - a server that did not report that count (missing, non-numeric,
+/// tokens expired) or is reachable through no online endpoint - carries a trailing '?': it is a
+/// lower bound.
 pub(super) fn header_counts(
     panes: usize,
     token_sets: &[&[(String, String)]],
-    unreachable_hosts: usize,
+    expected_hosts: usize,
 ) -> String {
     let mut out = format!("P:{panes}");
     for (letter, key) in HOST_COUNT_TOKENS {
@@ -143,7 +178,7 @@ pub(super) fn header_counts(
             .filter_map(|(_, value)| value.parse::<u64>().ok())
             .collect::<Vec<_>>();
         if !values.is_empty() {
-            let partial = unreachable_hosts > 0 || values.len() < token_sets.len();
+            let partial = values.len() < expected_hosts.max(token_sets.len());
             let mark = if partial { "?" } else { "" };
             out.push_str(&format!(" {letter}:{}{mark}", values.iter().sum::<u64>()));
         }
@@ -152,8 +187,8 @@ pub(super) fn header_counts(
 }
 
 /// Fits the space-separated count fields into `max` cells without cutting a number: trailing
-/// fields that do not fit are dropped and replaced by " +". Only when even the first field
-/// cannot fit is it cut, since a partial "P:" still beats an empty rule.
+/// fields that do not fit are dropped and replaced by " +". When not even the first field fits,
+/// the result is "+" alone: a cut "P:1" would read as an exact count of 1.
 pub(super) fn fit_counts(counts: &str, max: usize) -> String {
     let fields = counts
         .split(' ')
@@ -169,7 +204,11 @@ pub(super) fn fit_counts(counts: &str, max: usize) -> String {
             return candidate;
         }
     }
-    joined.chars().take(max).collect()
+    if max == 0 {
+        String::new()
+    } else {
+        "+".to_owned()
+    }
 }
 
 /// The rule row above the agents label: a box-drawing rule carrying " <counts> " after its first
@@ -520,7 +559,8 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
 #[cfg(test)]
 mod header_counts_tests {
     use super::{
-        fit_counts, header_counts, header_rule_text, host_count_tokens, render_agent_panel_header,
+        fit_counts, header_counts, header_rule_text, host_counts, render_agent_panel_header,
+        HostSource,
     };
 
     fn tokens(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -545,9 +585,9 @@ mod header_counts_tests {
             ("agents_f", "0"),
             ("agents_s", "3"),
         ]);
-        assert_eq!(header_counts(12, &[&dcc], 0), "P:12 A:0 W:7 F:1 S:0");
+        assert_eq!(header_counts(12, &[&dcc], 1), "P:12 A:0 W:7 F:1 S:0");
         assert_eq!(
-            header_counts(12, &[&dcc, &local], 0),
+            header_counts(12, &[&dcc, &local], 2),
             "P:12 A:2 W:8 F:1 S:3"
         );
     }
@@ -557,7 +597,7 @@ mod header_counts_tests {
     fn agents_header_counts_without_host_tokens_show_only_panes() {
         assert_eq!(header_counts(5, &[], 0), "P:5");
         let partial = tokens(&[("agents_w", "4"), ("agents_s", "not-a-number")]);
-        assert_eq!(header_counts(5, &[&partial], 0), "P:5 W:4");
+        assert_eq!(header_counts(5, &[&partial], 1), "P:5 W:4");
     }
 
     fn row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
@@ -617,45 +657,94 @@ mod header_counts_tests {
         assert_eq!(fit_counts(counts, 22), "P:12 A:20 W:80 F:10 +");
         assert_eq!(fit_counts(counts, 24), counts);
         assert_eq!(fit_counts(counts, 8), "P:12 +");
-        assert_eq!(fit_counts(counts, 3), "P:1");
+        // codex r3 finding 3: a first field that cannot fit is replaced, never cut
+        assert_eq!(fit_counts(counts, 3), "+");
+        assert_eq!(fit_counts(counts, 0), "");
         for max in 0..30 {
             let fitted = fit_counts(counts, max);
             assert!(fitted.chars().count() <= max, "{max}: {fitted:?}");
             for field in fitted.split(' ').filter(|f| *f != "+") {
                 assert!(
-                    counts.split(' ').any(|c| c == field) || fitted.chars().count() == max,
+                    counts.split(' ').any(|c| c == field),
                     "{max}: cut field {field:?} in {fitted:?}"
                 );
             }
         }
     }
 
-    // codex r2 findings 2 + 4: the real selector - any host key counts, one server boot once
-    #[test]
-    fn host_count_tokens_selects_any_key_and_dedupes_boot() {
-        let mut only_w = crate::client::shell::tests::snapshot();
-        only_w.workspaces[0].tokens = vec![("agents_w".to_owned(), "4".to_owned())];
-        let sets = host_count_tokens([&only_w]);
-        assert_eq!(header_counts(5, &sets, 0), "P:5 W:4");
-
-        let mut other = crate::client::shell::tests::snapshot();
-        other.boot_id = "boot-2".into();
-        other.workspaces[0].tokens = vec![
-            ("agents_w".to_owned(), "3".to_owned()),
-            ("agents_s".to_owned(), "1".to_owned()),
-        ];
-        let same_boot = only_w.clone();
-        let sets = host_count_tokens([&only_w, &same_boot, &other]);
-        assert_eq!(sets.len(), 2, "one contribution per boot_id");
-        // W summed over both hosts; S only from one of two hosts, so it is a lower bound
-        assert_eq!(header_counts(5, &sets, 0), "P:5 W:7 S:1?");
+    fn online(snapshot: &crate::protocol::ClientShellSnapshot) -> HostSource<'_> {
+        HostSource {
+            snapshot: Some(snapshot),
+            online: true,
+        }
     }
 
-    // codex r2 finding 3: an endpoint that is not online makes every total a lower bound
+    fn with_tokens(boot: &str, pairs: &[(&str, &str)]) -> crate::protocol::ClientShellSnapshot {
+        let mut snapshot = crate::client::shell::tests::snapshot();
+        snapshot.boot_id = boot.into();
+        snapshot.workspaces[0].tokens = tokens(pairs);
+        snapshot
+    }
+
+    fn header(sources: Vec<HostSource<'_>>) -> String {
+        let host = host_counts(sources);
+        header_counts(5, &host.token_sets, host.expected)
+    }
+
+    // codex r2 findings 2 + 4: any host key selects the workspace, one server boot counts once
     #[test]
-    fn header_counts_marks_totals_when_a_host_is_unreachable() {
-        let t = tokens(&[("agents_a", "1"), ("agents_w", "2")]);
-        assert_eq!(header_counts(3, &[&t], 1), "P:3 A:1? W:2?");
+    fn host_counts_selects_any_key_and_dedupes_boot() {
+        let only_w = with_tokens("boot-1", &[("agents_w", "4")]);
+        assert_eq!(header(vec![online(&only_w)]), "P:5 W:4");
+        let other = with_tokens("boot-2", &[("agents_w", "3"), ("agents_s", "1")]);
+        let same_boot = only_w.clone();
+        // W summed over both servers; S only from one of two, so it is a lower bound
+        assert_eq!(
+            header(vec![online(&only_w), online(&same_boot), online(&other)]),
+            "P:5 W:7 S:1?"
+        );
+    }
+
+    // codex r3 finding 1: a server whose tokens expired still counts as expected
+    #[test]
+    fn host_counts_tokenless_server_makes_totals_partial() {
+        let a = with_tokens("boot-a", &[("agents_w", "4")]);
+        let b = with_tokens("boot-b", &[]);
+        assert_eq!(header(vec![online(&a), online(&b)]), "P:5 W:4?");
+    }
+
+    // codex r3 finding 2: a tokenless snapshot of a server never hides a later one with counts
+    #[test]
+    fn host_counts_tokenless_snapshot_does_not_hide_counts_of_same_server() {
+        let empty = with_tokens("boot-1", &[]);
+        let full = with_tokens("boot-1", &[("agents_w", "4")]);
+        assert_eq!(header(vec![online(&empty), online(&full)]), "P:5 W:4");
+    }
+
+    // codex r3 finding 4: '?' is about servers, not connections
+    #[test]
+    fn host_counts_partial_is_per_server_not_per_connection() {
+        let live = with_tokens("boot-1", &[("agents_a", "1"), ("agents_w", "2")]);
+        let stale_alias = with_tokens("boot-1", &[("agents_a", "9"), ("agents_w", "9")]);
+        let offline_alias = HostSource {
+            snapshot: Some(&stale_alias),
+            online: false,
+        };
+        // an offline alias of a server that is online elsewhere: complete, stale counts unused
+        assert_eq!(header(vec![offline_alias, online(&live)]), "P:5 A:1 W:2");
+        // an unreachable endpoint that never delivered a snapshot: partial
+        let never = HostSource {
+            snapshot: None,
+            online: false,
+        };
+        assert_eq!(header(vec![online(&live), never]), "P:5 A:1? W:2?");
+        // a server known only through an offline endpoint: partial, its stale counts unused
+        let gone = with_tokens("boot-2", &[("agents_w", "5")]);
+        let gone = HostSource {
+            snapshot: Some(&gone),
+            online: false,
+        };
+        assert_eq!(header(vec![online(&live), gone]), "P:5 A:1? W:2?");
     }
 
     #[test]
