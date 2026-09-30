@@ -232,22 +232,22 @@ mod tests {
         }
     }
 
-    // herdr-upm: the machine name coloured by the pane's `$ctx`, thresholds 50/80.
+    // herdr-upm: the machine name coloured by the pane's `$ctx_num`, thresholds 50/80.
     #[test]
     fn machine_is_coloured_by_the_ctx_token() {
         let config: AgentsSidebarConfig = toml::from_str(r##"
-rows = [[{ token = "machine", fg = "#a6e3a1", rules = [{ source = "$ctx", gt = 80, fg = "#f38ba8" }, { source = "$ctx", gt = 50, fg = "#f9e2af" }] }]]
+rows = [[{ token = "machine", fg = "#a6e3a1", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 50, fg = "#f9e2af" }] }]]
 "##).unwrap();
         for (ctx, color) in [
-            (Some("85%"), (0xf3, 0x8b, 0xa8)),
-            (Some("80%"), (0xf9, 0xe2, 0xaf)),
-            (Some("51%"), (0xf9, 0xe2, 0xaf)),
-            (Some("50%"), (0xa6, 0xe3, 0xa1)),
+            (Some("85"), (0xf3, 0x8b, 0xa8)),
+            (Some("80"), (0xf9, 0xe2, 0xaf)),
+            (Some("51"), (0xf9, 0xe2, 0xaf)),
+            (Some("50"), (0xa6, 0xe3, 0xa1)),
             (None, (0xa6, 0xe3, 0xa1)),
         ] {
             let mut entry = entry();
             if let Some(ctx) = ctx {
-                entry.tokens.insert("ctx".into(), ctx.into());
+                entry.tokens.insert("ctx_num".into(), ctx.into());
             }
             let mut context = context(&entry);
             context.machine = Some("dcc");
