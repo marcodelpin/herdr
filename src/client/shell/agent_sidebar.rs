@@ -133,6 +133,23 @@ pub(super) fn header_counts(panes: usize, token_sets: &[&[(String, String)]]) ->
     out
 }
 
+/// The rule row above the agents label: a box-drawing rule carrying " <counts> " after its first
+/// cell, filled to `width` cells, or a plain rule when there are no counts. Truncated to `width`,
+/// so a narrow sidebar clips the tail.
+pub(super) fn header_rule_text(counts: &str, width: usize) -> String {
+    let dash = '\u{2500}';
+    let mut text = if counts.is_empty() {
+        String::new()
+    } else {
+        format!("{dash} {counts} ")
+    };
+    let used = text.chars().count();
+    if used < width {
+        text.extend(std::iter::repeat_n(dash, width - used));
+    }
+    text.chars().take(width).collect()
+}
+
 pub(super) fn render_agent_panel_header(
     buffer: &mut Buffer,
     area: Rect,
@@ -149,9 +166,21 @@ pub(super) fn render_agent_panel_header(
         area.x,
         area.y,
         area.width,
-        &"─".repeat(area.width as usize),
+        &header_rule_text(counts, area.width as usize),
         Style::default().fg(config.palette.surface_dim),
     );
+    // The counts sit on the rule row, not beside "agents": at the default sidebar width (26) the
+    // right-aligned sort toggle on the label row would overwrite them (herdr-47w review r1).
+    if !counts.is_empty() {
+        put_text(
+            buffer,
+            area.x.saturating_add(2),
+            area.y,
+            area.width.saturating_sub(2),
+            counts,
+            Style::default().fg(config.palette.overlay0),
+        );
+    }
     if area.height < 2 {
         return false;
     }
@@ -160,7 +189,7 @@ pub(super) fn render_agent_panel_header(
         area.x,
         area.y + 1,
         area.width,
-        &format!(" agents {counts}"),
+        " agents",
         Style::default()
             .fg(config.palette.overlay0)
             .add_modifier(Modifier::BOLD),
@@ -449,7 +478,7 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
 
 #[cfg(test)]
 mod header_counts_tests {
-    use super::header_counts;
+    use super::{header_counts, header_rule_text, render_agent_panel_header};
 
     fn tokens(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -483,5 +512,56 @@ mod header_counts_tests {
         assert_eq!(header_counts(5, &[]), "P:5");
         let partial = tokens(&[("agents_w", "4"), ("agents_s", "not-a-number")]);
         assert_eq!(header_counts(5, &[&partial]), "P:5 W:4");
+    }
+
+    fn row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| {
+                buffer
+                    .cell((x, y))
+                    .map(|c| c.symbol().to_owned())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    // herdr-47w review r1: at the default sidebar width (26) every count must stay visible;
+    // beside "agents" the right-aligned sort toggle overwrote W, F and S.
+    #[test]
+    fn agents_header_counts_visible_at_default_sidebar_width() {
+        let width = 26u16;
+        let area = ratatui::layout::Rect::new(0, 0, width, 2);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let config = crate::client::shell::state::ClientShellConfig::from_config(
+            &crate::config::Config::default(),
+        );
+        let mut hits = crate::client::shell::state::ShellHitMap::default();
+        let counts = "P:12 A:2 W:8 F:1 S:3";
+        assert!(render_agent_panel_header(
+            &mut buffer,
+            area,
+            None,
+            counts,
+            &config,
+            &mut hits
+        ));
+        let rule = row(&buffer, 0, width);
+        assert!(rule.contains(counts), "rule row {rule:?} lost counts");
+        let label = row(&buffer, 1, width);
+        assert!(label.starts_with(" agents"), "label row {label:?}");
+        assert!(
+            !label.contains("P:"),
+            "counts must not share the sort-toggle row: {label:?}"
+        );
+    }
+
+    #[test]
+    fn header_rule_text_fills_and_truncates() {
+        let dash = '\u{2500}';
+        assert_eq!(header_rule_text("", 4), dash.to_string().repeat(4));
+        let t = header_rule_text("P:1", 10);
+        assert_eq!(t.chars().count(), 10);
+        assert!(t.starts_with(&format!("{dash} P:1 ")));
+        assert_eq!(header_rule_text("P:12 A:2", 5).chars().count(), 5);
     }
 }
