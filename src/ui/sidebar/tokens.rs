@@ -110,9 +110,10 @@ pub(crate) fn agent_rows(
                             .map(ResolvedTokenKind::Custom),
                         AgentSidebarToken::Styled { .. } => None,
                     }?;
+                    let lookup = |name: &str| context.tokens.get(name).map(String::as_str);
                     let style = kind
                         .text_value()
-                        .map_or(Some(style), |value| configured.style_for_value(value))?;
+                        .map_or(Some(style), |value| configured.style_for(value, &lookup))?;
                     Some(ResolvedToken::new(kind, style))
                 })
                 .collect::<Vec<_>>();
@@ -166,9 +167,10 @@ pub(crate) fn space_rows(
                             .map(ResolvedTokenKind::Custom),
                         SpaceSidebarToken::Styled { .. } => None,
                     }?;
+                    let lookup = |name: &str| context.tokens.get(name).map(String::as_str);
                     let style = kind
                         .text_value()
-                        .map_or(Some(style), |value| configured.style_for_value(value))?;
+                        .map_or(Some(style), |value| configured.style_for(value, &lookup))?;
                     Some(ResolvedToken::new(kind, style))
                 })
                 .collect::<Vec<_>>();
@@ -227,6 +229,36 @@ mod tests {
             terminal_title_stripped: entry.terminal_title_stripped.as_deref(),
             canonical_agent: entry.canonical_agent,
             tokens: &entry.tokens,
+        }
+    }
+
+    // herdr-upm: the machine name coloured by the pane's `$ctx`, thresholds 50/80.
+    #[test]
+    fn machine_is_coloured_by_the_ctx_token() {
+        let config: AgentsSidebarConfig = toml::from_str(r##"
+rows = [[{ token = "machine", fg = "#a6e3a1", rules = [{ source = "$ctx", gt = 80, fg = "#f38ba8" }, { source = "$ctx", gt = 50, fg = "#f9e2af" }] }]]
+"##).unwrap();
+        for (ctx, color) in [
+            (Some("85%"), (0xf3, 0x8b, 0xa8)),
+            (Some("80%"), (0xf9, 0xe2, 0xaf)),
+            (Some("51%"), (0xf9, 0xe2, 0xaf)),
+            (Some("50%"), (0xa6, 0xe3, 0xa1)),
+            (None, (0xa6, 0xe3, 0xa1)),
+        ] {
+            let mut entry = entry();
+            if let Some(ctx) = ctx {
+                entry.tokens.insert("ctx".into(), ctx.into());
+            }
+            let mut context = context(&entry);
+            context.machine = Some("dcc");
+            let rows = agent_rows(&config, context, "working");
+            let token = &rows[0][0];
+            assert_eq!(token.kind, ResolvedTokenKind::Machine("dcc".into()));
+            assert_eq!(
+                token.style.fg.unwrap().ratatui(),
+                ratatui::style::Color::Rgb(color.0, color.1, color.2),
+                "ctx {ctx:?}"
+            );
         }
     }
 
