@@ -178,14 +178,11 @@ impl SidebarTokenRule {
     }
 }
 
-// parse_number reads a finite number, accepting one trailing `%` so a percentage token such as
-// `$ctx` ("33%") can drive a gt/lt rule (herdr-upm).
+// parse_number reads a full, finite number and nothing else: no unit, no padding (the upstream
+// contract numeric_conditions_require_full_finite_numbers_and_strict_comparison pins). A
+// percentage source therefore needs a numeric token, e.g. herdr-ccwait's `$ctx_num` (herdr-upm).
 fn parse_number(value: &str) -> Option<f64> {
-    let trimmed = value.trim();
-    trimmed
-        .strip_suffix('%')
-        .unwrap_or(trimmed)
-        .trim_end()
+    value
         .parse::<f64>()
         .ok()
         .filter(|number| number.is_finite())
@@ -284,13 +281,12 @@ mod tests {
         }
     }
 
-    // herdr-upm: a rule with `source` reads another custom token of the pane, and a trailing `%`
-    // is accepted by gt/lt.
+    // herdr-upm: a rule with `source` reads another custom token of the pane.
     #[test]
     fn source_rules_read_another_token_and_accept_percent() {
         let rules: Vec<SidebarTokenRule> = [
-            "source = '$ctx'\ngt = 80\nbold = true",
-            "source = '$ctx'\ngt = 50\ndim = true",
+            "source = '$ctx_num'\ngt = 80\nbold = true",
+            "source = '$ctx_num'\ngt = 50\ndim = true",
         ]
         .iter()
         .map(|raw| toml::from_str(raw).unwrap())
@@ -298,24 +294,23 @@ mod tests {
         let base = SidebarTokenStyle::default();
         let style = |ctx: Option<&str>| {
             matching_style(&rules, base, "dcc", &|name| {
-                assert_eq!(name, "ctx");
+                assert_eq!(name, "ctx_num");
                 ctx
             })
         };
-        assert_eq!(style(Some("85%")).unwrap().bold, Some(true));
-        assert_eq!(style(Some("60%")).unwrap().dim, Some(true));
-        assert_eq!(style(Some("60%")).unwrap().bold, None);
-        assert_eq!(style(Some("10%")).unwrap(), base);
+        assert_eq!(style(Some("85")).unwrap().bold, Some(true));
+        assert_eq!(style(Some("60")).unwrap().dim, Some(true));
+        assert_eq!(style(Some("60")).unwrap().bold, None);
+        assert_eq!(style(Some("10")).unwrap(), base);
+        // the upstream numeric contract holds for a sourced value too: a unit is not a number
+        assert_eq!(style(Some("85%")).unwrap(), base);
         // an absent source token matches no rule, whatever the styled value is
         assert_eq!(style(None).unwrap(), base);
         // the styled value itself is never read by a sourced rule
         assert_eq!(
-            matching_style(&rules, base, "99", &|_| Some("1%")).unwrap(),
+            matching_style(&rules, base, "99", &|_| Some("1")).unwrap(),
             base
         );
-        assert_eq!(parse_number(" 33% "), Some(33.0));
-        assert_eq!(parse_number("%"), None);
-        assert_eq!(parse_number("33%%"), None);
     }
 
     #[test]
@@ -324,9 +319,9 @@ mod tests {
             let raw = format!("source = '{bad}'\ngt = 1");
             assert!(toml::from_str::<SidebarTokenRule>(&raw).is_err(), "{bad}");
         }
-        let rule: SidebarTokenRule = toml::from_str("source = '$ctx'\ngt = 80").unwrap();
+        let rule: SidebarTokenRule = toml::from_str("source = '$ctx_num'\ngt = 80").unwrap();
         let back = toml::to_string(&rule).unwrap();
-        assert!(back.contains("source = \"$ctx\""), "{back}");
+        assert!(back.contains("source = \"$ctx_num\""), "{back}");
         assert_eq!(toml::from_str::<SidebarTokenRule>(&back).unwrap(), rule);
     }
 }
