@@ -54,16 +54,25 @@ pub(super) fn render_expanded(
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
+    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    let counts = super::agent_sidebar::header_counts(
+        rows.len(),
+        &super::agent_sidebar::host_count_tokens(
+            endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.snapshot.as_deref()),
+        ),
+    );
     if !super::agent_sidebar::render_agent_panel_header(
         buffer,
         area,
         agent_view_label,
+        &counts,
         config,
         hits,
     ) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
