@@ -57,17 +57,19 @@ pub(super) fn render_agent_panel(
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
+    let rows = agent_rows(snapshot, config, None);
+    let counts = header_counts(rows.len(), &host_count_tokens([snapshot]));
     if !render_agent_panel_header(
         buffer,
         area,
         snapshot.agent_view_label.as_deref(),
+        &counts,
         config,
         hits,
     ) {
         return;
     }
 
-    let rows = agent_rows(snapshot, config, None);
     render_agent_list(
         buffer,
         area,
@@ -87,10 +89,55 @@ pub(super) fn render_agent_panel(
     );
 }
 
+/// The host-wide agent counts herdr-ccwait publishes on every workspace (herdr-47w): subagents,
+/// detached workers, workflows, Claude sessions without a pane.
+const HOST_COUNT_TOKENS: [(&str, &str); 4] = [
+    ("A", "agents_a"),
+    ("W", "agents_w"),
+    ("F", "agents_f"),
+    ("S", "agents_s"),
+];
+
+/// One token set per snapshot (per host): the first workspace that carries the host counts. Every
+/// workspace carries the same values, so reading one per host avoids counting a host N times.
+pub(super) fn host_count_tokens<'a>(
+    snapshots: impl IntoIterator<Item = &'a ClientShellSnapshot>,
+) -> Vec<&'a [(String, String)]> {
+    snapshots
+        .into_iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.tokens.as_slice())
+                .find(|tokens| tokens.iter().any(|(key, _)| key == HOST_COUNT_TOKENS[0].1))
+        })
+        .collect()
+}
+
+/// The suffix of the agents header: "P:<panes>" and, per host count some host reported,
+/// " <letter>:<sum over hosts>". A count no host reported (an older herdr-ccwait) is left out
+/// rather than shown as 0, which would state something nobody measured.
+pub(super) fn header_counts(panes: usize, token_sets: &[&[(String, String)]]) -> String {
+    let mut out = format!("P:{panes}");
+    for (letter, key) in HOST_COUNT_TOKENS {
+        let values = token_sets
+            .iter()
+            .filter_map(|tokens| tokens.iter().find(|(k, _)| k == key))
+            .filter_map(|(_, value)| value.parse::<u64>().ok())
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            out.push_str(&format!(" {letter}:{}", values.iter().sum::<u64>()));
+        }
+    }
+    out
+}
+
 pub(super) fn render_agent_panel_header(
     buffer: &mut Buffer,
     area: Rect,
     agent_view_label: Option<&str>,
+    counts: &str,
     config: &ClientShellConfig,
     hits: &mut ShellHitMap,
 ) -> bool {
@@ -113,7 +160,7 @@ pub(super) fn render_agent_panel_header(
         area.x,
         area.y + 1,
         area.width,
-        " agents",
+        &format!(" agents {counts}"),
         Style::default()
             .fg(config.palette.overlay0)
             .add_modifier(Modifier::BOLD),
@@ -397,5 +444,44 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
         AgentStatus::Done => "done",
         AgentStatus::Working => "working",
         AgentStatus::Idle | AgentStatus::Unknown => "idle",
+    }
+}
+
+#[cfg(test)]
+mod header_counts_tests {
+    use super::header_counts;
+
+    fn tokens(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    // herdr-47w: P from the agent rows, A/W/F/S summed over the hosts that reported them.
+    #[test]
+    fn agents_header_counts_sum_hosts_and_keep_zeros() {
+        let dcc = tokens(&[
+            ("agents_a", "0"),
+            ("agents_w", "7"),
+            ("agents_f", "1"),
+            ("agents_s", "0"),
+        ]);
+        let local = tokens(&[
+            ("agents_a", "2"),
+            ("agents_w", "1"),
+            ("agents_f", "0"),
+            ("agents_s", "3"),
+        ]);
+        assert_eq!(header_counts(12, &[&dcc]), "P:12 A:0 W:7 F:1 S:0");
+        assert_eq!(header_counts(12, &[&dcc, &local]), "P:12 A:2 W:8 F:1 S:3");
+    }
+
+    // an older herdr-ccwait publishes nothing: P alone, never an invented 0
+    #[test]
+    fn agents_header_counts_without_host_tokens_show_only_panes() {
+        assert_eq!(header_counts(5, &[]), "P:5");
+        let partial = tokens(&[("agents_w", "4"), ("agents_s", "not-a-number")]);
+        assert_eq!(header_counts(5, &[&partial]), "P:5 W:4");
     }
 }

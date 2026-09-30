@@ -1,0 +1,118 @@
+# Fork-only workflow for fix/agents-header-counts (not for upstream), bd herdr-47w: the agents
+# header shows "agents P:<panes> A:<subagents> W:<workers> F:<workflows> S:<unpaned sessions>",
+# P from the client's agent rows, A/W/F/S from the host counts herdr-ccwait publishes on every
+# workspace (agents_a/w/f/s), summed over endpoints. Runs the whole crate on both OSes, the new
+# tests by name (a filter that matches nothing must fail), and one mutant: without the sum over
+# hosts the new test must go red.
+name: Fork agents header counts (47w)
+
+on:
+  push:
+    branches: [fix/agents-header-counts]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      # nextest runs one process per test, matching upstream `just ci` and this fork's own
+
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      - name: Run the new source-rule tests by name
+        shell: bash
+        run: |
+          filter='test(/agents_header_counts_sum_hosts_and_keep_zeros|agents_header_counts_without_host_tokens_show_only_panes/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > hdr-tests.txt
+          n=$(wc -l < hdr-tests.txt)
+          echo "new tests matched: $n"
+          if [ "$n" -ne 2 ]; then echo "expected 2 tests, got $n"; cat hdr-tests.txt; exit 1; fi
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
+
+  mutant-host-sum:
+    name: mutant - summing over hosts is load-bearing
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      # nextest runs one process per test, matching upstream `just ci` and this fork's own
+
+      - name: Take the first host instead of the sum and require the new tests to fail
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          p = "src/client/shell/agent_sidebar.rs"
+          s = open(p).read()
+          old = 'values.iter().sum::<u64>()'
+          assert s.count(old) == 1, "mutation site not found"
+          open(p, "w").write(s.replace(old, "values[0]"))
+          EOF
+          grep -c 'values\[0\]' src/client/shell/agent_sidebar.rs
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agents_header_counts_sum_hosts_and_keep_zeros/)' > mutant.log 2>&1 || rc=$?
+          tail -20 mutant.log
+          if [ "$rc" -eq 0 ]; then echo "MUTANT SURVIVED: the test passes without the sum over hosts"; exit 1; fi
+          grep -q 'FAIL' mutant.log || { echo "rc=$rc but no FAIL line: the tests did not run"; exit 1; }
+          echo "mutant killed (rc=$rc)"
