@@ -1,7 +1,7 @@
 # Fork-only workflow for fix/sidebar-rule-source (not for upstream), bd herdr-upm: a sidebar token
 # rule may name `source = "$<custom token>"` to read ANOTHER token of the same pane instead of the
-# styled token's own value (the operator colours the machine name by `$ctx`, 50/80), and gt/lt
-# accept a trailing `%`. Runs the whole crate on both OSes, the new tests by name (a filter that
+# styled token's own value (the operator colours the machine name by `$ctx_num`, 50/80);
+# the upstream numeric contract is unchanged. Runs the whole crate on both OSes, the new tests by name (a filter that
 # matches nothing must fail, never pass), and one mutant: with the source lookup removed the new
 # tests must go red.
 name: Fork sidebar rule source (upm)
