@@ -55,13 +55,27 @@ pub(super) fn render_expanded(
     hits: &mut ShellHitMap,
 ) {
     let rows = agent_rows(endpoints, active_endpoint_id, config);
+    // A disconnected endpoint keeps its last snapshot; its host counts are stale, so it does not
+    // contribute and instead marks the totals as a lower bound (codex r2 finding 3).
+    let online = |endpoint: &&ClientShellEndpoint| {
+        endpoint.status == crate::client::endpoint::ClientEndpointStatus::Online
+    };
+    let unreachable = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.snapshot.is_some() && !online(endpoint))
+        .filter(|endpoint| {
+            endpoint.status != crate::client::endpoint::ClientEndpointStatus::Disabled
+        })
+        .count();
     let counts = super::agent_sidebar::header_counts(
         rows.len(),
         &super::agent_sidebar::host_count_tokens(
             endpoints
                 .iter()
+                .filter(online)
                 .filter_map(|endpoint| endpoint.snapshot.as_deref()),
         ),
+        unreachable,
     );
     if !super::agent_sidebar::render_agent_panel_header(
         buffer,

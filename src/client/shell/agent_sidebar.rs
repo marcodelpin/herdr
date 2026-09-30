@@ -58,7 +58,7 @@ pub(super) fn render_agent_panel(
     hits: &mut ShellHitMap,
 ) {
     let rows = agent_rows(snapshot, config, None);
-    let counts = header_counts(rows.len(), &host_count_tokens([snapshot]));
+    let counts = header_counts(rows.len(), &host_count_tokens([snapshot]), 0);
     if !render_agent_panel_header(
         buffer,
         area,
@@ -98,27 +98,43 @@ const HOST_COUNT_TOKENS: [(&str, &str); 4] = [
     ("S", "agents_s"),
 ];
 
-/// One token set per snapshot (per host): the first workspace that carries the host counts. Every
+/// One token set per server (per host): the first workspace that carries any host count. Every
 /// workspace carries the same values, so reading one per host avoids counting a host N times.
+/// Two endpoints connected to the same server process (local plus ssh-to-self, two aliases)
+/// share its boot_id and contribute once; an empty boot_id is never merged with another.
 pub(super) fn host_count_tokens<'a>(
     snapshots: impl IntoIterator<Item = &'a ClientShellSnapshot>,
 ) -> Vec<&'a [(String, String)]> {
+    let mut seen_boots = std::collections::HashSet::new();
     snapshots
         .into_iter()
+        .filter(|snapshot| {
+            snapshot.boot_id.is_empty() || seen_boots.insert(snapshot.boot_id.as_str())
+        })
         .filter_map(|snapshot| {
             snapshot
                 .workspaces
                 .iter()
                 .map(|workspace| workspace.tokens.as_slice())
-                .find(|tokens| tokens.iter().any(|(key, _)| key == HOST_COUNT_TOKENS[0].1))
+                .find(|tokens| {
+                    tokens
+                        .iter()
+                        .any(|(key, _)| HOST_COUNT_TOKENS.iter().any(|(_, k)| key == k))
+                })
         })
         .collect()
 }
 
 /// The suffix of the agents header: "P:<panes>" and, per host count some host reported,
 /// " <letter>:<sum over hosts>". A count no host reported (an older herdr-ccwait) is left out
-/// rather than shown as 0, which would state something nobody measured.
-pub(super) fn header_counts(panes: usize, token_sets: &[&[(String, String)]]) -> String {
+/// rather than shown as 0, which would state something nobody measured. A sum that misses a
+/// host - one that did not report that count (missing or non-numeric), or `unreachable_hosts`
+/// endpoints that are not online - is marked with a trailing '?': it is a lower bound.
+pub(super) fn header_counts(
+    panes: usize,
+    token_sets: &[&[(String, String)]],
+    unreachable_hosts: usize,
+) -> String {
     let mut out = format!("P:{panes}");
     for (letter, key) in HOST_COUNT_TOKENS {
         let values = token_sets
@@ -127,10 +143,33 @@ pub(super) fn header_counts(panes: usize, token_sets: &[&[(String, String)]]) ->
             .filter_map(|(_, value)| value.parse::<u64>().ok())
             .collect::<Vec<_>>();
         if !values.is_empty() {
-            out.push_str(&format!(" {letter}:{}", values.iter().sum::<u64>()));
+            let partial = unreachable_hosts > 0 || values.len() < token_sets.len();
+            let mark = if partial { "?" } else { "" };
+            out.push_str(&format!(" {letter}:{}{mark}", values.iter().sum::<u64>()));
         }
     }
     out
+}
+
+/// Fits the space-separated count fields into `max` cells without cutting a number: trailing
+/// fields that do not fit are dropped and replaced by " +". Only when even the first field
+/// cannot fit is it cut, since a partial "P:" still beats an empty rule.
+pub(super) fn fit_counts(counts: &str, max: usize) -> String {
+    let fields = counts
+        .split(' ')
+        .filter(|f| !f.is_empty())
+        .collect::<Vec<_>>();
+    let joined = fields.join(" ");
+    if joined.chars().count() <= max {
+        return joined;
+    }
+    for keep in (1..fields.len()).rev() {
+        let candidate = format!("{} +", fields[..keep].join(" "));
+        if candidate.chars().count() <= max {
+            return candidate;
+        }
+    }
+    joined.chars().take(max).collect()
 }
 
 /// The rule row above the agents label: a box-drawing rule carrying " <counts> " after its first
@@ -161,23 +200,25 @@ pub(super) fn render_agent_panel_header(
     if area.height == 0 {
         return false;
     }
+    // "<rule> " before the counts and one cell after them keep at least one rule cell visible.
+    let shown = fit_counts(counts, (area.width as usize).saturating_sub(3));
     put_text(
         buffer,
         area.x,
         area.y,
         area.width,
-        &header_rule_text(counts, area.width as usize),
+        &header_rule_text(&shown, area.width as usize),
         Style::default().fg(config.palette.surface_dim),
     );
     // The counts sit on the rule row, not beside "agents": at the default sidebar width (26) the
     // right-aligned sort toggle on the label row would overwrite them (herdr-47w review r1).
-    if !counts.is_empty() {
+    if !shown.is_empty() {
         put_text(
             buffer,
             area.x.saturating_add(2),
             area.y,
             area.width.saturating_sub(2),
-            counts,
+            &shown,
             Style::default().fg(config.palette.overlay0),
         );
     }
@@ -478,7 +519,9 @@ fn sidebar_status_text(status: crate::api::schema::AgentStatus) -> &'static str 
 
 #[cfg(test)]
 mod header_counts_tests {
-    use super::{header_counts, header_rule_text, render_agent_panel_header};
+    use super::{
+        fit_counts, header_counts, header_rule_text, host_count_tokens, render_agent_panel_header,
+    };
 
     fn tokens(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -502,16 +545,19 @@ mod header_counts_tests {
             ("agents_f", "0"),
             ("agents_s", "3"),
         ]);
-        assert_eq!(header_counts(12, &[&dcc]), "P:12 A:0 W:7 F:1 S:0");
-        assert_eq!(header_counts(12, &[&dcc, &local]), "P:12 A:2 W:8 F:1 S:3");
+        assert_eq!(header_counts(12, &[&dcc], 0), "P:12 A:0 W:7 F:1 S:0");
+        assert_eq!(
+            header_counts(12, &[&dcc, &local], 0),
+            "P:12 A:2 W:8 F:1 S:3"
+        );
     }
 
     // an older herdr-ccwait publishes nothing: P alone, never an invented 0
     #[test]
     fn agents_header_counts_without_host_tokens_show_only_panes() {
-        assert_eq!(header_counts(5, &[]), "P:5");
+        assert_eq!(header_counts(5, &[], 0), "P:5");
         let partial = tokens(&[("agents_w", "4"), ("agents_s", "not-a-number")]);
-        assert_eq!(header_counts(5, &[&partial]), "P:5 W:4");
+        assert_eq!(header_counts(5, &[&partial], 0), "P:5 W:4");
     }
 
     fn row(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
@@ -529,14 +575,15 @@ mod header_counts_tests {
     // beside "agents" the right-aligned sort toggle overwrote W, F and S.
     #[test]
     fn agents_header_counts_visible_at_default_sidebar_width() {
-        let width = 26u16;
+        // 26-cell sidebar minus the border cell (ui/sidebar.rs expanded_sidebar_sections)
+        let width = 25u16;
         let area = ratatui::layout::Rect::new(0, 0, width, 2);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         let config = crate::client::shell::state::ClientShellConfig::from_config(
             &crate::config::Config::default(),
         );
         let mut hits = crate::client::shell::state::ShellHitMap::default();
-        let counts = "P:12 A:2 W:8 F:1 S:3";
+        let counts = "P:12 A:20 W:80 F:10 S:30";
         assert!(render_agent_panel_header(
             &mut buffer,
             area,
@@ -546,13 +593,69 @@ mod header_counts_tests {
             &mut hits
         ));
         let rule = row(&buffer, 0, width);
-        assert!(rule.contains(counts), "rule row {rule:?} lost counts");
+        let expected = fit_counts(counts, width as usize - 3);
+        assert!(
+            rule.contains(&expected),
+            "rule row {rule:?} lost {expected:?}"
+        );
+        assert!(
+            !rule.contains("S:3") || rule.contains("S:30"),
+            "cut number in {rule:?}"
+        );
         let label = row(&buffer, 1, width);
         assert!(label.starts_with(" agents"), "label row {label:?}");
         assert!(
             !label.contains("P:"),
             "counts must not share the sort-toggle row: {label:?}"
         );
+    }
+
+    // codex r2 finding 1: never cut inside a number; drop whole fields and say so with '+'
+    #[test]
+    fn fit_counts_drops_whole_fields() {
+        let counts = "P:12 A:20 W:80 F:10 S:30";
+        assert_eq!(fit_counts(counts, 22), "P:12 A:20 W:80 F:10 +");
+        assert_eq!(fit_counts(counts, 24), counts);
+        assert_eq!(fit_counts(counts, 8), "P:12 +");
+        assert_eq!(fit_counts(counts, 3), "P:1");
+        for max in 0..30 {
+            let fitted = fit_counts(counts, max);
+            assert!(fitted.chars().count() <= max, "{max}: {fitted:?}");
+            for field in fitted.split(' ').filter(|f| *f != "+") {
+                assert!(
+                    counts.split(' ').any(|c| c == field) || fitted.chars().count() == max,
+                    "{max}: cut field {field:?} in {fitted:?}"
+                );
+            }
+        }
+    }
+
+    // codex r2 findings 2 + 4: the real selector - any host key counts, one server boot once
+    #[test]
+    fn host_count_tokens_selects_any_key_and_dedupes_boot() {
+        let mut only_w = crate::client::shell::tests::snapshot();
+        only_w.workspaces[0].tokens = vec![("agents_w".to_owned(), "4".to_owned())];
+        let sets = host_count_tokens([&only_w]);
+        assert_eq!(header_counts(5, &sets, 0), "P:5 W:4");
+
+        let mut other = crate::client::shell::tests::snapshot();
+        other.boot_id = "boot-2".into();
+        other.workspaces[0].tokens = vec![
+            ("agents_w".to_owned(), "3".to_owned()),
+            ("agents_s".to_owned(), "1".to_owned()),
+        ];
+        let same_boot = only_w.clone();
+        let sets = host_count_tokens([&only_w, &same_boot, &other]);
+        assert_eq!(sets.len(), 2, "one contribution per boot_id");
+        // W summed over both hosts; S only from one of two hosts, so it is a lower bound
+        assert_eq!(header_counts(5, &sets, 0), "P:5 W:7 S:1?");
+    }
+
+    // codex r2 finding 3: an endpoint that is not online makes every total a lower bound
+    #[test]
+    fn header_counts_marks_totals_when_a_host_is_unreachable() {
+        let t = tokens(&[("agents_a", "1"), ("agents_w", "2")]);
+        assert_eq!(header_counts(3, &[&t], 1), "P:3 A:1? W:2?");
     }
 
     #[test]
