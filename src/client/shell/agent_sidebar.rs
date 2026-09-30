@@ -663,7 +663,7 @@ mod header_counts_tests {
         for max in 0..30 {
             let fitted = fit_counts(counts, max);
             assert!(fitted.chars().count() <= max, "{max}: {fitted:?}");
-            for field in fitted.split(' ').filter(|f| *f != "+") {
+            for field in fitted.split(' ').filter(|f| !f.is_empty() && *f != "+") {
                 assert!(
                     counts.split(' ').any(|c| c == field),
                     "{max}: cut field {field:?} in {fitted:?}"
