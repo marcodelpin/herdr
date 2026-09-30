@@ -59,11 +59,11 @@ jobs:
       - name: Run the new source-rule tests by name
         shell: bash
         run: |
-          filter='test(/agents_header_counts_sum_hosts_and_keep_zeros|agents_header_counts_without_host_tokens_show_only_panes/)'
+          filter='test(/agents_header_counts_sum_hosts_and_keep_zeros|agents_header_counts_without_host_tokens_show_only_panes|agents_header_counts_visible_at_default_sidebar_width|header_rule_text_fills_and_truncates/)'
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > hdr-tests.txt
           n=$(wc -l < hdr-tests.txt)
           echo "new tests matched: $n"
-          if [ "$n" -ne 2 ]; then echo "expected 2 tests, got $n"; cat hdr-tests.txt; exit 1; fi
+          if [ "$n" -ne 4 ]; then echo "expected 4 tests, got $n"; cat hdr-tests.txt; exit 1; fi
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
   mutant-host-sum:
@@ -116,3 +116,22 @@ jobs:
           if [ "$rc" -eq 0 ]; then echo "MUTANT SURVIVED: the test passes without the sum over hosts"; exit 1; fi
           grep -q 'FAIL' mutant.log || { echo "rc=$rc but no FAIL line: the tests did not run"; exit 1; }
           echo "mutant killed (rc=$rc)"
+
+      - name: Put the counts back beside "agents" and require the layout test to fail
+        shell: bash
+        run: |
+          git checkout -- src/client/shell/agent_sidebar.rs
+          python3 - <<'EOF'
+          p = "src/client/shell/agent_sidebar.rs"
+          s = open(p).read()
+          old = '        " agents",'
+          assert s.count(old) == 1, "layout mutation site not found"
+          open(p, "w").write(s.replace(old, '        &format!(" agents {counts}"),'))
+          EOF
+          grep -c 'agents {counts}' src/client/shell/agent_sidebar.rs
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/agents_header_counts_visible_at_default_sidebar_width/)' > mutant2.log 2>&1 || rc=$?
+          tail -20 mutant2.log
+          if [ "$rc" -eq 0 ]; then echo "MUTANT SURVIVED: counts beside agents pass the layout test"; exit 1; fi
+          grep -q 'FAIL' mutant2.log || { echo "rc=$rc but no FAIL line: the test did not run"; exit 1; }
+          echo "layout mutant killed (rc=$rc)"
