@@ -211,11 +211,11 @@ fn parse_source(value: &str) -> Result<String, String> {
 
 // matching_style returns the style of the first rule that matches. A rule with a `source` reads
 // that custom token through `lookup`; when the token is absent the rule does not match.
-pub(super) fn matching_style(
+pub(super) fn matching_style<'v>(
     rules: &[SidebarTokenRule],
     base: SidebarTokenStyle,
     value: &str,
-    lookup: &dyn Fn(&str) -> Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<&'v str>,
 ) -> Option<SidebarTokenStyle> {
     let mut numeric = None;
     for rule in rules {
