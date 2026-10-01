@@ -1,0 +1,58 @@
+# Fork-only workflow for fix/ffx-bridge-test-pid-wait (not for upstream), bd herdr-ffx: the test
+# windows_bridge_returns_application_exit_while_descendant_is_running gave the nested powershell.exe
+# 10 s to write its PID file and failed on a cold windows-latest runner (run 36760304896). The fix
+# waits for the PID file before the exit poll. This host cannot build the crate (no Zig 0.16.0), so
+# the Windows crate tests run here: the whole crate first (the load the flake appeared under), then
+# the test by name with a count check so a green run cannot skip it. Repeat it with gh run rerun.
+name: Fork ffx bridge test
+
+on:
+  push:
+    branches: [fix/ffx-bridge-test-pid-wait]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      - name: Run the bridge test by name
+        shell: bash
+        run: |
+          filter='test(=remote::attach::tests::windows_bridge_returns_application_exit_while_descendant_is_running)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > ffx-tests.txt
+          cat ffx-tests.txt
+          count=$(grep -c . ffx-tests.txt || true)
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly 1 test, the filter matched $count"
+            exit 1
+          fi
+          cargo nextest run --locked --bin herdr -E "$filter" --status-level all --failure-output final --success-output final
