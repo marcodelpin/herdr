@@ -7,7 +7,7 @@ name: Fork waiting state icon
 
 on:
   push:
-    branches: [fix/waiting-state-icon]
+    branches: [fix/waiting-state-icon, fix/adopt-0.9.3]
 
 permissions:
   contents: read

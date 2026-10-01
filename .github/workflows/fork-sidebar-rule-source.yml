@@ -8,7 +8,7 @@ name: Fork sidebar rule source (upm)
 
 on:
   push:
-    branches: [fix/sidebar-rule-source]
+    branches: [fix/sidebar-rule-source, fix/adopt-0.9.3]
 
 permissions:
   contents: read
