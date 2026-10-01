@@ -153,6 +153,7 @@ fn compose_waiting_periods_later(state: &mut ClientShellState, periods: u32) -> 
     state
         .compose(DESKTOP.0, DESKTOP.1)
         .expect("composed desktop frame")
+        .frame
 }
 
 /// The first instant at which the Waiting glyph turns over from the frame the last
