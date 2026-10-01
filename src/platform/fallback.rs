@@ -207,6 +207,21 @@ pub fn foreground_process_group_id(_child_pid: u32) -> Option<u32> {
     None
 }
 
+/// Unsupported platform stub (ADR-0002, herdr-3ir).
+pub fn process_group_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub (ADR-0002, herdr-4r8).
+pub fn process_start_marker(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Unsupported platform stub (ADR-0002, herdr-4r8, P1-a).
+pub fn local_pid_domain() -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
@@ -222,6 +237,12 @@ pub fn signal_processes(_pids: &[u32], _signal: Signal) {}
 
 /// Unsupported platform stub.
 pub fn process_exists(_pid: u32) -> bool {
+    false
+}
+
+/// Unsupported platform stub (ADR-0002, herdr-3ir/4r8/ct9 fix round, codex
+/// ar-r4 P2 #2).
+pub fn process_is_zombie(_pid: u32) -> bool {
     false
 }
 

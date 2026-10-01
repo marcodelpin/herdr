@@ -659,6 +659,8 @@ fn report_agent_session_command() -> Command {
         .arg(option("agent-session-id", "ID"))
         .arg(path_option("agent-session-path", "PATH"))
         .arg(option("session-start-source", "SOURCE"))
+        .arg(option("agent-pid", "PID"))
+        .arg(path_option("agent-session-cwd", "PATH"))
         .arg(resume_argv_arg())
 }
 

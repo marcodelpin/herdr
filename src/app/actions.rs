@@ -1529,14 +1529,18 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                reporter_is_foreground,
+                agent_session_cwd,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_reporter(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        reporter_is_foreground,
+                        agent_session_cwd,
                     )
                 })
                 .into_iter()
@@ -1711,7 +1715,15 @@ impl AppState {
             self.pending_agent_notifications.remove(&pane_id);
             self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
         }
-        if mutation.session_ref_changed || managed_changed || agent_name_changed {
+        // P2-d (ADR-0002, herdr-ct9): a cwd-only update (the session
+        // identity is unchanged, only the persisted session's `cwd` moved -
+        // e.g. the first report after a v10 -> v11 hook upgrade) must still
+        // schedule a save, or it is silently lost on the next restart.
+        if mutation.session_ref_changed
+            || mutation.persisted_agent_session_cwd_changed
+            || managed_changed
+            || agent_name_changed
+        {
             self.mark_session_dirty();
         }
         let agent_released = mutation.agent_released;
@@ -3240,6 +3252,8 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                reporter_is_foreground: None,
+                agent_session_cwd: None,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
@@ -3918,6 +3932,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            cwd: None,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),
@@ -4073,6 +4088,71 @@ mod tests {
         assert_eq!(state.terminals.get(&terminal_id).unwrap().cwd, cwd);
         assert!(state.session_dirty);
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-d: the SAME claude session is reported
+    // again with an `agent_session_cwd` it did not carry before (the shape
+    // of a v10 -> v11 hook upgrade's first post-upgrade report) - the
+    // session identity is unchanged, so `session_ref_changed` alone would
+    // never mark the session dirty, and the cwd would silently fail to
+    // persist across a restart.
+    #[test]
+    fn agent_restore_p2d_app_level_cwd_only_change_marks_session_dirty() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+                cwd: None,
+            });
+        assert_eq!(
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone()),
+            None
+        );
+        state.session_dirty = false;
+
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(2),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
+            session_start_source: Some("resume".into()),
+            reporter_is_foreground: Some(true),
+            agent_session_cwd: Some("/work/project".into()),
+        });
+
+        assert_eq!(
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/work/project"),
+            "the cwd should have been persisted onto the terminal"
+        );
+        assert!(
+            state.session_dirty,
+            "a cwd-only change must still schedule a save, or it is lost on the next restart"
+        );
     }
 
     #[test]

@@ -7381,6 +7381,8 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
                     agent_session_path: None,
                     session_start_source: None,
                     resume_argv: Some(vec!["intruder".into()]),
+                    agent_pid: None,
+                    agent_session_cwd: None,
                 },
             ),
         },
@@ -7423,6 +7425,8 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
             agent_session_path: None,
             session_start_source: None,
             resume_argv: Some(vec!["claude".into(), "--resume".into(), session.into()]),
+            agent_pid: None,
+            agent_session_cwd: None,
         })
     };
 
@@ -7539,6 +7543,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 source: "herdr:pi".into(),
                 agent: "pi".into(),
                 session_ref: old_session.clone(),
+                cwd: None,
             });
             terminal
                 .set_hook_authority_with_session_ref(
@@ -7562,6 +7567,8 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                     agent_session_path: Some(new_session.clone()),
                     resume_argv: None,
                     session_start_source: Some(reason.into()),
+                    agent_pid: None,
+                    agent_session_cwd: None,
                 }),
             );
             let mut report = PaneReportAgentParams {
@@ -7719,6 +7726,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                     .to_string(),
             )
             .unwrap(),
+            cwd: None,
         });
     server
         .app

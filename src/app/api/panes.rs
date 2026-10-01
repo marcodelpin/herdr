@@ -1612,6 +1612,18 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        // ADR-0002, herdr-3ir: whether the reporter's own process group
+        // matches the pane's foreground process group, computed here (the
+        // one place that has both the reporter's pid and the pane's runtime)
+        // rather than inside TerminalState, which stays pure. Any missing
+        // piece - no agent_pid, no runtime, an unresolvable pid - yields
+        // `None`, which fails open to today's behavior.
+        let reporter_is_foreground = params.agent_pid.and_then(|pid| {
+            let shell_pid = self.lookup_runtime(ws_idx, pane_id)?.0.child_pid()?;
+            let fg = crate::detect::foreground_process_group_id(shell_pid)?;
+            let theirs = crate::detect::process_group_id(pid)?;
+            Some(fg == theirs)
+        });
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1621,6 +1633,8 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            reporter_is_foreground,
+            agent_session_cwd: params.agent_session_cwd,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());

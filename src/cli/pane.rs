@@ -1295,7 +1295,7 @@ fn split_resume_argv(args: &[String]) -> (&[String], Option<Vec<String>>) {
 }
 
 fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [-- <resume-command...>]";
+    const USAGE: &str = "usage: herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--session-start-source SOURCE] [--agent-pid PID] [--agent-session-cwd PATH] [-- <resume-command...>]";
 
     let (args, resume_argv) = split_resume_argv(args);
     let args = super::expand_equals_args(
@@ -1307,6 +1307,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
             "--agent-session-id",
             "--agent-session-path",
             "--session-start-source",
+            "--agent-pid",
+            "--agent-session-cwd",
         ],
     );
     let mut pane_id = None;
@@ -1316,6 +1318,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
     let mut agent_session_id = None;
     let mut agent_session_path = None;
     let mut session_start_source = None;
+    let mut agent_pid = None;
+    let mut agent_session_cwd = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -1368,6 +1372,22 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
                 session_start_source = Some(value.clone());
                 index += 2;
             }
+            "--agent-pid" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent-pid");
+                    return Ok(2);
+                };
+                agent_pid = Some(super::parse_u32_flag("--agent-pid", value)?);
+                index += 2;
+            }
+            "--agent-session-cwd" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --agent-session-cwd");
+                    return Ok(2);
+                };
+                agent_session_cwd = Some(value.clone());
+                index += 2;
+            }
             option if option.starts_with('-') => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -1409,6 +1429,8 @@ fn pane_report_agent_session(args: &[String]) -> std::io::Result<i32> {
             agent_session_path,
             session_start_source,
             resume_argv,
+            agent_pid,
+            agent_session_cwd,
         },
     ))
 }
@@ -1699,7 +1721,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
     eprintln!("  herdr pane wait-output <pane_id> (--match TEXT | --regex PATTERN) [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--raw]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-    eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
+    eprintln!("  herdr pane report-agent-session <pane_id> --source ID --agent LABEL [--seq N] [--agent-session-id ID] [--agent-session-path PATH] [--agent-pid PID] [--agent-session-cwd PATH]");
     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr pane run <pane_id> <command>");

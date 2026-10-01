@@ -1132,7 +1132,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 11);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1141,7 +1141,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(10));
+    assert_eq!(status.installed_version, Some(11));
     assert_eq!(status.state, IntegrationStatusKind::Current);
 
     std::env::remove_var("HOME");
@@ -1171,7 +1171,7 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 11);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -3192,6 +3192,35 @@ fn bundled_integration_asset_versions_match_expected_versions() {
             "{name} asset version must match its integration version constant"
         );
     }
+}
+
+// ADR-0002 (herdr-3ir, herdr-ct9): a regression guard against "the version
+// marker bumped but the field was never actually added" - cheap
+// string-presence checks, not a behavioral test of the hook. CLAUDE_HOOK_ASSET
+// is the `.sh` asset on Unix and the `.ps1` asset on Windows (`cfg!(windows)`
+// in `mod.rs`); the `.sh` builds a JSON params dict directly (`agent_pid`,
+// `agent_session_cwd`), while the `.ps1` shells out to the CLI with hyphenated
+// flags (`--agent-pid`, `--agent-session-cwd`) - either spelling satisfies the
+// check, since CI runs this on both `ubuntu-latest` and `windows-latest`.
+#[test]
+fn agent_restore_3ir_claude_hook_asset_reports_agent_pid() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("CLAUDE_PID"),
+        "the claude hook should read the reporter's own pid from $CLAUDE_PID"
+    );
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_pid") || CLAUDE_HOOK_ASSET.contains("agent-pid"),
+        "the claude hook should report the reporter's pid to pane.report_agent_session"
+    );
+}
+
+#[test]
+fn agent_restore_ct9_claude_hook_asset_reports_session_cwd() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_session_cwd")
+            || CLAUDE_HOOK_ASSET.contains("agent-session-cwd"),
+        "the claude hook should report the agent's own cwd to pane.report_agent_session"
+    );
 }
 
 #[test]

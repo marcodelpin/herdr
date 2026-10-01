@@ -512,13 +512,53 @@ fn restore_tab(
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
 
-        let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
-        if !has_import && !cwd.is_dir() {
+        // ADR-0002, herdr-ct9 (herdr-3ir/4r8/ct9 fix round, P1-b): a pane
+        // whose own persisted cwd was deleted or moved is not necessarily
+        // unrestorable - when it carries a resumable native agent session
+        // whose own reported cwd still exists, that admits it past the
+        // first availability gate below on the hypothesis that it will take
+        // the DEFERRED native-agent resume branch (which uses that agent
+        // cwd, via `agent_resume_cwd()`, once it actually starts). This is
+        // a *pure* re-derivation of `restore_plan_for_snapshot` - it never
+        // touches `resumed_agent_sessions`, so it cannot steal the dedupe
+        // reservation from a sibling pane that shares the same session id
+        // and does have a resumable plan; the real (mutating)
+        // `pane_restore_startup` call below is unchanged and still runs
+        // exactly once, at the same point in the same iteration order as
+        // before this fix. The pane that predicted the deferred branch but
+        // does not get it (loses the dedupe race) is caught by the second
+        // gate further down, right before it would otherwise spawn a plain
+        // shell into this directory instead of its own.
+        let agent_cwd_override = saved_agent_session
+            .filter(|session| {
+                restore_plan_for_snapshot(session, runtime_context.resume_agents_on_restore)
+                    .is_some()
+            })
+            .and_then(|session| session.agent_session_cwd.as_deref())
+            .map(PathBuf::from)
+            .filter(|agent_cwd| agent_cwd.is_dir());
+
+        // codex ar-r4 (P2 #1): `agent_cwd_override` only ADMITS a pane past
+        // this gate on the HYPOTHESIS that it will take the DEFERRED
+        // native-agent resume branch below, which spawns no shell now and
+        // uses `saved_cwd` directly (never the agent's directory). It must
+        // never become the directory an actual shell spawns into - that
+        // spawn always uses `saved_cwd`, checked again by the second gate
+        // right before the immediate-spawn path further down, once
+        // de-duplication is known. `restore_plan_for_snapshot` here is pure
+        // and pre-dates de-duplication, so two panes sharing one agent
+        // session can both see the override as available even though only
+        // one of them will actually get the deferred plan from the real
+        // (mutating) `pane_restore_startup` call below; the other is caught
+        // by that second gate instead of being permanently relocated into a
+        // directory that belongs to a different pane's agent.
+        if !has_import && !saved_cwd.is_dir() && agent_cwd_override.is_none() {
             let terminal = unavailable_restored_terminal(
                 saved_pane,
-                cwd,
+                saved_cwd,
                 "Saved directory is unavailable. Restore the directory and restart this session."
                     .into(),
             );
@@ -533,7 +573,6 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
-        let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -545,7 +584,7 @@ fn restore_tab(
             pane_restore_startup(
                 saved_agent_session,
                 saved_agent_resume,
-                &cwd,
+                &saved_cwd,
                 saved_history,
                 &mut agent_restore,
             )
@@ -586,7 +625,15 @@ fn restore_tab(
         };
         if let Some(plan) = pending_native_agent_restore {
             let terminal_id = TerminalId::alloc();
-            let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+            // codex ar-r3 (P2 #3): `saved_cwd`, NOT the availability-merged
+            // `cwd` - this terminal spawns no shell now, so `terminal.cwd`
+            // stays the pane's OWN directory. `agent_resume_cwd()` prefers
+            // the session's own cwd when the deferred resume actually
+            // starts and falls back to `terminal.cwd` otherwise; that
+            // fallback must be a DIFFERENT directory than the agent's, or
+            // the agent directory disappearing later leaves nothing to fall
+            // back to.
+            let mut terminal = TerminalState::new(terminal_id.clone(), saved_cwd.clone())
                 .with_pending_agent_resume_plan(plan);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
@@ -620,6 +667,28 @@ fn restore_tab(
             continue;
         }
 
+        // codex ar-r4 (P2 #1): this pane did not get the deferred
+        // native-agent resume - no session, resume disabled, or it lost the
+        // de-dupe race to a sibling pane restoring the same session id - and
+        // is about to become, or stay, a plain shell. A plain shell always
+        // spawns into the pane's OWN saved directory, never the agent's.
+        // `agent_cwd_override` above may have admitted this pane past the
+        // first gate purely on the hypothesis it would take the deferred
+        // branch; now that de-duplication is known and it did not, re-check
+        // `saved_cwd` on its own before the immediate-spawn path below ever
+        // reads it.
+        if !was_imported && !saved_cwd.is_dir() {
+            let terminal = unavailable_restored_terminal(
+                saved_pane,
+                saved_cwd,
+                "Saved directory is unavailable. Restore the directory and restart this session."
+                    .into(),
+            );
+            panes.insert(*id, PaneState::new(terminal.id.clone()));
+            terminals.push(terminal);
+            continue;
+        }
+
         #[cfg(not(unix))]
         if imported_runtime.is_some() {
             failed_imports += 1;
@@ -646,7 +715,7 @@ fn restore_tab(
                     *id,
                     rows,
                     cols,
-                    cwd.clone(),
+                    saved_cwd.clone(),
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,
@@ -665,7 +734,7 @@ fn restore_tab(
                     *id,
                     rows,
                     cols,
-                    cwd.clone(),
+                    saved_cwd.clone(),
                     runtime_context.scrollback_limit_bytes,
                     crate::terminal_theme::TerminalTheme::default(),
                     None,
@@ -682,7 +751,7 @@ fn restore_tab(
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                let mut terminal = TerminalState::new(terminal_id.clone(), saved_cwd.clone());
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -746,7 +815,7 @@ fn restore_tab(
                 );
                 if !was_imported {
                     let terminal = unavailable_restored_terminal(
-                        saved_pane, cwd,
+                        saved_pane, saved_cwd,
                         format!("Could not start the saved shell: {e}. Fix the shell configuration and restart this session."),
                     );
                     panes.insert(*id, PaneState::new(terminal.id.clone()));
@@ -895,6 +964,13 @@ fn persisted_agent_session_from_snapshot(
     )
 }
 
+/// ADR-0002, herdr-ct9 amendment: this used to have a sibling function,
+/// `restored_terminal_agent_session_cwd`, that independently re-derived the
+/// SAME `duplicate_agent_session` gate to decide whether the cwd survives
+/// restore - two copies of one rule that could (and did) drift apart. Now
+/// that `cwd` lives inside `PersistedAgentSession` itself, there is only one
+/// gate to get right: a duplicate session returns `None` here and there is
+/// no cwd left over to leak from a second function nobody re-checked.
 fn restored_terminal_agent_session(
     session: Option<&PaneAgentSessionSnapshot>,
     duplicate_agent_session: bool,
@@ -902,7 +978,9 @@ fn restored_terminal_agent_session(
     if duplicate_agent_session {
         return None;
     }
-    session.and_then(persisted_agent_session_from_snapshot)
+    let session = session?;
+    persisted_agent_session_from_snapshot(session)
+        .map(|persisted| persisted.with_cwd(session.agent_session_cwd.clone()))
 }
 
 #[cfg(test)]
@@ -1109,6 +1187,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            agent_session_cwd: None,
         };
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
@@ -1122,6 +1201,7 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            agent_session_cwd: None,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
     }
@@ -1134,6 +1214,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            agent_session_cwd: None,
         };
         let mut resumed = HashSet::new();
 
@@ -1156,6 +1237,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            agent_session_cwd: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1187,6 +1269,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            agent_session_cwd: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1227,6 +1310,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            agent_session_cwd: None,
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
             source: "herdr:pi".into(),
@@ -1300,6 +1384,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            agent_session_cwd: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1332,6 +1417,7 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            agent_session_cwd: None,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1348,6 +1434,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            agent_session_cwd: None,
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
@@ -1382,6 +1469,7 @@ mod tests {
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
+                agent_session_cwd: None,
             });
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
@@ -1471,6 +1559,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                agent_session_cwd: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -1521,6 +1610,474 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+        assert_eq!(
+            session.cwd, None,
+            "a snapshot without an agent_session_cwd should restore with none"
+        );
+    }
+
+    // herdr-ct9 (ADR-0002): a snapshot written before this field existed has
+    // no `agent_session_cwd` key at all in its JSON. `#[serde(default)]`
+    // must let it deserialize anyway, with the field defaulting to `None`,
+    // rather than fail the whole restore over one missing optional key.
+    #[test]
+    fn agent_restore_ct9_old_snapshot_without_cwd_field_still_loads() {
+        let json = r#"{
+            "source": "herdr:opencode",
+            "agent": "opencode",
+            "kind": "id",
+            "value": "opencode-session"
+        }"#;
+
+        let session: super::super::snapshot::PaneAgentSessionSnapshot =
+            serde_json::from_str(json).expect("a pre-ct9 snapshot must still deserialize");
+
+        assert_eq!(session.source, "herdr:opencode");
+        assert_eq!(session.value, "opencode-session");
+        assert_eq!(session.agent_session_cwd, None);
+    }
+
+    #[tokio::test]
+    async fn agent_restore_ct9_restore_carries_agent_session_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let agent_cwd = cwd.join("agent-subdir");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "claude-session".into(),
+                                agent_session_cwd: Some(agent_cwd.display().to_string()),
+                            }),
+                            launch_argv: None,
+                            agent_resume: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some(agent_cwd.display().to_string().as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P1-b: a cold restore whose PANE cwd was
+    // deleted or moved must still resume the agent when the agent's own
+    // reported cwd exists and resume is enabled - the availability check at
+    // the top of the pane loop must not reject the pane before
+    // `pending_native_agent_restore` is even considered.
+    #[tokio::test]
+    async fn agent_restore_p1b_cold_restore_with_missing_pane_cwd_resumes_via_agent_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let missing_pane_cwd = cwd.join("__herdr_p1b_missing_pane_cwd__");
+        assert!(!missing_pane_cwd.exists());
+        let agent_cwd = cwd.join("__herdr_p1b_agent_cwd__");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: missing_pane_cwd.clone(),
+                            label: Some("keep my pane".into()),
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "p1b-claude-session".into(),
+                                agent_session_cwd: Some(agent_cwd.display().to_string()),
+                            }),
+                            launch_argv: None,
+                            agent_resume: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert!(
+            terminal.restore_error.is_none(),
+            "an existing agent cwd must satisfy the availability check, got: {:?}",
+            terminal.restore_error
+        );
+        // ADR-0002 amendment, codex ar-r3 (P2 #3): `terminal.cwd` stays the
+        // pane's OWN saved cwd (even though it does not currently exist) -
+        // NOT overwritten with the agent's cwd. Overwriting it here was the
+        // original P1-b behavior, and it is exactly what let a LATER removal
+        // of the agent directory take the pane's own cwd down with it (the
+        // deferred resume's fallback landed on the same missing directory
+        // instead of a genuinely different one). Which directory the
+        // deferred resume actually launches into is decided at launch time
+        // by `agent_resume_cwd()` (see its own unit tests in
+        // `app/agent_resume.rs`), reading the cwd off the persisted session
+        // below - never off this field.
+        assert_eq!(
+            terminal.cwd, missing_pane_cwd,
+            "the pane's own saved cwd must be preserved as-is, distinct from the agent's cwd"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some(agent_cwd.display().to_string().as_str())
+        );
+        assert!(
+            terminal.pending_agent_resume_plan.is_some(),
+            "resume must still be pending - the bug this test guards against skipped it entirely"
+        );
+        assert_eq!(terminal.manual_label.as_deref(), Some("keep my pane"));
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        assert!(
+            runtimes.get(&terminal.id).is_none(),
+            "a pending native resume must not spawn a plain shell yet"
+        );
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    // ADR-0002 amendment, codex ar-r3 (P2 #3): the mirror of the P1-b test
+    // above - BOTH the pane's own cwd and the agent's reported cwd exist at
+    // restore time. Before the amendment, `restore_tab` folded them into one
+    // `cwd` value and used it for `terminal.cwd`, so the pane's own
+    // directory was never recorded anywhere once the agent directory looked
+    // available too. If that agent directory is later removed - restore
+    // finished, the deferred resume has not fired yet, e.g. while awaiting
+    // client attachment - the "fallback" in `agent_resume_cwd()` landed on
+    // the SAME now-missing directory, and the resume that should have used
+    // the pane's still-good cwd reported "Saved directory is unavailable"
+    // instead. `terminal.cwd` must stay the pane's own directory through
+    // restore, so the fallback is still able to succeed afterward.
+    #[tokio::test]
+    async fn agent_restore_p2_amendment_removed_agent_dir_falls_back_to_pane_cwd_after_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let pane_cwd = cwd.join("__herdr_p2_pane_cwd_survives__");
+        std::fs::create_dir_all(&pane_cwd).unwrap();
+        let agent_cwd = cwd.join("__herdr_p2_agent_cwd_removed_later__");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: pane_cwd.clone(),
+                            label: Some("both dirs present".into()),
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:claude".into(),
+                                agent: "claude".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "p2-claude-session".into(),
+                                agent_session_cwd: Some(agent_cwd.display().to_string()),
+                            }),
+                            launch_argv: None,
+                            agent_resume: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert!(
+            terminal.restore_error.is_none(),
+            "both directories exist, restore must not report unavailable"
+        );
+        assert_eq!(
+            terminal.cwd, pane_cwd,
+            "the pane's own cwd must be preserved even though the agent cwd also exists"
+        );
+        assert!(terminal.pending_agent_resume_plan.is_some());
+
+        // The agent directory disappears AFTER restore, before the deferred
+        // resume fires.
+        std::fs::remove_dir_all(&agent_cwd).unwrap();
+
+        assert_eq!(
+            crate::app::agent_resume::agent_resume_cwd(terminal),
+            pane_cwd,
+            "with the agent cwd gone, the deferred resume must fall back to the pane's OWN cwd, \
+             not to the same directory that just vanished"
+        );
+
+        let _ = std::fs::remove_dir_all(&pane_cwd);
+    }
+
+    // codex ar-r4 (P2 #1): two saved panes reference the SAME resumable
+    // agent session. Only the first one (by restore iteration order, which
+    // follows the layout tree depth-first) gets the deferred resume plan;
+    // de-duplication in `pane_restore_startup` turns the second into a
+    // plain shell. Before this fix, `agent_cwd_override` was computed
+    // per-pane from the *pure* `restore_plan_for_snapshot` (which does not
+    // know about de-duplication), so the second pane's `cwd` was merged
+    // with the shared agent directory and it permanently became a plain
+    // shell rooted in the AGENT's directory instead of its own saved one.
+    #[tokio::test]
+    async fn agent_restore_duplicate_session_plain_shell_keeps_its_own_pane_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let agent_cwd = cwd.join("__herdr_dup_agent_cwd__");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let pane_a_cwd = cwd.join("__herdr_dup_pane_a_cwd__");
+        std::fs::create_dir_all(&pane_a_cwd).unwrap();
+        let pane_b_cwd = cwd.join("__herdr_dup_pane_b_cwd__");
+        std::fs::create_dir_all(&pane_b_cwd).unwrap();
+
+        let shared_session =
+            |cwd_field: &std::path::Path| super::super::snapshot::PaneAgentSessionSnapshot {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "dup-claude-session".into(),
+                agent_session_cwd: Some(cwd_field.display().to_string()),
+            };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(10)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([
+                        (
+                            10,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: pane_a_cwd.clone(),
+                                label: Some("first, keeps the session".into()),
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: Some(shared_session(&agent_cwd)),
+                                launch_argv: None,
+                                agent_resume: None,
+                            },
+                        ),
+                        (
+                            20,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: pane_b_cwd.clone(),
+                                label: Some("second, loses the dedupe race".into()),
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: Some(shared_session(&agent_cwd)),
+                                launch_argv: None,
+                                agent_resume: None,
+                            },
+                        ),
+                    ]),
+                    zoomed: false,
+                    focused: Some(10),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let first = terminals
+            .values()
+            .find(|t| t.manual_label.as_deref() == Some("first, keeps the session"))
+            .expect("first pane should restore");
+        assert!(
+            first.pending_agent_resume_plan.is_some(),
+            "the first pane must win the de-dupe race and keep the deferred resume"
+        );
+        assert_eq!(first.cwd, pane_a_cwd);
+
+        let second = terminals
+            .values()
+            .find(|t| t.manual_label.as_deref() == Some("second, loses the dedupe race"))
+            .expect("second pane should restore");
+        assert!(
+            second.pending_agent_resume_plan.is_none(),
+            "the second pane is a duplicate and must become a plain shell now"
+        );
+        assert!(
+            second.restore_error.is_none(),
+            "the second pane's own directory exists, it must not read as unavailable, got: {:?}",
+            second.restore_error
+        );
+        assert_eq!(
+            second.cwd, pane_b_cwd,
+            "a duplicate that falls back to a plain shell must spawn into its OWN saved cwd, \
+             never into the shared agent directory another pane is resuming into"
+        );
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        assert!(
+            runtimes.get(&second.id).is_some(),
+            "the duplicate must actually spawn a shell, not stay pending or unavailable"
+        );
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
+        let _ = std::fs::remove_dir_all(&pane_a_cwd);
+        let _ = std::fs::remove_dir_all(&pane_b_cwd);
     }
 
     #[tokio::test]
@@ -1635,6 +2192,7 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                agent_session_cwd: None,
             }),
             agent_resume: None,
             launch_argv: None,
@@ -1787,6 +2345,7 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                agent_session_cwd: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -1891,6 +2450,7 @@ mod tests {
                     "/var/tmp/handoff-test.jsonl",
                 )
                 .unwrap(),
+                cwd: None,
             });
             terminal.set_hook_authority_with_session_ref(
                 "herdr:pi".into(),

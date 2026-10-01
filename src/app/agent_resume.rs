@@ -14,6 +14,26 @@ struct PendingAgentResumeCandidate {
     cols: u16,
 }
 
+/// ADR-0002, herdr-ct9: prefer the agent's own reported cwd over the pane's
+/// shell cwd for a deferred resume, when it names a directory that still
+/// exists - a claude tab whose shell sits in one project while its agent
+/// works in another otherwise comes back in the wrong folder, or (if the
+/// shell's own folder was moved or retired) in a discard directory neither
+/// side ever meant. Falls back to the pane's shell cwd exactly as before
+/// this fix whenever no agent cwd was reported or it no longer resolves -
+/// the existing "Saved directory is unavailable" handling in
+/// `start_pending_agent_resume` is unchanged either way.
+pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {
+    terminal
+        .persisted_agent_session
+        .as_ref()
+        .and_then(|session| session.cwd.as_deref())
+        .map(std::path::Path::new)
+        .filter(|cwd| cwd.is_dir())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| terminal.cwd.clone())
+}
+
 impl App {
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
@@ -128,7 +148,7 @@ impl App {
                     pending.push(PendingAgentResumeCandidate {
                         pane_id: info.id,
                         terminal_id: pane.attached_terminal_id.clone(),
-                        cwd: terminal.cwd.clone(),
+                        cwd: agent_resume_cwd(terminal),
                         plan,
                         rows: info.inner_rect.height,
                         cols: info.inner_rect.width,
@@ -196,7 +216,7 @@ impl App {
                     let terminal = self.state.terminals.get(terminal_id)?;
                     Some((
                         pane_id,
-                        terminal.cwd.clone(),
+                        agent_resume_cwd(terminal),
                         terminal.pending_agent_resume_plan.clone()?,
                     ))
                 })
@@ -270,6 +290,45 @@ impl App {
                 terminal.revision = terminal.revision.saturating_add(1);
             }
             return true;
+        }
+
+        // ADR-0002, herdr-4r8: refuse to resume onto a claude session id
+        // that some other live process already has open (measured: two
+        // separate interactive `claude` processes ended up attached to the
+        // same session through exactly this path). Scoped to
+        // ("herdr:claude", "claude") - the one agent this ADR's registry
+        // scan and its liveness marker were built and verified against; a
+        // registry miss, a non-claude plan, or any I/O failure inside the
+        // scan all fail open to today's unconditional resume.
+        if plan.agent == "claude" {
+            let target_id = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+                .filter(|session| {
+                    session.source == "herdr:claude"
+                        && session.agent == "claude"
+                        && session.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id
+                })
+                .map(|session| session.session_ref.value.clone());
+            if let Some(target_id) = target_id {
+                if let Some(holder) = crate::agent_session_registry::find_live_holder(&target_id) {
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.pending_agent_resume_plan = None;
+                        terminal.restore_error = Some(format!(
+                            "This conversation is already open in another running Claude session (pid {}{}). Close it and restart this session.",
+                            holder.pid,
+                            holder
+                                .cwd
+                                .map(|cwd| format!(", {cwd}"))
+                                .unwrap_or_default(),
+                        ));
+                        terminal.revision = terminal.revision.saturating_add(1);
+                    }
+                    return true;
+                }
+            }
         }
 
         let runtime = match crate::terminal::TerminalRuntime::spawn(
@@ -550,6 +609,266 @@ mod tests {
         ]
     }
 
+    // herdr-ct9 (ADR-0002): `agent_resume_cwd` is a pure function of the
+    // terminal's reported agent cwd and its pane cwd - no App/runtime
+    // fixture needed to exercise it.
+
+    #[test]
+    fn agent_restore_ct9_resume_uses_agent_cwd_when_it_exists() {
+        let pane_cwd = std::env::current_dir().unwrap();
+        let agent_cwd = pane_cwd.join("__herdr_ct9_agent_cwd_exists__");
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+
+        let mut terminal =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), pane_cwd);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("ct9-test-session").unwrap(),
+            cwd: Some(agent_cwd.display().to_string()),
+        });
+
+        assert_eq!(agent_resume_cwd(&terminal), agent_cwd);
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    #[test]
+    fn agent_restore_ct9_resume_falls_back_to_pane_cwd_when_agent_cwd_missing_or_not_dir() {
+        let pane_cwd = std::env::current_dir().unwrap();
+
+        let mut terminal = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            pane_cwd.clone(),
+        );
+        assert_eq!(
+            agent_resume_cwd(&terminal),
+            pane_cwd,
+            "no agent cwd was ever reported"
+        );
+
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("ct9-test-session-2").unwrap(),
+            cwd: Some(
+                pane_cwd
+                    .join("__herdr_ct9_agent_cwd_does_not_exist__")
+                    .display()
+                    .to_string(),
+            ),
+        });
+        assert_eq!(
+            agent_resume_cwd(&terminal),
+            pane_cwd,
+            "a reported agent cwd that no longer resolves must fall back to the pane cwd"
+        );
+    }
+
+    // herdr-4r8 (ADR-0002): a deferred claude resume must not spawn onto a
+    // session id another live process already has open. These tests write
+    // a real Claude Code session-registry fixture under an overridden
+    // CLAUDE_CONFIG_DIR and use this test process's own pid as the "live"
+    // holder - it is guaranteed alive and its start marker is stable for
+    // the test's whole lifetime, on every platform this module's crate
+    // tests run on (ubuntu-latest, windows-latest).
+
+    struct ClaudeRegistryFixture {
+        dir: std::path::PathBuf,
+        _lock: crate::integration::IntegrationEnvLock,
+    }
+
+    impl ClaudeRegistryFixture {
+        fn new(label: &str) -> Self {
+            let lock = crate::integration::integration_env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-agent-restore-4r8-test-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            std::env::set_var(crate::integration::CLAUDE_CONFIG_DIR_ENV_VAR, &dir);
+            Self { dir, _lock: lock }
+        }
+
+        /// Registers this test PROCESS's own pid as the live holder of
+        /// `session_id` - real, alive, and its start marker is a genuine
+        /// reading from this platform's own primitive.
+        fn register_self_as_live_holder(&self, session_id: &str) {
+            let pid = std::process::id();
+            let marker = crate::platform::process_start_marker(pid);
+            let json = format!(
+                r#"{{"sessionId":"{session_id}","procStart":{marker},"procStartFt":{marker}}}"#,
+                marker = marker.unwrap_or(0)
+            );
+            std::fs::write(self.dir.join("sessions").join(format!("{pid}.json")), json).unwrap();
+        }
+    }
+
+    impl Drop for ClaudeRegistryFixture {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::integration::CLAUDE_CONFIG_DIR_ENV_VAR);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_4r8_deferred_resume_onto_live_elsewhere_session_sets_restore_error_and_keeps_session(
+    ) {
+        let fixture = ClaudeRegistryFixture::new("live-elsewhere");
+        fixture.register_self_as_live_holder("claude-live-session");
+
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("claude-live-elsewhere");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-live-session").unwrap(),
+            cwd: None,
+        };
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(session.clone());
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: long_running_test_argv(),
+            dedupe_key: "claude-live-session".into(),
+        });
+
+        app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_none(),
+            "must not spawn a second writer onto a session another live process holds"
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert_eq!(
+            terminal.persisted_agent_session.as_ref(),
+            Some(&session),
+            "the session reference must survive so a later restart or manual retry can resume it"
+        );
+        let pid = std::process::id().to_string();
+        assert!(
+            terminal
+                .restore_error
+                .as_deref()
+                .is_some_and(|err| err.contains(&pid)),
+            "restore_error should name the pid already holding the session, got {:?}",
+            terminal.restore_error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_4r8_deferred_resume_onto_not_live_session_spawns_normally() {
+        // pid 0 is never a real process on any platform this crate targets
+        // (`process_exists` special-cases it on Linux; Windows cannot open
+        // a handle to it either) - a portable, deterministic "dead pid".
+        let fixture = ClaudeRegistryFixture::new("not-live");
+        std::fs::write(
+            fixture.dir.join("sessions").join("0.json"),
+            r#"{"sessionId":"claude-stale-session","procStart":1}"#,
+        )
+        .unwrap();
+
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("claude-not-live");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-stale-session").unwrap(),
+            cwd: None,
+        });
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: long_running_test_argv(),
+            dedupe_key: "claude-stale-session".into(),
+        });
+
+        app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "a registry entry for a dead pid must not block the resume"
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.restore_error.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // Mutant killer for "the 4r8 scoping is load-bearing, not decorative":
+    // the gate reads `plan.agent == "claude"` (cheap outer check) AND filters
+    // the target id on `session.source == "herdr:claude" && session.agent ==
+    // "claude"` (the actual scoping - `plan` and `terminal.persisted_agent_session`
+    // are two different pieces of state and are not guaranteed to agree). A
+    // claude PLAN whose terminal happens to carry a stale non-claude
+    // persisted session must not have that session's id looked up in the
+    // (claude-only) registry just because the plan says "claude" - if the
+    // source/agent filter were widened to accept any session kind==Id, this
+    // mismatched session would incorrectly get blocked by a live fixture
+    // that has nothing to do with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_4r8_scoping_is_limited_to_claude_sessions() {
+        let fixture = ClaudeRegistryFixture::new("scoping");
+        fixture.register_self_as_live_holder("mismatched-session-that-collides");
+
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("mismatched-session");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:mastracode".into(),
+            agent: "mastracode".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id(
+                "mismatched-session-that-collides",
+            )
+            .unwrap(),
+            cwd: None,
+        });
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: long_running_test_argv(),
+            dedupe_key: "mismatched-session-that-collides".into(),
+        });
+
+        app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "a persisted session that is not herdr:claude/claude must never be looked up in the claude live-elsewhere registry"
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.restore_error.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
@@ -575,6 +894,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("resume-test").unwrap(),
+                cwd: None,
             };
             terminal.persisted_agent_session = Some(session.clone());
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {

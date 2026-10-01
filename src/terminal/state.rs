@@ -106,6 +106,17 @@ pub(crate) struct TerminalTitleChange {
 pub struct TerminalStateMutation {
     pub effective_state_change: Option<EffectiveStateChange>,
     pub session_ref_changed: bool,
+    /// ADR-0002, herdr-ct9 (P2-d): whether the persisted agent session's
+    /// `cwd` itself changed on this call, independent of
+    /// `session_ref_changed`. The two can disagree - a v10 -> v11 hook
+    /// upgrade can report the SAME session id (identity unchanged) with a
+    /// cwd for the first time - and only the site that actually writes
+    /// `TerminalState::persisted_agent_session`
+    /// (`set_agent_session_ref_for_session_start_with_reporter`) ever sets
+    /// this to anything but `false`. The caller must OR it into its own
+    /// persistence-dirty decision alongside `session_ref_changed`, or a
+    /// cwd-only update never gets saved.
+    pub persisted_agent_session_cwd_changed: bool,
     pub agent_released: bool,
 }
 
@@ -136,6 +147,11 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    /// The agent's own reported cwd (herdr-ct9) travels INSIDE this value's
+    /// `cwd` field, not as a sibling `TerminalState` field - see the doc
+    /// comment on `agent_resume::PersistedAgentSession` for why. `None`
+    /// when the current session was never reported with a cwd (old client,
+    /// managed launch, or a restore whose snapshot predates this field).
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
@@ -403,6 +419,7 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                persisted_agent_session_cwd_changed: false,
                 agent_released: false,
             };
         }
@@ -422,6 +439,7 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
+                persisted_agent_session_cwd_changed: false,
                 agent_released: false,
             };
         }
@@ -622,6 +640,7 @@ impl TerminalState {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         session_ref: session_ref.clone(),
+                        cwd: None,
                     }
                 })
             });
@@ -653,6 +672,7 @@ impl TerminalState {
             effective_state_change,
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed: false,
             agent_released,
         }
     }
@@ -751,8 +771,14 @@ impl TerminalState {
             ) {
                 session_ref
             } else {
-                self.conflicting_same_owner_session_ref(&source, &agent_label, &session_ref, None)
-                    .unwrap_or(session_ref)
+                self.conflicting_same_owner_session_ref(
+                    &source,
+                    &agent_label,
+                    &session_ref,
+                    None,
+                    None,
+                )
+                .unwrap_or(session_ref)
             }
         });
         if self.live_full_lifecycle_hook_authority_conflicts_with_session(
@@ -814,6 +840,7 @@ impl TerminalState {
         Some(TerminalStateMutation {
             effective_state_change,
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed: false,
             agent_released: false,
         })
     }
@@ -1229,10 +1256,22 @@ impl TerminalState {
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+            // codex ar-r3 (P2 #2): this INSTALLS a session for whichever
+            // agent was just (re)detected, unconditionally replacing
+            // whatever `persisted_agent_session` held before - which, before
+            // ADR-0002's amendment, could be a DIFFERENT agent's session
+            // still carrying the sibling `persisted_agent_session_cwd`
+            // field, silently pairing that stale cwd with this new session.
+            // Embedding `cwd` in the session value itself (rather than a
+            // field this constructor has no reason to know about) makes
+            // that impossible: this buffered/replayed report never carried
+            // a cwd of its own, so `None` here is not an omission, it is
+            // the only value the type lets it be.
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
                 agent: agent_label,
                 session_ref,
+                cwd: None,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
@@ -1341,6 +1380,7 @@ impl TerminalState {
         agent_label: &str,
         session_ref: &crate::agent_resume::AgentSessionRef,
         session_start_source: Option<&str>,
+        reporter_is_foreground: Option<bool>,
     ) -> Option<crate::agent_resume::AgentSessionRef> {
         self.current_session_identity_for_persistence().and_then(
             |(current_source, current_agent, current_kind, current_value)| {
@@ -1353,6 +1393,7 @@ impl TerminalState {
                         source,
                         agent_label,
                         session_start_source,
+                        reporter_is_foreground,
                     ))
                 .then_some(crate::agent_resume::AgentSessionRef {
                     kind: current_kind,
@@ -1382,11 +1423,48 @@ impl TerminalState {
                 })
     }
 
+    /// herdr-3ir: whether the reporter is known NOT to be the pane's
+    /// foreground process group for a `herdr:claude` report - the report
+    /// came from a nested, non-interactive worker (e.g. a headless
+    /// `claude -p` run from inside the pane's own Bash tool), not the
+    /// session the operator is looking at. `reporter_is_foreground` is
+    /// computed by the caller from the reporter's own pid (ADR-0002);
+    /// `None` (old client, Windows, or a vanished pid) fails open to
+    /// today's behavior.
+    ///
+    /// Extracted to a single named predicate (P2-c, herdr-3ir/4r8/ct9 fix
+    /// round) so `session_report_allows_session_replacement` below and the
+    /// pre-seq-watermark gate in
+    /// `set_agent_session_ref_for_session_start_with_reporter` share ONE
+    /// implementation rather than two independently-maintained copies of
+    /// the same rule - a duplicate would let one drift from the other, and
+    /// would make a mutation to either copy alone fail to prove the OTHER
+    /// is load-bearing.
+    fn claude_report_rejected_for_non_foreground_reporter(
+        source: &str,
+        agent_label: &str,
+        reporter_is_foreground: Option<bool>,
+    ) -> bool {
+        (source, agent_label) == ("herdr:claude", "claude") && reporter_is_foreground == Some(false)
+    }
+
+    /// herdr-3ir: a `herdr:claude` report that would replace the pane's
+    /// persisted session is refused when the reporter is known NOT to be the
+    /// pane's foreground process group - see
+    /// `claude_report_rejected_for_non_foreground_reporter` above.
     fn session_report_allows_session_replacement(
         source: &str,
         agent_label: &str,
         session_start_source: Option<&str>,
+        reporter_is_foreground: Option<bool>,
     ) -> bool {
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            source,
+            agent_label,
+            reporter_is_foreground,
+        ) {
+            return false;
+        }
         matches!(
             (source, agent_label, session_start_source),
             (
@@ -1433,6 +1511,10 @@ impl TerminalState {
             == ("herdr:opencode", "opencode", Some("select"), None)
     }
 
+    /// The one setter for `persisted_agent_session` - `session.cwd` already
+    /// carries whatever cwd (if any) belongs to it (ADR-0002, herdr-ct9
+    /// amendment), so there is nothing left for a caller to pass or forget
+    /// separately.
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
@@ -1440,10 +1522,15 @@ impl TerminalState {
         self.persisted_agent_session = Some(session);
     }
 
+    /// A managed launch (herdr itself starting a NEW agent process, not
+    /// resuming one) never carries a resume cwd of its own - force it to
+    /// `None` regardless of what the caller passed, so `persisted_agent_session`
+    /// and `managed_agent_launch_session` cannot silently disagree.
     pub fn set_managed_agent_launch_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        let session = session.with_cwd(None);
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
     }
@@ -1465,6 +1552,35 @@ impl TerminalState {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         session_start_source: Option<String>,
+    ) -> Option<TerminalStateMutation> {
+        self.set_agent_session_ref_for_session_start_with_reporter(
+            source,
+            agent_label,
+            session_ref,
+            seq,
+            session_start_source,
+            None,
+            None,
+        )
+    }
+
+    /// Same contract as `set_agent_session_ref_for_session_start`, plus the
+    /// two ADR-0002 inputs a plain hook/CLI report never carries:
+    /// `reporter_is_foreground` (herdr-3ir - `None` fails open exactly like
+    /// the 5-arg form above) and `agent_session_cwd` (herdr-ct9 - persisted
+    /// alongside the session ref whenever this call actually replaces it).
+    /// This is the variant the real `pane.report_agent_session` API path
+    /// calls; the 5-arg form stays the stable entry point every existing
+    /// caller (tests included) already uses.
+    pub fn set_agent_session_ref_for_session_start_with_reporter(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+        reporter_is_foreground: Option<bool>,
+        agent_session_cwd: Option<String>,
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
@@ -1583,9 +1699,50 @@ impl TerminalState {
                         now,
                     ),
                     session_ref_changed: previous_session != current_session,
+                    persisted_agent_session_cwd_changed: false,
                     agent_released: false,
                 });
             }
+            return None;
+        }
+        // P2-c (herdr-3ir/4r8/ct9 fix round, ADR-0002 amendment): checked
+        // BEFORE the seq freshness check below and before ANY state
+        // mutation, so a report the herdr-3ir foreground gate is about to
+        // reject never advances the per-source seq watermark and never
+        // touches the session ref or its cwd - unconditionally, regardless
+        // of whether this report's session id happens to match the pane's
+        // current one.
+        //
+        // codex ar-r3 (P2 #1): the ORIGINAL fix here only rejected when the
+        // reported session id DIFFERED from the pane's current one
+        // (`same_owner_session_ref_differs`), on the theory that a same-id
+        // report changes nothing worth blocking. That missed the cwd: a
+        // nested `claude -p --resume <same-id>` worker started in a
+        // DIFFERENT directory still reaches this function with the SAME
+        // session id and its OWN `agent_session_cwd`, and the pre-amendment
+        // code fell through to the unconditional
+        // `self.persisted_agent_session_cwd = agent_session_cwd` assignment
+        // further down, silently overwriting the interactive pane's cwd
+        // with the worker's. Rejecting the WHOLE report - identity and cwd
+        // together - closes that hole; there is no case where a
+        // non-foreground `herdr:claude` reporter should be allowed to move
+        // either.
+        //
+        // Shares `claude_report_rejected_for_non_foreground_reporter` with
+        // `session_report_allows_session_replacement` below (ONE predicate,
+        // not two), so this is the EXACT clause that can make THIS report
+        // the reason for its own rejection - every OTHER rejection reason
+        // (in particular an unrecognized `session_start_source` on a
+        // same-owner, differing-value report) is unchanged and still
+        // advances the watermark via the normal `accept_hook_report` call
+        // right below; see
+        // `different_same_agent_session_ref_is_ignored_until_current_session_clears`,
+        // which depends on exactly that and would otherwise regress.
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            &source,
+            &agent_label,
+            reporter_is_foreground,
+        ) {
             return None;
         }
         if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
@@ -1598,6 +1755,7 @@ impl TerminalState {
             &source,
             &agent_label,
             session_start_source.as_deref(),
+            reporter_is_foreground,
         );
         let replacing_identity_only_session =
             crate::detect::session_identity_only_integration(&source, &agent_label)
@@ -1631,6 +1789,7 @@ impl TerminalState {
                 &agent_label,
                 &session_ref,
                 session_start_source.as_deref(),
+                reporter_is_foreground,
             )
             .is_some()
         {
@@ -1651,6 +1810,13 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        // P2-d: captured so the mutation can report a cwd-only change even
+        // when the session identity itself did not move (see the new field's
+        // doc comment on `TerminalStateMutation`).
+        let previous_persisted_agent_session_cwd = self
+            .persisted_agent_session
+            .as_ref()
+            .and_then(|session| session.cwd.clone());
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -1668,12 +1834,20 @@ impl TerminalState {
             self.hook_authority = None;
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+        // ADR-0002, herdr-ct9 amendment: `cwd` travels IN the session value
+        // itself, set in the SAME assignment as the rest of its identity -
+        // there is no separate field left to forget.
         let persisted_session = crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
             session_ref,
+            cwd: agent_session_cwd,
         };
-        if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
+        if self
+            .managed_agent_launch_session
+            .as_ref()
+            .is_some_and(|launch_session| launch_session.same_identity(&persisted_session))
+        {
             self.managed_agent_launch_session = None;
         }
         self.persisted_agent_session = Some(persisted_session);
@@ -1682,6 +1856,12 @@ impl TerminalState {
             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
             self.agent_process_acquisition_pending = true;
         }
+        let current_persisted_agent_session_cwd = self
+            .persisted_agent_session
+            .as_ref()
+            .and_then(|session| session.cwd.clone());
+        let persisted_agent_session_cwd_changed =
+            previous_persisted_agent_session_cwd != current_persisted_agent_session_cwd;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1691,6 +1871,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed,
             agent_released: false,
         })
     }
@@ -1804,6 +1985,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session.is_some(),
+            persisted_agent_session_cwd_changed: false,
             agent_released: false,
         })
     }
@@ -1870,6 +2052,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed: false,
             agent_released: !process_owns_agent,
         })
     }
@@ -1914,6 +2097,7 @@ impl TerminalState {
                 now,
             ),
             session_ref_changed: previous_session != current_session,
+            persisted_agent_session_cwd_changed: false,
             agent_released: true,
         })
     }
@@ -2315,7 +2499,11 @@ impl TerminalState {
             .managed_agent_launch_session
             .take()
             .as_ref()
-            .is_some_and(|session| self.persisted_agent_session.as_ref() == Some(session))
+            .is_some_and(|session| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .is_some_and(|current| current.same_identity(session))
+            })
         {
             self.persisted_agent_session = None;
         }
@@ -2458,6 +2646,443 @@ mod tests {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
     }
 
+    // herdr-3ir (ADR-0002): a `herdr:claude` report that would replace the
+    // pane's persisted session is refused when the reporter is known not to
+    // be the pane's foreground process group. `reporter_is_foreground` is
+    // computed by the API layer from the reporter's own pid, never inside
+    // `TerminalState` itself - these tests pass it in directly.
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_pane_foreground_replaces_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a foreground reporter's resume report should replace the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // This is the measured incident: a nested `claude -p` worker (a
+        // child in its own process group) fires the same SessionStart hook
+        // and reports its own headless session id with session_start_source
+        // "resume". It must not overwrite the pane's interactive session.
+        let mutation = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(21),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+
+        assert!(
+            mutation.is_none(),
+            "a nested worker's resume report must not replace the pane's session"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_without_agent_pid_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // The 5-arg entry point every existing caller uses (an old client
+        // with no pid plumbing, or any non-claude report) has no reporter
+        // identity to give at all - it must keep replacing the session
+        // exactly as before this fix.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+            )
+            .expect("a report with no reporter pid should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_reporter_pid_unresolvable_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // The caller sent an agent_pid, but resolving it (or the pane's own
+        // foreground group) failed - e.g. the pid raced and exited between
+        // the report and the lookup, or this build is Windows. The API
+        // layer reduces that to `None`, same as no pid at all: fail open.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                None,
+                None,
+            )
+            .expect("an unresolvable reporter should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-c: a report REJECTED by the
+    // herdr-3ir foreground gate must not commit its seq to the per-source
+    // watermark - otherwise its (higher) seq can starve a legitimate,
+    // lower-seq report that was simply delayed and arrives afterwards.
+    #[test]
+    fn agent_restore_p2c_rejected_report_does_not_starve_a_later_lower_seq_foreground_report() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // A non-foreground (nested worker) report arrives FIRST, with a
+        // HIGHER seq than the legitimate foreground report still in flight,
+        // and is correctly rejected by the herdr-3ir gate.
+        let rejected = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(201),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+        assert!(
+            rejected.is_none(),
+            "the non-foreground report must still be rejected"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session"),
+            "a rejected report must not replace the session"
+        );
+
+        // The legitimate foreground report, delayed, arrives afterwards with
+        // a LOWER seq than the report just rejected. Before this fix, the
+        // rejected report's seq=201 was already committed to the watermark
+        // (accept_hook_report ran before the foreground gate), so this
+        // seq=200 report would fail the staleness check (200 <= 201) and be
+        // silently dropped - exactly the failure this test guards against.
+        let accepted = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("foreground-session"),
+                Some(200),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a rejected report must not consume the seq a later legitimate report needs");
+
+        assert!(accepted.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("foreground-session")
+        );
+    }
+
+    // ADR-0002 amendment, codex ar-r3 P2 #1: a NESTED, non-foreground
+    // `claude -p --resume <same-id>` worker reports the pane's OWN session
+    // id (not a different one) from a DIFFERENT cwd. Before the amendment
+    // the herdr-3ir gate only rejected when the reported id DIFFERED from
+    // the pane's current one, so this exact report fell through, advanced
+    // the seq watermark, and overwrote the interactive session's cwd with
+    // the worker's - even though the session "didn't change". The gate must
+    // reject the WHOLE report, cwd included, and must not touch the
+    // watermark either, so a delayed lower-seq foreground report (e.g. a
+    // `/clear`) still lands.
+    #[test]
+    fn agent_restore_p2c_amendment_same_id_non_foreground_report_leaves_cwd_and_watermark_unchanged(
+    ) {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+
+        // Same session id as the pane's own, higher seq, but from a nested
+        // non-foreground worker reporting a DIFFERENT cwd.
+        let rejected = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("interactive-session"),
+            Some(301),
+            Some("resume".into()),
+            Some(false),
+            Some("/worker-cwd".into()),
+        );
+        assert!(
+            rejected.is_none(),
+            "a same-id report from a non-foreground reporter must still be rejected"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/project-a"),
+            "the rejected report must not move the cwd, even though the session id matched"
+        );
+
+        // A delayed, legitimate foreground report (e.g. `/clear`) with a
+        // LOWER seq than the rejected one must still be accepted - proving
+        // the rejected report never touched the watermark.
+        let accepted = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("cleared-session"),
+                Some(300),
+                Some("clear".into()),
+                Some(true),
+                Some("/project-a".into()),
+            )
+            .expect("a same-id rejection must not consume the seq a later legitimate report needs");
+        assert!(accepted.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("cleared-session")
+        );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-d: the SAME session id is reported
+    // again, this time carrying a cwd for the first time (the shape of a
+    // v10 -> v11 hook upgrade's first post-upgrade report). The session
+    // identity does not change, but the cwd does, and the mutation must say
+    // so through its OWN field rather than only through `session_ref_changed`.
+    #[test]
+    fn agent_restore_p2d_cwd_only_change_sets_its_own_changed_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
+        });
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone()),
+            None
+        );
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("a same-identity report with a new cwd must still be accepted");
+
+        assert!(
+            !mutation.session_ref_changed,
+            "the session identity did not change"
+        );
+        assert!(
+            mutation.persisted_agent_session_cwd_changed,
+            "the cwd DID change and must be reported so a caller can persist it"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/work/project")
+        );
+    }
+
+    // The mirror: neither the identity nor the cwd changes - both flags stay
+    // false, so an unrelated re-report of unchanged state never marks the
+    // session dirty.
+    #[test]
+    fn agent_restore_p2d_unchanged_cwd_does_not_set_the_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/work/project".into()),
+        });
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("an unchanged report should still be accepted");
+
+        assert!(!mutation.session_ref_changed);
+        assert!(!mutation.persisted_agent_session_cwd_changed);
+    }
+
+    // ADR-0002 amendment, codex ar-r3 P2 #2: Claude reports a session with a
+    // cwd, then exits; Mastracode's OWN SessionStart hook had ALREADY fired
+    // (a common race - the hook can run before herdr's screen detection
+    // confirms the new agent), so its session sat buffered as a
+    // `replacement_session_ref` while Claude was still nominally detected.
+    // Once Mastracode is detected on screen, the buffered report is
+    // installed via `clear_full_lifecycle_hook_suppression_for_detected_agent`
+    // - which, before the amendment, replaced `persisted_agent_session`
+    // (Claude's, already cleared to `None` by its own exit) but left the
+    // SIBLING `persisted_agent_session_cwd` field untouched, so Claude's
+    // "/project-a" silently became Mastracode's cwd. With `cwd` embedded in
+    // the session value there is no sibling field left to forget: the new
+    // session must have `cwd: None`, and a snapshot capture taken afterward
+    // must carry none either.
+    #[test]
+    fn agent_restore_p2_amendment_cwd_does_not_survive_a_session_replaced_by_another_agents_startup(
+    ) {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+
+        // Mastracode's own hook fires while Claude is still the detected
+        // agent - buffered, not yet active.
+        let buffered = terminal.set_agent_session_ref_for_session_start(
+            "herdr:mastracode".into(),
+            "mastracode".into(),
+            crate::agent_resume::AgentSessionRef::id("mastracode-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            buffered.is_none(),
+            "mastracode's session should not activate before its process is detected"
+        );
+
+        // Claude exits - clears `persisted_agent_session` (its session AND,
+        // now that it lives inside the same value, its cwd).
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert!(terminal.persisted_agent_session.is_none());
+
+        // Mastracode is detected on screen - installs its buffered session.
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Mastracode),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            Instant::now(),
+        );
+
+        let session = terminal
+            .persisted_agent_session
+            .as_ref()
+            .expect("mastracode's buffered session should now be installed");
+        assert_eq!(session.source, "herdr:mastracode");
+        assert_eq!(session.session_ref.value, "mastracode-session");
+        assert_eq!(
+            session.cwd, None,
+            "claude's stale cwd must not have survived onto mastracode's session"
+        );
+    }
+
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
             .unwrap()
@@ -2478,6 +3103,7 @@ mod tests {
             source: source.into(),
             agent: agent_label.into(),
             session_ref,
+            cwd: None,
         });
     }
 
@@ -2598,6 +3224,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
@@ -3022,6 +3649,7 @@ mod tests {
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(old_session)
                 .expect("test session path should be valid"),
+            cwd: None,
         });
 
         let startup = terminal.set_agent_session_ref_for_session_start(
@@ -5445,6 +6073,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Grok), AgentState::Idle);
 
@@ -5475,6 +6104,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                cwd: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5511,6 +6141,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                cwd: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5546,6 +6177,7 @@ mod tests {
                     source: "herdr:codex".into(),
                     agent: "codex".into(),
                     session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                    cwd: None,
                 });
                 terminal.set_detected_state(detected_agent, AgentState::Idle);
 
@@ -5580,6 +6212,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -6089,6 +6722,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            cwd: None,
         });
 
         let mutation = terminal
@@ -6107,6 +6741,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
 
@@ -6134,6 +6769,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: session_ref.clone(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6167,6 +6803,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6199,6 +6836,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
@@ -6308,6 +6946,7 @@ mod tests {
             source: "herdr:opencode".into(),
             agent: "opencode".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+            cwd: None,
         });
 
         let first =
@@ -6327,6 +6966,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            cwd: None,
         });
 
         let mutation = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);

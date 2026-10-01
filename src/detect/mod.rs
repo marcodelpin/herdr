@@ -371,6 +371,13 @@ pub fn pane_shell_is_idle(child_pid: u32) -> bool {
     crate::platform::available_pane_shell(child_pid).is_some()
 }
 
+/// Get the process group `pid` itself belongs to (ADR-0002, herdr-3ir) -
+/// not the foreground group of a controlling terminal, which is what
+/// `foreground_process_group_id` above answers.
+pub fn process_group_id(pid: u32) -> Option<u32> {
+    crate::platform::process_group_id(pid)
+}
+
 fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> String {
     let effective = process.argv0.as_deref().unwrap_or(&process.name);
     let lower_effective = effective.to_lowercase();
