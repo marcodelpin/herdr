@@ -709,7 +709,10 @@ session). Both are optional and additive. The server uses `agent_pid` to
 refuse a same-owner session replacement when the reporter is not the pane's
 foreground process group, and `agent_session_cwd` as the preferred cwd for a
 later deferred resume of that session, when it still names a directory that
-exists.
+exists. A report refused because its reporter is not the foreground process
+group changes nothing, so a `resume_argv` it carries is ignored too. A
+reported `resume_argv` runs in that same agent cwd when it exists, and
+de-duplication across panes uses the directory the command runs in.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` expose a read-only `agent_session` object when Herdr has a stored native session reference:
 
