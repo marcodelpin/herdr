@@ -8,7 +8,7 @@ name: Fork agents header counts (47w)
 
 on:
   push:
-    branches: [fix/agents-header-counts]
+    branches: [fix/agents-header-counts, fix/adopt-0.9.3]
 
 permissions:
   contents: read

@@ -78,7 +78,7 @@ name: Fork agent restore (3ir/4r8/ct9)
 
 on:
   push:
-    branches: [fix/3ir-4r8-ct9-agent-restore]
+    branches: [fix/3ir-4r8-ct9-agent-restore, fix/adopt-0.9.3]
 
 permissions:
   contents: read
