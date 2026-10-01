@@ -143,8 +143,10 @@ jobs:
       # end-to-end tests through the real platform predicates (agent_session_registry.rs). The three
       # App-level herdr-4r8 tests spawn a real /bin/sh pty and are #[cfg(unix)] only; the eight ar-r5
       # tests are all #[cfg(target_os = "linux")] (three of them only via platform/linux.rs itself
-      # being Linux-only - real zombie/liveness detection is a documented no-op on macOS/Windows), so
-      # Windows carries those 3 + 8 = 11 fewer: 43 on Linux/macOS-shaped Unix, 32 on Windows. The
+      # being Linux-only - real zombie/liveness detection is a documented no-op on macOS/Windows), plus
+      # herdr-nrr (port onto upstream #4687): one App-level 3ir test that a refused report does not
+      # record its resume_argv (spawns a real /bin/sh pty, #[cfg(unix)]), so
+      # Windows carries those 4 + 8 = 12 fewer: 44 on Linux/macOS-shaped Unix, 32 on Windows. The
       # count check fails the job if the filter matches fewer (or more) than expected, so a green run
       # that skipped, or silently gained, one of them is red. (ar-r4's P2 #3 fingerprint fix has its
       # own regression test,
@@ -162,7 +164,7 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             expected=32
           else
-            expected=43
+            expected=44
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -281,7 +283,58 @@ jobs:
             exit 1
           fi
           grep -q "FAIL.*agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected" mutant.log || { echo "expected the non-foreground rejection test to FAIL"; exit 1; }
-          echo "mutant killed: the rejection test failed with the guard deleted"
+          grep -q "FAIL.*agent_restore_3ir_refused_report_does_not_record_its_resume_argv" mutant.log || { echo "expected the resume_argv refusal test to FAIL"; exit 1; }
+          echo "mutant killed: the rejection tests failed with the guard deleted"
+
+  agent-restore-3ir-resume-argv-mutant:
+    # herdr-nrr: upstream #4687 records a report's resume_argv when the report's session is
+    # current. The 3ir gate refuses a non-foreground herdr:claude report before any state change,
+    # but a refused report naming the ALREADY-current session still passes #4687's
+    # session_report_applied, so the API handler also consults the gate. Dropping that one term
+    # must turn the resume_argv refusal test red.
+    name: mutant - the 3ir gate must also refuse the #4687 resume_argv
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Drop the gate term from the resume_argv decision and require the refusal test to fail
+        run: |
+          sed -i 's/&& !refused_by_foreground_gate/\/* MUTANT 3ir resume_argv gate dropped *\//' src/app/api/panes.rs
+          landed=$(grep -c 'MUTANT 3ir resume_argv gate dropped' src/app/api/panes.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_3ir_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every 3ir test passed with the resume_argv gate term dropped"
+            exit 1
+          fi
+          grep -q "FAIL.*agent_restore_3ir_refused_report_does_not_record_its_resume_argv" mutant.log || { echo "expected the resume_argv refusal test to FAIL"; exit 1; }
+          echo "mutant killed: the resume_argv refusal test failed with the gate term dropped"
 
   agent-restore-4r8-scoping-mutant:
     # herdr-4r8's live-elsewhere check must be scoped to ("herdr:claude", "claude") sessions only -

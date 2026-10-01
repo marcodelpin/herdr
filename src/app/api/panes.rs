@@ -1636,8 +1636,20 @@ impl App {
             reporter_is_foreground,
             agent_session_cwd: params.agent_session_cwd,
         });
-        let applied =
-            report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        // herdr-nrr (ADR-0002 on top of #4687): a report the 3ir foreground
+        // gate refuses changes no state, so the resume_argv it carries is
+        // refused with it. `session_report_applied` alone does not cover
+        // this: a refused report naming the session that is ALREADY current
+        // would pass it, record the command and advance the watermark.
+        let refused_by_foreground_gate =
+            crate::terminal::TerminalState::claude_report_rejected_for_non_foreground_reporter(
+                &params.source,
+                &agent_label,
+                reporter_is_foreground,
+            );
+        let applied = report_is_newer
+            && !refused_by_foreground_gate
+            && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
             id,
             ws_idx,

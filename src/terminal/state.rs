@@ -1440,7 +1440,7 @@ impl TerminalState {
     /// the same rule - a duplicate would let one drift from the other, and
     /// would make a mutation to either copy alone fail to prove the OTHER
     /// is load-bearing.
-    fn claude_report_rejected_for_non_foreground_reporter(
+    pub(crate) fn claude_report_rejected_for_non_foreground_reporter(
         source: &str,
         agent_label: &str,
         reporter_is_foreground: Option<bool>,
