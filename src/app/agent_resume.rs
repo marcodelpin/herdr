@@ -34,6 +34,39 @@ pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std
         .unwrap_or_else(|| terminal.cwd.clone())
 }
 
+/// herdr-nrr (codex nrr-r1 P1 + P2): a reported resume command (upstream
+/// #4687) runs ONLY in the directory it was reserved for at restore time.
+/// `agent --continue` names no session of its own - it resumes whatever is
+/// latest in its working directory - so the same argv in another directory
+/// is another conversation: one the herdr-4r8 live-holder gate (which checks
+/// the saved session id) never looked at, and one restore de-duplication
+/// never reserved. When the launch directory differs from the reserved one
+/// (the agent cwd vanished between restore and launch, or reappeared), the
+/// saved session id's native plan is used instead: it names its session, so
+/// 4r8 checks the identity actually resumed and two panes can no longer land
+/// on the same conversation. With no usable session id the resume is
+/// skipped (`Err` returns the dropped plan for the log line). A native plan
+/// (`launch_dir == None`) passes through unchanged.
+fn deferred_resume_plan_in(
+    terminal: &crate::terminal::TerminalState,
+    plan: crate::agent_resume::AgentResumePlan,
+    cwd: &std::path::Path,
+) -> Result<crate::agent_resume::AgentResumePlan, crate::agent_resume::AgentResumePlan> {
+    match plan.launch_dir.as_deref() {
+        None => return Ok(plan),
+        Some(reserved) if reserved == cwd => return Ok(plan),
+        Some(_) => {}
+    }
+    terminal
+        .persisted_agent_session
+        .as_ref()
+        .filter(|session| session.agent == plan.agent)
+        .and_then(|session| {
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+        })
+        .ok_or(plan)
+}
+
 impl App {
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
@@ -257,6 +290,45 @@ impl App {
         if host_terminal_theme.is_empty() && !allow_empty_theme {
             return false;
         }
+
+        // herdr-nrr: a reported resume command runs only in the directory
+        // its dedupe key reserved. See `deferred_resume_plan_in`.
+        let reserved_dir = plan.launch_dir.clone();
+        let resolved = match self.state.terminals.get(&terminal_id) {
+            Some(terminal) => deferred_resume_plan_in(terminal, plan, &cwd),
+            None => Ok(plan),
+        };
+        let plan = match resolved {
+            Ok(plan) => {
+                if plan.launch_dir.is_none() && reserved_dir.is_some() {
+                    tracing::info!(
+                        pane = pane_id.raw(),
+                        terminal = %terminal_id,
+                        agent = %plan.agent,
+                        reserved_dir = ?reserved_dir,
+                        cwd = %cwd.display(),
+                        "reported resume command's directory changed; resuming the saved session id instead"
+                    );
+                }
+                plan
+            }
+            Err(plan) => {
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    reserved_dir = ?reserved_dir,
+                    cwd = %cwd.display(),
+                    "skipping deferred agent resume: the reported resume command's directory changed and no saved session id names the session"
+                );
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.pending_agent_resume_plan = None;
+                    terminal.restore_error = Some("The saved resume command belongs to a directory that is no longer available. Restore the directory and restart this session.".into());
+                    terminal.revision = terminal.revision.saturating_add(1);
+                }
+                return true;
+            }
+        };
 
         let launcher = self.state.agent_launchers.get(&plan.agent);
         if launcher_has_control_character(launcher) {
@@ -545,6 +617,7 @@ mod tests {
                     agent: "codex".into(),
                     argv: vec!["codex".into()],
                     dedupe_key: terminal.id.to_string(),
+                    launch_dir: None,
                 });
             }
             let now = Instant::now();
@@ -741,6 +814,7 @@ mod tests {
             agent: "claude".into(),
             argv: long_running_test_argv(),
             dedupe_key: "claude-live-session".into(),
+            launch_dir: None,
         });
 
         app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
@@ -798,6 +872,7 @@ mod tests {
             agent: "claude".into(),
             argv: long_running_test_argv(),
             dedupe_key: "claude-stale-session".into(),
+            launch_dir: None,
         });
 
         app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
@@ -853,6 +928,7 @@ mod tests {
             agent: "claude".into(),
             argv: long_running_test_argv(),
             dedupe_key: "mismatched-session-that-collides".into(),
+            launch_dir: None,
         });
 
         app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
@@ -897,6 +973,7 @@ mod tests {
             agent: "claude".into(),
             argv: long_running_test_argv(),
             dedupe_key: "claude-3ir-resume-argv".into(),
+            launch_dir: None,
         });
         app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
         assert!(
@@ -1010,6 +1087,7 @@ mod tests {
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: "resume-test".into(),
+                launch_dir: None,
             });
             app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
             assert!(app.terminal_runtimes.get(&terminal_id).is_none());
@@ -1046,6 +1124,7 @@ mod tests {
             agent: "codex".into(),
             argv: marker_resume_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            launch_dir: None,
         });
 
         assert!(!app.start_pending_agent_resumes(Instant::now(), false));
@@ -1192,6 +1271,7 @@ mod tests {
             agent: "claude".into(),
             argv: launcher_argv,
             dedupe_key: "herdr:claude\0claude\0Id\0launcher-test-session".into(),
+            launch_dir: None,
         });
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
             foreground: Some(crate::terminal_theme::RgbColor {
@@ -1253,6 +1333,7 @@ mod tests {
             agent: "claude".into(),
             argv: launcher_target_check_argv(a, b, tag),
             dedupe_key: "herdr:claude\0claude\0Id\0stock-test-session".into(),
+            launch_dir: None,
         });
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
             foreground: Some(crate::terminal_theme::RgbColor {
@@ -1307,6 +1388,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            launch_dir: None,
         });
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
@@ -1358,6 +1440,7 @@ mod tests {
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: format!("herdr:codex\0codex\0Id\0{terminal_id}"),
+                launch_dir: None,
             });
         }
         app.pending_agent_resume_deadline =
@@ -1428,6 +1511,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
+            launch_dir: None,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));
@@ -1489,6 +1573,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
+            launch_dir: None,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));
@@ -1547,6 +1632,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            launch_dir: None,
         });
 
         app.sync_pending_agent_resume_deadline(std::time::Instant::now());
@@ -1608,6 +1694,7 @@ mod tests {
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            launch_dir: None,
         });
 
         assert!(app.start_pending_agent_resumes(Instant::now(), false));
