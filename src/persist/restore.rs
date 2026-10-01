@@ -888,7 +888,7 @@ fn pane_restore_startup<'a>(
     let restore_plan = if !agent_restore.enabled {
         None
     } else if let Some(resume) = reported_resume {
-        Some(reported_resume_from_snapshot(resume).plan(cwd))
+        Some(reported_resume_from_snapshot(resume).plan(&reported_resume_dir(session, cwd)))
     } else {
         session.and_then(|session| restore_plan_for_snapshot(session, true))
     };
@@ -924,6 +924,25 @@ fn pane_restore_startup<'a>(
         duplicate_agent_session,
         reserved_agent_session,
     }
+}
+
+/// herdr-nrr (ADR-0002 ported onto upstream #4687): the directory a reported
+/// resume command will run in. #4687 makes the directory part of the
+/// command's dedupe identity, because `agent --continue` names a different
+/// session in a different directory. herdr-ct9 launches the deferred resume
+/// in the session's own agent cwd when it still exists (`agent_resume_cwd()`
+/// at launch time), so the identity must use that same directory: two panes
+/// whose shells sit in different folders but whose agent ran in the same one
+/// would otherwise both pass de-duplication and both run `--continue` there.
+fn reported_resume_dir(
+    session: Option<&PaneAgentSessionSnapshot>,
+    pane_cwd: &std::path::Path,
+) -> PathBuf {
+    session
+        .and_then(|session| session.agent_session_cwd.as_deref())
+        .map(PathBuf::from)
+        .filter(|agent_cwd| agent_cwd.is_dir())
+        .unwrap_or_else(|| pane_cwd.to_path_buf())
 }
 
 fn saved_reported_resume(pane: &super::snapshot::PaneSnapshot) -> Option<&PaneAgentResumeSnapshot> {
@@ -1375,6 +1394,89 @@ mod tests {
         );
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
+    }
+
+    // herdr-nrr (ADR-0002 ported onto upstream #4687): a reported resume
+    // command is de-duplicated on the directory it will actually run in. Two
+    // panes whose shells sit in different folders but whose claude ran in
+    // the same project both report `claude --continue`; herdr-ct9 launches
+    // both in that project, so only the first may get the plan. When the
+    // agent cwd no longer exists, the command runs in each pane's own cwd
+    // and both keep their plans, as upstream does.
+    #[test]
+    fn agent_restore_ct9_reported_resume_dedupes_on_the_dir_it_runs_in() {
+        let agent_cwd = std::env::temp_dir().join(format!(
+            "herdr-nrr-reported-resume-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let session = |id: &str, agent_cwd: &std::path::Path| {
+            super::super::snapshot::PaneAgentSessionSnapshot {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: id.into(),
+                agent_session_cwd: Some(agent_cwd.display().to_string()),
+            }
+        };
+        let resume = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--continue".into()],
+        };
+        let pane_a = std::path::Path::new("/pane-a");
+        let pane_b = std::path::Path::new("/pane-b");
+
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let first = pane_restore_startup(
+            Some(&session("session-a", &agent_cwd)),
+            Some(&resume),
+            pane_a,
+            None,
+            &mut agent_restore,
+        );
+        assert_eq!(first.restore_plan.unwrap().argv, resume.argv);
+        let second = pane_restore_startup(
+            Some(&session("session-b", &agent_cwd)),
+            Some(&resume),
+            pane_b,
+            None,
+            &mut agent_restore,
+        );
+        assert!(
+            second.restore_plan.is_none() && second.duplicate_agent_session,
+            "both commands run in the same agent cwd, so the second is a duplicate"
+        );
+
+        let missing_agent_cwd = agent_cwd.join("gone");
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        for pane in [pane_a, pane_b] {
+            let startup = pane_restore_startup(
+                Some(&session("session-a", &missing_agent_cwd)),
+                Some(&resume),
+                pane,
+                None,
+                &mut agent_restore,
+            );
+            assert!(
+                startup.restore_plan.is_some(),
+                "without the agent cwd each command runs in its own pane cwd"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&agent_cwd);
     }
 
     #[test]
