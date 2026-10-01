@@ -1055,6 +1055,159 @@ mod tests {
         }
     }
 
+    // herdr-nrr (codex nrr-r1): a reported resume command runs only in the
+    // directory its dedupe key reserved at restore time. These tests route
+    // the typed command through an `agent_launchers` recorder script that
+    // appends "<physical cwd>|<args>" to a log, so they observe exactly which
+    // command ran in which directory - no real agent binary needed.
+    #[cfg(unix)]
+    struct NrrLaunchRecorder {
+        root: std::path::PathBuf,
+        log: std::path::PathBuf,
+        launcher: String,
+    }
+
+    #[cfg(unix)]
+    impl NrrLaunchRecorder {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "herdr-nrr-launch-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            let log = root.join("launches.log");
+            let script = root.join("record.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "printf '%s|%s\\n' \"$(pwd -P)\" \"$*\" >> '{}'\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            let launcher = format!("/bin/sh {}", script.display());
+            Self {
+                root,
+                log,
+                launcher,
+            }
+        }
+
+        fn dir(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        async fn wait_for_launches(&self, count: usize) -> Vec<String> {
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let lines: Vec<String> = std::fs::read_to_string(&self.log)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                if lines.len() >= count || Instant::now() >= deadline {
+                    return lines;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for NrrLaunchRecorder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn nrr_reported_continue_plan(
+        reserved_dir: &std::path::Path,
+    ) -> crate::agent_resume::AgentResumePlan {
+        crate::agent_resume::ReportedAgentResume {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--continue".into()],
+        }
+        .plan(reserved_dir)
+    }
+
+    #[cfg(unix)]
+    fn nrr_claude_session(
+        id: &str,
+        agent_cwd: &std::path::Path,
+    ) -> crate::agent_resume::PersistedAgentSession {
+        crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id(id).unwrap(),
+            cwd: Some(agent_cwd.display().to_string()),
+        }
+    }
+
+    // codex nrr-r1 P1: session A is persisted with the reported command
+    // `claude --continue`, reserved for A's agent dir X. X disappears before
+    // the deferred launch, so the launch dir falls back to the pane dir P,
+    // whose latest conversation is B - held by a live process. 4r8 checks A
+    // (not held), so typing `--continue` in P would attach a second writer to
+    // B. The launch must resume A by id instead, and never type `--continue`
+    // outside X.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_nrr_reported_continue_does_not_resume_a_live_session_after_agent_cwd_vanished(
+    ) {
+        let fixture = ClaudeRegistryFixture::new("nrr-p1");
+        fixture.register_self_as_live_holder("nrr-session-b");
+        let recorder = NrrLaunchRecorder::new("p1");
+        let pane_dir = recorder.dir("pane-p");
+        let agent_dir = recorder.dir("agent-x");
+
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("nrr-p1");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state
+            .agent_launchers
+            .insert("claude".into(), recorder.launcher.clone());
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.cwd = pane_dir.clone();
+        terminal.persisted_agent_session = Some(nrr_claude_session("nrr-session-a", &agent_dir));
+        terminal.pending_agent_resume_plan = Some(nrr_reported_continue_plan(&agent_dir));
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        assert_eq!(
+            agent_resume_cwd(&app.state.terminals[&terminal_id]),
+            pane_dir
+        );
+
+        app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "session A is held by nobody, so its resume must still start"
+        );
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!("{}|--resume nrr-session-a", pane_dir.display())],
+            "the pane must resume the saved session A by id, never `--continue` onto P's live conversation B"
+        );
+        assert!(app.state.terminals[&terminal_id].restore_error.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
