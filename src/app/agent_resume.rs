@@ -1207,7 +1207,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         let runtime = app
             .terminal_runtimes
             .get(&terminal_id)
@@ -1268,7 +1268,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(app.start_pending_agent_resumes(false));
+        assert!(app.start_pending_agent_resumes(Instant::now(), false));
         let runtime = app
             .terminal_runtimes
             .get(&terminal_id)
