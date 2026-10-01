@@ -146,8 +146,10 @@ jobs:
       # being Linux-only - real zombie/liveness detection is a documented no-op on macOS/Windows), plus
       # herdr-nrr (port onto upstream #4687): one App-level 3ir test that a refused report does not
       # record its resume_argv (spawns a real /bin/sh pty, #[cfg(unix)]) and one pure ct9 test that
-      # a reported resume dedupes on the agent cwd it runs in (all platforms), so
-      # Windows carries those 4 + 8 = 12 fewer: 45 on Linux/macOS-shaped Unix, 33 on Windows. The
+      # a reported resume dedupes on the agent cwd it runs in (all platforms), plus the codex nrr-r1
+      # fix round: two App-level nrr tests that a reported resume command runs only in the directory
+      # it was reserved for (P1 live-session, P2 shared-pane-dir; real /bin/sh pty, #[cfg(unix)]), so
+      # Windows carries those 6 + 8 = 14 fewer: 47 on Linux/macOS-shaped Unix, 33 on Windows. The
       # count check fails the job if the filter matches fewer (or more) than expected, so a green run
       # that skipped, or silently gained, one of them is red. (ar-r4's P2 #3 fingerprint fix has its
       # own regression test,
@@ -165,7 +167,7 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             expected=33
           else
-            expected=45
+            expected=47
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -384,6 +386,60 @@ jobs:
           fi
           grep -q "FAIL.*agent_restore_ct9_reported_resume_dedupes_on_the_dir_it_runs_in" mutant.log || { echo "expected the dedupe test to FAIL"; exit 1; }
           echo "mutant killed: the dedupe test failed with the pane cwd as the dedupe directory"
+
+  agent-restore-nrr-launch-dir-mutant:
+    # herdr-nrr (codex nrr-r1 P1 + P2): a reported resume command (`claude --continue`) runs only in
+    # the directory restore reserved it for; when the launch directory differs, the saved session
+    # id's native plan runs instead. Letting the reported command run in any directory must turn
+    # both scenario tests red: P1 types `--continue` onto the pane dir's live conversation, P2 types
+    # it twice in the same pane dir.
+    name: mutant - a reported resume command runs only in its reserved directory
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Let the reported command run in any directory and require both nrr tests to fail
+        run: |
+          sed -i 's/Some(reserved) if reserved == cwd =>/Some(reserved) if reserved == cwd || true \/* MUTANT nrr launch dir *\/ =>/' src/app/agent_resume.rs
+          landed=$(grep -c 'MUTANT nrr launch dir' src/app/agent_resume.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_nrr_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every nrr test passed with the reported command run outside its reserved directory"
+            exit 1
+          fi
+          for test in \
+            agent_restore_nrr_reported_continue_does_not_resume_a_live_session_after_agent_cwd_vanished \
+            agent_restore_nrr_reported_continue_reservations_hold_when_agent_cwds_vanish_before_launch; do
+            grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
+          done
+          echo "mutant killed: both nrr scenario tests failed with the launch-dir guard disabled"
 
   agent-restore-4r8-scoping-mutant:
     # herdr-4r8's live-elsewhere check must be scoped to ("herdr:claude", "claude") sessions only -
@@ -907,6 +963,9 @@ jobs:
         agent-restore-ar4-p2-2-zombie-liveness-mutant,
         agent-restore-ar5-thread-group-check-mutant,
         agent-restore-ar4-p2-3-fingerprint-strip-mutant,
+        agent-restore-3ir-resume-argv-mutant,
+        agent-restore-ct9-reported-resume-dir-mutant,
+        agent-restore-nrr-launch-dir-mutant,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 90

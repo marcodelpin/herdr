@@ -1208,6 +1208,84 @@ mod tests {
         }
     }
 
+    // codex nrr-r1 P2: two panes share pane dir P and report `claude
+    // --continue` from distinct agent dirs X and Y, so restore reserves two
+    // different dedupe keys and keeps both plans. X and Y disappear before
+    // the deferred launch; both would fall back to P and resume P's same
+    // latest conversation twice. At most one `--continue` may run in P.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_nrr_reported_continue_reservations_hold_when_agent_cwds_vanish_before_launch(
+    ) {
+        let _fixture = ClaudeRegistryFixture::new("nrr-p2");
+        let recorder = NrrLaunchRecorder::new("p2");
+        let pane_dir = recorder.dir("pane-p");
+        let agent_dirs = [recorder.dir("agent-x"), recorder.dir("agent-y")];
+
+        let mut app = test_app();
+        app.state.workspaces = (0..2)
+            .map(|_| crate::workspace::Workspace::test_new("nrr-p2"))
+            .collect();
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state
+            .agent_launchers
+            .insert("claude".into(), recorder.launcher.clone());
+        let terminal_ids: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.terminal_id(ws.tabs[0].root_pane).unwrap().clone())
+            .collect();
+        let mut dedupe_keys = std::collections::HashSet::new();
+        for ((terminal_id, agent_dir), session_id) in terminal_ids
+            .iter()
+            .zip(&agent_dirs)
+            .zip(["nrr-session-x", "nrr-session-y"])
+        {
+            let plan = nrr_reported_continue_plan(agent_dir);
+            assert!(
+                dedupe_keys.insert(plan.dedupe_key.clone()),
+                "restore reserves a distinct key per agent dir, so both plans survive de-duplication"
+            );
+            let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+            terminal.cwd = pane_dir.clone();
+            terminal.persisted_agent_session = Some(nrr_claude_session(session_id, agent_dir));
+            terminal.pending_agent_resume_plan = Some(plan);
+        }
+
+        for agent_dir in &agent_dirs {
+            std::fs::remove_dir_all(agent_dir).unwrap();
+        }
+        for terminal_id in &terminal_ids {
+            app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+            assert!(app.terminal_runtimes.get(terminal_id).is_some());
+        }
+
+        let mut launches = recorder.wait_for_launches(2).await;
+        launches.sort();
+        let continues_in_pane_dir = launches
+            .iter()
+            .filter(|line| *line == &format!("{}|--continue", pane_dir.display()))
+            .count();
+        assert!(
+            continues_in_pane_dir <= 1,
+            "two panes must not both resume P's latest conversation, launches: {launches:?}"
+        );
+        assert_eq!(
+            launches,
+            vec![
+                format!("{}|--resume nrr-session-x", pane_dir.display()),
+                format!("{}|--resume nrr-session-y", pane_dir.display()),
+            ],
+            "each pane resumes its own saved session by id"
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
