@@ -887,7 +887,9 @@ fn pane_restore_startup<'a>(
     // duplicate suppressed by session de-duplication.
     let restore_plan = if !agent_restore.enabled {
         None
-    } else if let Some(resume) = reported_resume {
+    } else if let Some(resume) =
+        reported_resume.filter(|resume| !reported_resume_excluded(session, resume))
+    {
         Some(reported_resume_from_snapshot(resume).plan(&reported_resume_dir(session, cwd)))
     } else {
         session.and_then(|session| restore_plan_for_snapshot(session, true))
@@ -924,6 +926,30 @@ fn pane_restore_startup<'a>(
         duplicate_agent_session,
         reserved_agent_session,
     }
+}
+
+/// herdr-nrr round 3 (operator decision 2026-10-01, after codex nrr-r2): claude
+/// never resumes through a reported resume command (upstream #4687), only
+/// through the native plan built from its persisted session id
+/// (`claude --resume <id>`). A reported command such as `claude --continue`
+/// names no session: it resumes whatever conversation is latest in the
+/// directory it lands in, so the herdr-3ir, herdr-4r8 and herdr-ct9 gates
+/// (which all reason about the persisted session id) would check one identity
+/// while another one is resumed, and restore de-duplication would key on a
+/// directory instead of on the session. Two review rounds found two such
+/// gaps (a directory gone before cold restore; two panes saving the same id
+/// with reported commands reserved for different directories); excluding
+/// claude removes the whole class instead of patching cases. With no usable
+/// persisted id a claude pane gets no resume, as natively. Other agents keep
+/// upstream behaviour; the launch-dir gate in `app/agent_resume.rs` still
+/// protects them.
+fn reported_resume_excluded(
+    session: Option<&PaneAgentSessionSnapshot>,
+    resume: &PaneAgentResumeSnapshot,
+) -> bool {
+    let is_claude = |source: &str, agent: &str| source == "herdr:claude" || agent == "claude";
+    is_claude(&resume.source, &resume.agent)
+        || session.is_some_and(|session| is_claude(&session.source, &session.agent))
 }
 
 /// herdr-nrr (ADR-0002 ported onto upstream #4687): the directory a reported
@@ -1398,11 +1424,12 @@ mod tests {
 
     // herdr-nrr (ADR-0002 ported onto upstream #4687): a reported resume
     // command is de-duplicated on the directory it will actually run in. Two
-    // panes whose shells sit in different folders but whose claude ran in
-    // the same project both report `claude --continue`; herdr-ct9 launches
+    // panes whose shells sit in different folders but whose agent ran in the
+    // same project both report `codex resume --last`; herdr-ct9 launches
     // both in that project, so only the first may get the plan. When the
     // agent cwd no longer exists, the command runs in each pane's own cwd
-    // and both keep their plans, as upstream does.
+    // and both keep their plans, as upstream does. (codex, not claude: since
+    // nrr round 3 claude never takes the reported-command path.)
     #[test]
     fn agent_restore_ct9_reported_resume_dedupes_on_the_dir_it_runs_in() {
         let agent_cwd = std::env::temp_dir().join(format!(
@@ -1416,17 +1443,17 @@ mod tests {
         std::fs::create_dir_all(&agent_cwd).unwrap();
         let session = |id: &str, agent_cwd: &std::path::Path| {
             super::super::snapshot::PaneAgentSessionSnapshot {
-                source: "herdr:claude".into(),
-                agent: "claude".into(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: id.into(),
                 agent_session_cwd: Some(agent_cwd.display().to_string()),
             }
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
-            source: "herdr:claude".into(),
-            agent: "claude".into(),
-            argv: vec!["claude".into(), "--continue".into()],
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
         };
         let pane_a = std::path::Path::new("/pane-a");
         let pane_b = std::path::Path::new("/pane-b");
@@ -1477,6 +1504,178 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    fn nrr_r3_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-nrr-r3-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn nrr_r3_claude_session(
+        id: &str,
+        agent_cwd: &std::path::Path,
+    ) -> super::super::snapshot::PaneAgentSessionSnapshot {
+        super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: id.into(),
+            agent_session_cwd: Some(agent_cwd.display().to_string()),
+        }
+    }
+
+    fn nrr_r3_claude_continue() -> super::super::snapshot::PaneAgentResumeSnapshot {
+        super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--continue".into()],
+        }
+    }
+
+    // herdr-nrr round 3 (codex nrr-r2 P1): a claude pane persisted session A
+    // and a reported `claude --continue`. Whether its agent dir still exists
+    // or was already gone before cold restore, the plan resumes A by id -
+    // the identity 3ir/4r8/ct9 check - and never types `--continue`, which
+    // would resume whatever is latest in the directory it lands in. With no
+    // persisted id there is no resume at all.
+    #[test]
+    fn agent_restore_nrr_claude_resumes_its_persisted_id_never_a_reported_continue() {
+        let root = nrr_r3_temp_dir("p1");
+        let agent_dir = root.join("agent-x");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let missing_agent_dir = root.join("gone");
+        let pane_dir = root.join("pane-p");
+        let resume = nrr_r3_claude_continue();
+
+        for agent_cwd in [&agent_dir, &missing_agent_dir] {
+            let mut resumed = HashSet::new();
+            let mut agent_restore = AgentRestoreState {
+                enabled: true,
+                resumed_sessions: &mut resumed,
+            };
+            let startup = pane_restore_startup(
+                Some(&nrr_r3_claude_session("nrr-session-a", agent_cwd)),
+                Some(&resume),
+                &pane_dir,
+                None,
+                &mut agent_restore,
+            );
+            let plan = startup
+                .restore_plan
+                .expect("claude resumes its persisted id");
+            assert_eq!(
+                plan.argv,
+                vec!["claude", "--resume", "nrr-session-a"],
+                "agent cwd {}: claude must resume session A by id, never `--continue`",
+                agent_cwd.display()
+            );
+            assert!(
+                plan.launch_dir.is_none(),
+                "a native plan is not tied to a directory"
+            );
+        }
+
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let startup =
+            pane_restore_startup(None, Some(&resume), &pane_dir, None, &mut agent_restore);
+        assert!(
+            startup.restore_plan.is_none(),
+            "without a persisted id a reported claude command must not run"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // herdr-nrr round 3 (codex nrr-r2 P2): two claude panes persisted the
+    // SAME session A, with reported commands reserved for different agent
+    // dirs X and Y. Under the reported path their dedupe keys differ (the
+    // directory is part of them) and both would resume; on the native path
+    // the key is the session itself, so restore keeps exactly one resume.
+    #[test]
+    fn agent_restore_nrr_claude_same_persisted_id_resumes_once_across_reported_dirs() {
+        let root = nrr_r3_temp_dir("p2");
+        let agent_dirs = [root.join("agent-x"), root.join("agent-y")];
+        for dir in &agent_dirs {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let resume = nrr_r3_claude_continue();
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+
+        let first = pane_restore_startup(
+            Some(&nrr_r3_claude_session("nrr-session-a", &agent_dirs[0])),
+            Some(&resume),
+            &root.join("pane-1"),
+            None,
+            &mut agent_restore,
+        );
+        let second = pane_restore_startup(
+            Some(&nrr_r3_claude_session("nrr-session-a", &agent_dirs[1])),
+            Some(&resume),
+            &root.join("pane-2"),
+            None,
+            &mut agent_restore,
+        );
+        assert_eq!(
+            first.restore_plan.expect("first pane resumes A").argv,
+            vec!["claude", "--resume", "nrr-session-a"]
+        );
+        assert!(
+            second.restore_plan.is_none() && second.duplicate_agent_session,
+            "the second pane persisting the same session A must be de-duplicated"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // herdr-nrr round 3: the claude exclusion is scoped to claude. Another
+    // agent's reported resume command is still used, reserved for its
+    // directory, exactly as upstream #4687 does.
+    #[test]
+    fn agent_restore_nrr_non_claude_reported_resume_is_still_used() {
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "codex-session".into(),
+            agent_session_cwd: None,
+        };
+        let resume = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
+        };
+        let pane_dir = std::path::Path::new("/pane-codex");
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let startup = pane_restore_startup(
+            Some(&session),
+            Some(&resume),
+            pane_dir,
+            None,
+            &mut agent_restore,
+        );
+        let plan = startup.restore_plan.expect("reported codex plan");
+        assert_eq!(plan.argv, resume.argv);
+        assert_eq!(plan.launch_dir.as_deref(), Some(pane_dir));
     }
 
     #[test]
