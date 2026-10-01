@@ -50,6 +50,12 @@ try {
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
     }
+    if ($env:CLAUDE_PID) {
+        $args += @("--agent-pid", "$($env:CLAUDE_PID)")
+    }
+    if ($payload.cwd -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.cwd)) {
+        $args += @("--agent-session-cwd", "$($payload.cwd)")
+    }
     & $herdr @args 2>$null | Out-Null
 } catch {
 }

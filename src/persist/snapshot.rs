@@ -126,6 +126,11 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// The agent's own reported cwd at the moment it bound this session id
+    /// (ADR-0002, herdr-ct9). `#[serde(default)]` so a snapshot written
+    /// before this field existed still loads with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -358,6 +363,10 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        // A live hook-authoritative session has no reported
+                        // resume cwd of its own - it is not a candidate for
+                        // deferred resume while it holds authority.
+                        agent_session_cwd: None,
                     });
                 }
             }
@@ -369,6 +378,10 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    // ADR-0002, herdr-ct9 amendment: the cwd lives INSIDE the
+                    // session value itself, so it can never disagree with
+                    // which session it is captured alongside.
+                    agent_session_cwd: session.cwd.clone(),
                 })
         });
         let agent_resume = terminal
@@ -405,12 +418,43 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let mut value = serde_json::to_value(snapshot).ok()?;
+    // codex ar-r4 (P2 #3): `agent_session_cwd` (ADR-0002, herdr-ct9) is a
+    // NEW optional field a PREVIOUS build's `PaneAgentSessionSnapshot` does
+    // not know about at all - its deserializer silently drops the unknown
+    // JSON key, so recomputing the fingerprint there can never include it,
+    // while a NEW build's stored fingerprint did. That single-field
+    // mismatch fails the whole-session equality check below, discarding
+    // EVERY pane's history on a rollback, not just the pane whose agent cwd
+    // changed. Strip it before hashing so the two builds always agree on
+    // this projection; the field itself is still persisted and still read
+    // for restore's own cwd decisions (`restore_tab`) - only the
+    // HISTORY-compatibility fingerprint excludes it.
+    strip_json_key_recursive(&mut value, "agent_session_cwd");
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Remove every occurrence of `key` from any JSON object anywhere in
+/// `value`, recursively through arrays and nested objects.
+fn strip_json_key_recursive(value: &mut serde_json::Value, key: &str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove(key);
+            for nested in map.values_mut() {
+                strip_json_key_recursive(nested, key);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_json_key_recursive(item, key);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Capture pane screen history separately from the structural session snapshot.
@@ -650,6 +694,69 @@ mod tests {
         assert_ne!(
             layout_fingerprint(&snapshot).as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    // codex ar-r4 (P2 #3): a PREVIOUS build's `PaneAgentSessionSnapshot` has
+    // no `agent_session_cwd` field at all, so it can never include one in
+    // its own recomputed fingerprint. The fingerprint of a snapshot
+    // carrying the field must equal the fingerprint of the same snapshot
+    // with the field stripped entirely - that IS the projection a previous
+    // build's deserializer actually produces - or a rollback discards every
+    // pane's history over a field it never knew existed.
+    #[test]
+    fn layout_fingerprint_ignores_agent_session_cwd_for_previous_reader_compatibility() {
+        let session_with_cwd = |cwd: Option<&str>| PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "fingerprint-session".into(),
+            agent_session_cwd: cwd.map(String::from),
+        };
+
+        let mut with_cwd = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        with_cwd.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(session_with_cwd(Some("/work/agent-cwd")));
+
+        let mut without_cwd = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        without_cwd.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(session_with_cwd(None));
+
+        assert_eq!(
+            layout_fingerprint(&with_cwd),
+            layout_fingerprint(&without_cwd),
+            "the agent's reported cwd must not affect the history-compatibility fingerprint"
+        );
+
+        // The strip must be targeted: a genuine difference elsewhere in the
+        // same agent_session (a different session id) still changes it.
+        let mut different_session = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        let mut other = session_with_cwd(Some("/work/agent-cwd"));
+        other.value = "a-different-session".into();
+        different_session.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&1)
+            .unwrap()
+            .agent_session = Some(other);
+        assert_ne!(
+            layout_fingerprint(&with_cwd),
+            layout_fingerprint(&different_session),
+            "stripping agent_session_cwd must not stop the fingerprint from noticing other changes"
         );
     }
 
@@ -1280,6 +1387,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            cwd: None,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1355,6 +1463,7 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+                cwd: None,
             });
 
         let snapshot = capture_from_state(&state);
@@ -1370,6 +1479,75 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Id
         );
         assert_eq!(agent_session.value, "opencode-session");
+    }
+
+    // ADR-0002 amendment companion to
+    // `agent_restore_p2_amendment_cwd_does_not_survive_a_session_replaced_by_another_agents_startup`
+    // in terminal/state.rs - the state-level regression proves the runtime
+    // value is correct; this proves a snapshot CAPTURED off that runtime
+    // value carries the same correct `None`, not a stale cwd resurrected
+    // from a sibling field the capture code used to read separately.
+    #[test]
+    fn capture_contract_does_not_resurrect_a_stale_cwd_after_session_replacement() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Claude),
+            crate::detect::AgentState::Working,
+        );
+        let buffered = terminal.set_agent_session_ref_for_session_start(
+            "herdr:mastracode".into(),
+            "mastracode".into(),
+            crate::agent_resume::AgentSessionRef::id("mastracode-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            buffered.is_none(),
+            "mastracode's session should not activate before its process is detected"
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Claude),
+            crate::detect::AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            std::time::Instant::now(),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Mastracode),
+            crate::detect::AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("mastracode's session should be captured");
+
+        assert_eq!(agent_session.source, "herdr:mastracode");
+        assert_eq!(agent_session.value, "mastracode-session");
+        assert_eq!(
+            agent_session.agent_session_cwd, None,
+            "claude's stale cwd must not appear in a snapshot of mastracode's session"
+        );
     }
 
     #[test]
