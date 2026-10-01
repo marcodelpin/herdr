@@ -25,6 +25,12 @@ pub struct AgentResumePlan {
     pub agent: String,
     pub argv: Vec<String>,
     pub dedupe_key: String,
+    /// herdr-nrr: `Some` only for a reported resume command - the directory
+    /// its dedupe key reserved at restore time. The command (for example
+    /// `agent --continue`) names a session only relative to that directory,
+    /// so the deferred launch runs it there or not at all. `None` for a
+    /// native plan, whose argv names its session explicitly.
+    pub launch_dir: Option<std::path::PathBuf>,
 }
 
 /// A resume command reported by the agent itself, run in the restored pane.
@@ -49,6 +55,7 @@ impl ReportedAgentResume {
                 cwd.display(),
                 self.argv.join("\u{0}")
             ),
+            launch_dir: Some(cwd.to_path_buf()),
         }
     }
 }
@@ -351,6 +358,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         agent: agent.to_string(),
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),
+        launch_dir: None,
     })
 }
 
