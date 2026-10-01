@@ -148,8 +148,10 @@ jobs:
       # record its resume_argv (spawns a real /bin/sh pty, #[cfg(unix)]) and one pure ct9 test that
       # a reported resume dedupes on the agent cwd it runs in (all platforms), plus the codex nrr-r1
       # fix round: two App-level nrr tests that a reported resume command runs only in the directory
-      # it was reserved for (P1 live-session, P2 shared-pane-dir; real /bin/sh pty, #[cfg(unix)]), so
-      # Windows carries those 6 + 8 = 14 fewer: 47 on Linux/macOS-shaped Unix, 33 on Windows. The
+      # it was reserved for (P1 live-session, P2 shared-pane-dir; real /bin/sh pty, #[cfg(unix)]),
+      # plus nrr round 3 (claude never uses a reported resume command): three pure persist/restore
+      # tests (all platforms), so Windows carries those 6 + 8 = 14 fewer: 50 on Linux/macOS-shaped
+      # Unix, 36 on Windows. The
       # count check fails the job if the filter matches fewer (or more) than expected, so a green run
       # that skipped, or silently gained, one of them is red. (ar-r4's P2 #3 fingerprint fix has its
       # own regression test,
@@ -165,9 +167,9 @@ jobs:
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=33
+            expected=36
           else
-            expected=47
+            expected=50
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
@@ -440,6 +442,64 @@ jobs:
             grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
           done
           echo "mutant killed: both nrr scenario tests failed with the launch-dir guard disabled"
+
+  agent-restore-nrr-claude-reported-mutant:
+    # herdr-nrr round 3 (operator decision after codex nrr-r2): for claude a reported resume command
+    # (`claude --continue`) is never used; restore always builds the native `claude --resume <id>`
+    # plan from the persisted session id. Letting claude take the reported path again must turn
+    # both scenario tests red: r2 P1 types `--continue` (agent dir present or already gone before
+    # cold restore), r2 P2 keeps two resumes of the same persisted session.
+    name: mutant - claude never uses a reported resume command
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Let claude take the reported path again and require both claude tests to fail
+        run: |
+          sed -i 's/!reported_resume_excluded(session, resume))/!reported_resume_excluded(session, resume) || true \/* MUTANT nrr claude reported *\/)/' src/persist/restore.rs
+          landed=$(grep -c 'MUTANT nrr claude reported' src/persist/restore.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-run
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::agent_restore_nrr_/)' > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          if [ "$rc" = 0 ]; then
+            echo "MUTANT SURVIVED: every nrr test passed with claude using a reported resume command"
+            exit 1
+          fi
+          for test in \
+            agent_restore_nrr_claude_resumes_its_persisted_id_never_a_reported_continue \
+            agent_restore_nrr_claude_same_persisted_id_resumes_once_across_reported_dirs; do
+            grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not appear as a failure"; exit 1; }
+          done
+          if grep -q "FAIL.*agent_restore_nrr_non_claude_reported_resume_is_still_used" mutant.log; then
+            echo "the non-claude control test must not fail under this mutant"
+            exit 1
+          fi
+          echo "mutant killed: both claude scenario tests failed with the claude exclusion disabled"
 
   agent-restore-4r8-scoping-mutant:
     # herdr-4r8's live-elsewhere check must be scoped to ("herdr:claude", "claude") sessions only -
@@ -966,6 +1026,7 @@ jobs:
         agent-restore-3ir-resume-argv-mutant,
         agent-restore-ct9-reported-resume-dir-mutant,
         agent-restore-nrr-launch-dir-mutant,
+        agent-restore-nrr-claude-reported-mutant,
       ]
     runs-on: ubuntu-latest
     timeout-minutes: 90
