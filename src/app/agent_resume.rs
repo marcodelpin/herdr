@@ -869,6 +869,115 @@ mod tests {
         }
     }
 
+    // herdr-nrr (ADR-0002 ported onto upstream #4687): #4687 lets a
+    // `pane.report_agent_session` carry a `resume_argv`, recorded when the
+    // report's session is current. A `herdr:claude` report refused by the
+    // 3ir foreground gate changes no state - so it must not record its
+    // resume_argv nor advance the sequence watermark, also when it names the
+    // session that is ALREADY current (the case `session_report_applied`
+    // alone lets through). The test process's own pid is a real process
+    // outside the pane's pty session, so the gate sees `Some(false)`; the
+    // control report without `agent_pid` (fails open) proves the same path
+    // records the command when the gate does not refuse it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3ir_refused_report_does_not_record_its_resume_argv() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("claude-3ir-resume-argv");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: long_running_test_argv(),
+            dedupe_key: "claude-3ir-resume-argv".into(),
+        });
+        app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+        assert!(
+            app.terminal_runtimes.get(&terminal_id).is_some(),
+            "the pane needs a real shell for the foreground gate to measure"
+        );
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Claude,
+            observed_at: std::time::Instant::now(),
+        });
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        fn report(
+            app: &mut App,
+            public_pane_id: &str,
+            seq: u64,
+            agent_pid: Option<u32>,
+            resume: bool,
+        ) {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: format!("report-{seq}"),
+                method: crate::api::schema::Method::PaneReportAgentSession(
+                    crate::api::schema::PaneReportAgentSessionParams {
+                        pane_id: public_pane_id.to_string(),
+                        source: "herdr:claude".into(),
+                        agent: "claude".into(),
+                        seq: Some(seq),
+                        agent_session_id: Some("claude-3ir-session".into()),
+                        agent_session_path: None,
+                        session_start_source: Some("resume".into()),
+                        resume_argv: resume.then(|| {
+                            vec![
+                                "claude".into(),
+                                "--resume".into(),
+                                format!("claude-3ir-session-{seq}"),
+                            ]
+                        }),
+                        agent_pid,
+                        agent_session_cwd: None,
+                    },
+                ),
+            });
+            assert!(!response.contains("\"error\""), "{response}");
+        }
+
+        report(&mut app, &public_pane_id, 1, None, false);
+        report(&mut app, &public_pane_id, 2, Some(std::process::id()), true);
+        {
+            let terminal = &app.state.terminals[&terminal_id];
+            assert!(terminal.session_ref_is_current(
+                &crate::agent_resume::AgentSessionRef::id("claude-3ir-session").unwrap()
+            ));
+            assert!(
+                terminal.reported_resume().is_none(),
+                "a report refused by the foreground gate must not record its resume_argv, got {:?}",
+                terminal.reported_resume()
+            );
+            assert!(
+                terminal.hook_report_is_newer("herdr:claude", Some(2)),
+                "a refused report must not advance the sequence watermark"
+            );
+        }
+
+        report(&mut app, &public_pane_id, 3, None, true);
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .reported_resume()
+                .map(|resume| resume.argv.clone()),
+            Some(vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "claude-3ir-session-3".to_string()
+            ]),
+            "control: the same report without agent_pid fails open and records the command"
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
