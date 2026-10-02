@@ -7,7 +7,7 @@ name: Fork paste health timer
 
 on:
   push:
-    branches: [fix/paste-health-timer, fix/adopt-0.9.3]
+    branches: [fix/paste-health-timer, fix/adopt-0.9.3, fix/pkp-civ]
 
 permissions:
   contents: read
