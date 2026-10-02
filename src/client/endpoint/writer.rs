@@ -318,6 +318,9 @@ mod tests {
         // ping's last byte. A frame no peer is reading is larger than any socket or pipe buffer
         // here, so its receipt must stay pending until the peer drains it.
         let (stream, mut peer, path) = streams();
+        // The peer polls: a blocking read would never return to the deadline checks below if
+        // the writer stalled before its first byte while keeping the connection open.
+        crate::ipc::set_local_stream_polling(&mut peer, true).unwrap();
         let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
         // Larger than any buffer between the two ends (a Unix socket takes about 208 KiB
         // unread; a Windows pipe takes 512 bytes at a time), small enough that draining it one

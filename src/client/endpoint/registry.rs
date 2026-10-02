@@ -647,7 +647,12 @@ mod tests {
             "the connection expired before the initial snapshot deadline"
         );
 
-        registry.tick_health(after_insert + super::super::health::HEARTBEAT_TIMEOUT);
+        // Answer any probe first, without marking the snapshot ready: if the test thread was
+        // descheduled long enough for a probe window to lapse, only the snapshot deadline can
+        // still expire the connection, so this assertion cannot pass through probe expiry.
+        let deadline = after_insert + super::super::health::HEARTBEAT_TIMEOUT;
+        registry.received(&ssh_id, 2, deadline);
+        registry.tick_health(deadline);
         assert!(registry.connection(&ssh_id).is_none());
         assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
     }
