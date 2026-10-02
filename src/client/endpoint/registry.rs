@@ -610,6 +610,48 @@ mod tests {
         assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
     }
 
+    #[test]
+    fn negotiated_remote_without_an_initial_snapshot_expires_the_connection() {
+        // bd herdr-pkp: the health layer covers the 10 s initial-snapshot deadline on its own;
+        // this pins that the registry acts on it. The connection is never marked ready, and the
+        // ping sent on the first tick opens a reply window that outlives the second tick, so
+        // only the snapshot deadline can expire it.
+        let mut registry = EndpointRegistry::new(
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            1,
+            negotiation(),
+        );
+        let ssh_id = ClientEndpointId::Ssh(profile());
+        let before_insert = Instant::now();
+        registry.insert(
+            ssh_id.clone(),
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            2,
+            negotiation(),
+            false,
+        );
+        let after_insert = Instant::now();
+
+        registry.tick_health(
+            before_insert + super::super::health::HEARTBEAT_TIMEOUT
+                - std::time::Duration::from_millis(1),
+        );
+        assert!(
+            registry.connection(&ssh_id).is_some(),
+            "the connection expired before the initial snapshot deadline"
+        );
+
+        registry.tick_health(after_insert + super::super::health::HEARTBEAT_TIMEOUT);
+        assert!(registry.connection(&ssh_id).is_none());
+        assert_eq!(registry.take_failures()[0].kind, io::ErrorKind::TimedOut);
+    }
+
     /// The Windows named pipe measured in herdr-8qd: the writer offers a large frame in
     /// 512-byte pieces and a peer polling through PeekNamedPipe takes one piece per poll. A
     /// 1 MiB paste is about 2048 pieces, roughly 20 s, well past the 15 s the health check

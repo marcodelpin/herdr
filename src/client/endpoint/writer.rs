@@ -331,7 +331,30 @@ mod tests {
         let expected_len = expected.len();
         let queued_at = Instant::now();
         let receipt = transport.send_tracked(&paste, queued_at).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        // bd herdr-pkp: wait for evidence that the worker has started writing (the peer sees the
+        // first bytes) instead of sleeping and hoping it was scheduled. One piece is taken here
+        // and counted below; the rest of the frame is far larger than what the peer then leaves
+        // buffered, so the writer is still blocked mid-frame.
+        let mut bytes = Vec::new();
+        let started = Instant::now() + Duration::from_secs(30);
+        while bytes.is_empty() {
+            assert!(
+                Instant::now() < started,
+                "the writer never put a byte of the frame on the wire"
+            );
+            let mut first = [0_u8; 1024];
+            match crate::ipc::poll_local_stream_read_count(&mut peer, &mut first).unwrap() {
+                crate::ipc::LocalStreamReadCount::Data(count) => {
+                    bytes.extend_from_slice(&first[..count]);
+                }
+                crate::ipc::LocalStreamReadCount::Pending => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                crate::ipc::LocalStreamReadCount::Closed => {
+                    panic!("the peer saw the stream close before any byte of the frame")
+                }
+            }
+        }
         assert!(
             receipt.transmitted_at().is_none(),
             "a frame no peer has read reported itself transmitted"
@@ -345,7 +368,6 @@ mod tests {
         let (done, received) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(120);
-            let mut bytes = Vec::new();
             let mut buffer = [0_u8; 16 * 1024];
             while bytes.len() < expected_len && Instant::now() < deadline {
                 match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
