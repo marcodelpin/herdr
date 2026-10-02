@@ -386,6 +386,16 @@ impl App {
                 .map(|session| session.session_ref.value.clone());
             if let Some(target_id) = target_id {
                 if let Some(holder) = crate::agent_session_registry::find_live_holder(&target_id) {
+                    // bd herdr-civ: leave a trace in the server log, so skipped restores can be
+                    // counted after a restart without reading the UI.
+                    tracing::warn!(
+                        pane = pane_id.raw(),
+                        terminal = %terminal_id,
+                        agent = %plan.agent,
+                        session = %target_id,
+                        holder_pid = holder.pid,
+                        "skipping agent resume: session is already open in another running Claude process"
+                    );
                     if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                         terminal.pending_agent_resume_plan = None;
                         terminal.restore_error = Some(format!(
