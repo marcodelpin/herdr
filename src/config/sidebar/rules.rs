@@ -283,7 +283,7 @@ mod tests {
 
     // herdr-upm: a rule with `source` reads another custom token of the pane.
     #[test]
-    fn source_rules_read_another_token_and_accept_percent() {
+    fn source_rules_read_another_token_and_never_the_own_value() {
         let rules: Vec<SidebarTokenRule> = [
             "source = '$ctx_num'\ngt = 80\nbold = true",
             "source = '$ctx_num'\ngt = 50\ndim = true",
@@ -310,6 +310,30 @@ mod tests {
         assert_eq!(
             matching_style(&rules, base, "99", &|_| Some("1")).unwrap(),
             base
+        );
+        // nor is it a fallback for an absent source, even when it would match (herdr-a2y9)
+        assert_eq!(matching_style(&rules, base, "99", &|_| None).unwrap(), base);
+    }
+
+    // herdr-a2y9: a sourced and an unsourced numeric rule never share the parsed number, in
+    // either order, so each reads its own value.
+    #[test]
+    fn sourced_and_unsourced_rules_parse_their_own_values() {
+        let sourced: SidebarTokenRule =
+            toml::from_str("source = '$ctx_num'\ngt = 80\nbold = true").unwrap();
+        let own: SidebarTokenRule = toml::from_str("gt = 80\nhide = true").unwrap();
+        let base = SidebarTokenStyle::default();
+        // own value 90, source 10: the sourced rule misses, the unsourced one hides
+        assert_eq!(
+            matching_style(&[sourced.clone(), own.clone()], base, "90", &|_| Some("10")),
+            None
+        );
+        // own value 10, source 90: the unsourced rule misses, the sourced one styles
+        assert_eq!(
+            matching_style(&[own, sourced], base, "10", &|_| Some("90"))
+                .unwrap()
+                .bold,
+            Some(true)
         );
     }
 
