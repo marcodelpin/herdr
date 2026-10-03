@@ -232,32 +232,93 @@ mod tests {
         }
     }
 
-    // herdr-upm: the machine name coloured by the pane's `$ctx_num`, thresholds 50/80.
+    // herdr-upm + herdr-6w2f: the operator layout row 1 (the outer repo's
+    // docs/herdr-sidebar-config.toml carries the same rows; tests/test_sidebar_layout_docs.py keeps
+    // them equal). Thresholds 50/80 on `$ctx_num`. The machine name is neutral until measured; the
+    // `$ctx` cell is the indicator on a single-endpoint client, where `machine` renders nothing.
+    const CTX_LAYOUT: &str = r##"
+rows = [
+  ["state_icon", { token = "machine", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 49, fg = "#f9e2af" }, { source = "$ctx_num", lt = 50, fg = "#a6e3a1" }] }, "workspace", "tab", { token = "$ctx", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 49, fg = "#f9e2af" }, { source = "$ctx_num", lt = 50, hide = true }] }, { token = "$ver_acct", dim = true }, { token = "$ver_old", fg = "#f38ba8", bold = true }],
+  ["state_text", { token = "$wait", fg = "#f9e2af" }, { token = "$stale", fg = "#f38ba8", bold = true }],
+]
+"##;
+    const GREEN: (u8, u8, u8) = (0xa6, 0xe3, 0xa1);
+    const YELLOW: (u8, u8, u8) = (0xf9, 0xe2, 0xaf);
+    const RED: (u8, u8, u8) = (0xf3, 0x8b, 0xa8);
+
+    fn ctx_row(machine: Option<&str>, ctx_num: Option<&str>) -> Vec<ResolvedToken> {
+        let config: AgentsSidebarConfig = toml::from_str(CTX_LAYOUT).unwrap();
+        let mut entry = entry();
+        if let Some(num) = ctx_num {
+            entry.tokens.insert("ctx_num".into(), num.into());
+            entry.tokens.insert("ctx".into(), format!("{num}%"));
+        }
+        let mut context = context(&entry);
+        context.machine = machine;
+        agent_rows(&config, context, "working").swap_remove(0)
+    }
+
+    fn fg(token: &ResolvedToken) -> Option<ratatui::style::Color> {
+        token.style.fg.map(|color| color.ratatui())
+    }
+
+    fn rgb(color: (u8, u8, u8)) -> Option<ratatui::style::Color> {
+        Some(ratatui::style::Color::Rgb(color.0, color.1, color.2))
+    }
+
     #[test]
     fn machine_is_coloured_by_the_ctx_token() {
-        let config: AgentsSidebarConfig = toml::from_str(r##"
-rows = [[{ token = "machine", fg = "#a6e3a1", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 50, fg = "#f9e2af" }] }]]
-"##).unwrap();
         for (ctx, color) in [
-            (Some("85"), (0xf3, 0x8b, 0xa8)),
-            (Some("80"), (0xf9, 0xe2, 0xaf)),
-            (Some("51"), (0xf9, 0xe2, 0xaf)),
-            (Some("50"), (0xa6, 0xe3, 0xa1)),
-            (None, (0xa6, 0xe3, 0xa1)),
+            ("100", RED),
+            ("81", RED),
+            ("80", YELLOW),
+            ("50", YELLOW),
+            ("49", GREEN),
+            ("0", GREEN),
         ] {
-            let mut entry = entry();
-            if let Some(ctx) = ctx {
-                entry.tokens.insert("ctx_num".into(), ctx.into());
+            let row = ctx_row(Some("dcc"), Some(ctx));
+            assert_eq!(row[1].kind, ResolvedTokenKind::Machine("dcc".into()));
+            assert_eq!(fg(&row[1]), rgb(color), "ctx {ctx}");
+        }
+    }
+
+    // herdr-6w2f: a pane that was never measured, or whose poll token expired, must not look like
+    // a measured low usage: no green without a number below 50.
+    #[test]
+    fn unmeasured_context_leaves_the_machine_neutral() {
+        for ctx in [None, Some("81%"), Some("")] {
+            let row = ctx_row(Some("dcc"), ctx);
+            assert_eq!(row[1].kind, ResolvedTokenKind::Machine("dcc".into()));
+            assert_eq!(fg(&row[1]), None, "ctx {ctx:?}");
+        }
+    }
+
+    // herdr-6w2f: the single-endpoint renderer supplies no machine name, so the `machine` token is
+    // omitted; the `$ctx` cell must then carry the warning, and stay out of a healthy row.
+    #[test]
+    fn single_endpoint_rows_keep_a_context_warning() {
+        let ctx_cell = |row: &[ResolvedToken]| {
+            row.iter()
+                .find(|token| matches!(token.kind, ResolvedTokenKind::Custom(ref value) if value.ends_with('%')))
+                .cloned()
+        };
+        for machine in [None, Some("dcc")] {
+            for (ctx, color) in [("81", Some(RED)), ("50", Some(YELLOW)), ("49", None)] {
+                let row = ctx_row(machine, Some(ctx));
+                let cell = ctx_cell(&row);
+                match color {
+                    Some(color) => {
+                        let cell = cell.unwrap_or_else(|| panic!("ctx {ctx} {machine:?}: no cell"));
+                        assert_eq!(cell.kind, ResolvedTokenKind::Custom(format!("{ctx}%")));
+                        assert_eq!(fg(&cell), rgb(color), "ctx {ctx} {machine:?}");
+                    }
+                    None => assert_eq!(cell, None, "a healthy row shows no ctx cell: {machine:?}"),
+                }
             }
-            let mut context = context(&entry);
-            context.machine = Some("dcc");
-            let rows = agent_rows(&config, context, "working");
-            let token = &rows[0][0];
-            assert_eq!(token.kind, ResolvedTokenKind::Machine("dcc".into()));
             assert_eq!(
-                token.style.fg.unwrap().ratatui(),
-                ratatui::style::Color::Rgb(color.0, color.1, color.2),
-                "ctx {ctx:?}"
+                ctx_cell(&ctx_row(machine, None)),
+                None,
+                "never measured: {machine:?}"
             );
         }
     }
