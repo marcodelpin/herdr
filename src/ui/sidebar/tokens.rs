@@ -432,6 +432,39 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
         }
     }
 
+    // herdr-a2y9: space rows resolve a sourced rule through the pane's other custom tokens.
+    #[test]
+    fn space_rows_read_a_rule_source_token() {
+        let config: crate::config::SidebarConfig = toml::from_str(
+            r#"
+[spaces]
+rows = [[{ token = "$host", rules = [{ source = "$ctx_num", gt = 80, bold = true }] }]]
+"#,
+        )
+        .unwrap();
+        let mut entry = entry();
+        entry.tokens.insert("host".into(), "dcc".into());
+        for (ctx, bold) in [(Some("85"), Some(true)), (Some("80"), None), (None, None)] {
+            match ctx {
+                Some(ctx) => entry.tokens.insert("ctx_num".into(), ctx.into()),
+                None => entry.tokens.remove("ctx_num"),
+            };
+            let rows = space_rows(
+                &config.spaces,
+                SpaceTokenContext {
+                    workspace: "repo",
+                    branch: None,
+                    state_text: "working",
+                    ahead_behind: None,
+                    suppress_git_details: false,
+                    tokens: &entry.tokens,
+                },
+            );
+            assert_eq!(rows[0][0].kind, ResolvedTokenKind::Custom("dcc".into()));
+            assert_eq!(rows[0][0].style.bold, bold, "ctx {ctx:?}");
+        }
+    }
+
     #[test]
     fn conditional_hide_removes_tokens_and_empty_rows() {
         let config: crate::config::SidebarConfig = toml::from_str(
