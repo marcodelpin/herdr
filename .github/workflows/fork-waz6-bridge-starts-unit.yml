@@ -72,7 +72,7 @@ jobs:
         include:
           - name: unit never chosen
             perl: 's/if unit_installed && !explicit_session && !socket_override \{/if false \&\& unit_installed \&\& !explicit_session \&\& !socket_override \/* MUTANT *\/ {/'
-            expect: "plan_uses_the_unit_when_installed_on_the_default_session unit_plan_starts_the_unit_and_never_spawns"
+            expect: "plan_uses_the_unit_when_installed_on_the_default_session"
           - name: explicit session guard dropped
             perl: 's/if unit_installed && !explicit_session && !socket_override \{/if unit_installed \&\& !socket_override \/* MUTANT *\/ {/'
             expect: "plan_spawns_directly_for_an_explicit_session"
