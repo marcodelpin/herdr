@@ -32,6 +32,16 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// Attempts to start a connection thread before the connection is dropped.
+/// Thread creation fails with EAGAIN when the cgroup hits pids.max; a bounded
+/// retry rides out a short spike without stalling the accept loop for long.
+const CONNECTION_SPAWN_ATTEMPTS: u32 = 5;
+const CONNECTION_SPAWN_BACKOFF: Duration = Duration::from_millis(20);
+/// Process exit code when the api listener thread dies while the server is
+/// still running (EX_SOFTWARE). A non-zero exit lets a supervisor such as
+/// systemd Restart=on-failure bring the server back; staying alive with no
+/// listener leaves every api client refused until someone restarts it by hand.
+const LISTENER_DEAD_EXIT_CODE: i32 = 70;
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -119,34 +129,55 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        run_accept_loop(
-            listener.incoming(),
-            &listener_running,
-            ACCEPT_ERROR_BACKOFF,
-            |stream| {
-                let api_tx = api_tx.clone();
-                let event_hub = event_hub.clone();
-                let capabilities = capabilities.clone();
-                let server_stop = server_stop.clone();
-                let connection_running = Arc::clone(&listener_running);
-                #[cfg(unix)]
-                let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_connection_with_stop(
-                        stream,
-                        &api_tx,
-                        &event_hub,
-                        &connection_running,
-                        capabilities,
-                        server_stop.as_ref(),
-                        #[cfg(unix)]
-                        ssh_agents.as_ref(),
-                    ) {
-                        warn!(err = %err, "api connection failed");
+        let outcome = supervise_listener(&listener_running, || {
+            run_accept_loop(
+                listener.incoming(),
+                &listener_running,
+                ACCEPT_ERROR_BACKOFF,
+                |stream| {
+                    let api_tx = api_tx.clone();
+                    let event_hub = event_hub.clone();
+                    let capabilities = capabilities.clone();
+                    let server_stop = server_stop.clone();
+                    let connection_running = Arc::clone(&listener_running);
+                    #[cfg(unix)]
+                    let ssh_agents = ssh_agents.clone();
+                    let spawned = spawn_connection_thread(
+                        move || {
+                            if let Err(err) = handle_connection_with_stop(
+                                stream,
+                                &api_tx,
+                                &event_hub,
+                                &connection_running,
+                                capabilities,
+                                server_stop.as_ref(),
+                                #[cfg(unix)]
+                                ssh_agents.as_ref(),
+                            ) {
+                                warn!(err = %err, "api connection failed");
+                            }
+                        },
+                        CONNECTION_SPAWN_ATTEMPTS,
+                        CONNECTION_SPAWN_BACKOFF,
+                        spawn_named_connection_thread,
+                    );
+                    if let Err(err) = spawned {
+                        error!(
+                            err = %err,
+                            attempts = CONNECTION_SPAWN_ATTEMPTS,
+                            "failed to spawn api connection thread; dropping connection"
+                        );
                     }
-                });
-            },
-        );
+                },
+            );
+        });
+        if outcome == ListenerOutcome::Died {
+            error!(
+                exit_code = LISTENER_DEAD_EXIT_CODE,
+                "api listener died while the server is running; exiting so the supervisor restarts it"
+            );
+            std::process::exit(LISTENER_DEAD_EXIT_CODE);
+        }
         debug!("api server thread exiting");
     });
 
@@ -156,6 +187,91 @@ fn start_server_inner(
         identity,
         running,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerOutcome {
+    /// The listener ended because the server asked it to stop.
+    Stopped,
+    /// The listener ended (by panic or by returning) while the server still
+    /// expects it to serve; the socket file is left with no listener.
+    Died,
+}
+
+/// Runs the accept loop body and reports whether it ended on request or died.
+/// A panic is caught here so the caller can turn it into a process exit: an
+/// unwinding panic otherwise ends only this thread and the process stays up
+/// with no api listener (herdr-o0i8).
+fn supervise_listener(running: &AtomicBool, body: impl FnOnce()) -> ListenerOutcome {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    if !running.load(Ordering::Relaxed) {
+        return ListenerOutcome::Stopped;
+    }
+    match result {
+        Err(_) => error!("api listener thread panicked while the server is running"),
+        Ok(()) => error!("api listener loop ended while the server is running"),
+    }
+    ListenerOutcome::Died
+}
+
+type ConnectionWork = Box<dyn FnOnce() + Send + 'static>;
+
+fn spawn_named_connection_thread(work: ConnectionWork) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("herdr-api-conn".to_string())
+        .spawn(work)
+        .map(drop)
+}
+
+/// Starts `work` on a new thread through `spawn`, retrying with a doubling
+/// backoff when thread creation fails (EAGAIN under pids.max). On the final
+/// failure `work` is dropped without running, which closes the connection it
+/// owns, and the error is returned instead of panicking the accept thread.
+fn spawn_connection_thread<F>(
+    work: F,
+    attempts: u32,
+    backoff: Duration,
+    mut spawn: impl FnMut(ConnectionWork) -> io::Result<()>,
+) -> io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    // A failed spawn drops the closure it was given, so the work lives in a
+    // shared slot and each attempt only carries a handle to it.
+    let slot = Arc::new(std::sync::Mutex::new(Some(work)));
+    let mut delay = backoff;
+    let mut last_err = None;
+    for attempt in 1..=attempts.max(1) {
+        let attempt_slot = Arc::clone(&slot);
+        let attempt_work: ConnectionWork = Box::new(move || {
+            let work = attempt_slot.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(work) = work {
+                work();
+            }
+        });
+        match spawn(attempt_work) {
+            Ok(()) => {
+                if attempt > 1 {
+                    info!(attempt, "api connection thread spawned after retry");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                if attempt == 1 {
+                    warn!(err = %err, "failed to spawn api connection thread; retrying");
+                }
+                last_err = Some(err);
+                if attempt < attempts {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+    }
+    if let Ok(mut slot) = slot.lock() {
+        slot.take();
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("connection thread spawn failed")))
 }
 
 fn run_accept_loop<S>(
@@ -233,6 +349,134 @@ mod accept_loop_tests {
         });
 
         assert_eq!(attempts, 3);
+    }
+
+    fn would_block() -> io::Error {
+        io::Error::from_raw_os_error(11)
+    }
+
+    // herdr-o0i8: a panic in the accept thread used to end only that thread,
+    // leaving the process alive with no api listener. The supervisor must
+    // report it as a death so the thread exits the process.
+    #[test]
+    fn listener_liveness_panic_while_running_is_a_death() {
+        let running = AtomicBool::new(true);
+        let outcome = supervise_listener(&running, || {
+            panic!("failed to spawn thread: WouldBlock");
+        });
+        assert_eq!(outcome, ListenerOutcome::Died);
+    }
+
+    #[test]
+    fn listener_liveness_loop_return_while_running_is_a_death() {
+        let running = AtomicBool::new(true);
+        let outcome = supervise_listener(&running, || {});
+        assert_eq!(outcome, ListenerOutcome::Died);
+    }
+
+    #[test]
+    fn listener_liveness_panic_after_shutdown_is_a_stop() {
+        let running = AtomicBool::new(true);
+        let outcome = supervise_listener(&running, || {
+            running.store(false, Ordering::Relaxed);
+            panic!("late panic during shutdown");
+        });
+        assert_eq!(outcome, ListenerOutcome::Stopped);
+    }
+
+    #[test]
+    fn listener_liveness_accept_loop_shutdown_is_a_stop() {
+        let running = AtomicBool::new(true);
+        let mut attempts = 0;
+        let outcome = supervise_listener(&running, || {
+            let incoming = std::iter::from_fn(|| {
+                attempts += 1;
+                if attempts == 2 {
+                    running.store(false, Ordering::Relaxed);
+                }
+                Some(accept_error())
+            });
+            run_accept_loop(incoming, &running, Duration::ZERO, |_| {});
+        });
+        assert_eq!(outcome, ListenerOutcome::Stopped);
+    }
+
+    #[test]
+    fn listener_liveness_spawn_retries_past_would_block() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_work = Arc::clone(&ran);
+        let mut calls = 0;
+        let result = spawn_connection_thread(
+            move || ran_in_work.store(true, Ordering::Relaxed),
+            5,
+            Duration::ZERO,
+            |work| {
+                calls += 1;
+                if calls < 3 {
+                    return Err(would_block());
+                }
+                work();
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+        assert!(ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn listener_liveness_spawn_gives_up_and_drops_the_connection() {
+        let connection = Arc::new(());
+        let held = Arc::clone(&connection);
+        let mut calls = 0;
+        let result = spawn_connection_thread(
+            move || drop(held),
+            4,
+            Duration::ZERO,
+            |_work| {
+                calls += 1;
+                Err(would_block())
+            },
+        );
+        let err = result.expect_err("every spawn attempt failed");
+        assert_eq!(err.raw_os_error(), Some(11));
+        assert_eq!(calls, 4);
+        assert_eq!(
+            Arc::strong_count(&connection),
+            1,
+            "the connection must be closed"
+        );
+    }
+
+    // The accept loop keeps serving after a connection whose thread could
+    // not be spawned, instead of losing the listener to a panic.
+    #[test]
+    fn listener_liveness_accept_loop_survives_spawn_failure() {
+        let running = AtomicBool::new(true);
+        let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut spawn_calls = 0;
+        let outcome = supervise_listener(&running, || {
+            run_accept_loop([Ok(1), Ok(2)], &running, Duration::ZERO, |stream| {
+                let served = Arc::clone(&served);
+                let _ = spawn_connection_thread(
+                    move || served.lock().unwrap().push(stream),
+                    2,
+                    Duration::ZERO,
+                    |work| {
+                        spawn_calls += 1;
+                        if stream == 1 {
+                            return Err(would_block());
+                        }
+                        work();
+                        Ok(())
+                    },
+                );
+            });
+            running.store(false, Ordering::Relaxed);
+        });
+        assert_eq!(outcome, ListenerOutcome::Stopped);
+        assert_eq!(*served.lock().unwrap(), vec![2]);
+        assert_eq!(spawn_calls, 3);
     }
 }
 

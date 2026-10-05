@@ -1,0 +1,221 @@
+# Fork-only workflow for fix/o0i8-api-listener-liveness (not for upstream). On dcc on
+# 2026-10-04 the container hit pids.max, a std::thread::spawn for an api connection panicked
+# with EAGAIN inside the api accept thread, and that unwinding panic ended only the accept
+# thread: the server process stayed alive with no listener on herdr.sock for 6h52m while
+# systemd reported active/running, so Restart=on-failure never fired. The fix (src/api/server.rs)
+# retries the connection thread spawn with backoff and drops the connection on final failure
+# instead of panicking, and supervises the accept thread: if it ends by panic or by returning
+# while the server is still running, the process exits 70 so the supervisor restarts it.
+# This host cannot build the crate (no Zig 0.16.0), so the crate tests run here on both
+# platforms, the fork's listener_liveness_ tests run again by name with a count check, two
+# mutants prove the supervisor and the retry are load-bearing (the first mutant restores
+# the stock behaviour: a dead listener is reported as a clean stop), and a Linux release build
+# runs only once the tests and mutants pass. bd herdr-o0i8.
+name: Fork o0i8 api listener liveness
+
+on:
+  push:
+    branches: [fix/o0i8-api-listener-liveness]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: clippy, rustfmt
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Format and clippy
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      # The fork's own tests, by name: 7 platform-agnostic tests in src/api/server.rs
+      # (supervisor: panic while running, return while running, panic after shutdown,
+      # accept loop shutdown; spawn: retry past WouldBlock, give up and close the connection,
+      # accept loop survives a failed spawn). The count check fails the job if the filter
+      # matches fewer or more tests than expected.
+      - name: Run the fork tests by name
+        shell: bash
+        run: |
+          filter='test(/::listener_liveness_/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
+          cat fork-tests.txt
+          count=$(grep -c . fork-tests.txt || true)
+          expected=7
+          [ "$count" = "$expected" ] || { echo "expected $expected fork tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
+
+  listener-liveness-mutants:
+    name: mutants - stock listener death and a spawn without retry must be caught
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: clippy, rustfmt
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Mutant 1 - report a dead listener as a clean stop (stock behaviour)
+        run: |
+          perl -0777 -pi -e 's/    ListenerOutcome::Died\n\}\n\ntype ConnectionWork/    ListenerOutcome::Stopped \/* MUTANT listener death ignored *\/\n}\n\ntype ConnectionWork/' src/api/server.rs
+          landed=$(grep -c 'MUTANT listener death ignored' src/api/server.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::listener_liveness_/)' > mutant1.log 2>&1 || rc=$?
+          cat mutant1.log
+          [ "$rc" != 0 ] || { echo "MUTANT 1 SURVIVED"; exit 1; }
+          for test in listener_liveness_panic_while_running_is_a_death \
+                      listener_liveness_loop_return_while_running_is_a_death; do
+            grep -q "FAIL.*$test" mutant1.log || { echo "expected $test to FAIL"; exit 1; }
+          done
+          git checkout -- src/api/server.rs
+          echo "mutant 1 killed"
+
+      - name: Mutant 2 - spawn the connection thread once, no retry
+        run: |
+          perl -0777 -pi -e 's/for attempt in 1\.\.=attempts\.max\(1\) \{/for attempt in 1..=1u32 \/* MUTANT no spawn retry *\/ {/' src/api/server.rs
+          landed=$(grep -c 'MUTANT no spawn retry' src/api/server.rs || true)
+          [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/::listener_liveness_/)' > mutant2.log 2>&1 || rc=$?
+          cat mutant2.log
+          [ "$rc" != 0 ] || { echo "MUTANT 2 SURVIVED"; exit 1; }
+          grep -q "FAIL.*listener_liveness_spawn_retries_past_would_block" mutant2.log || { echo "expected the retry test to FAIL"; exit 1; }
+          git checkout -- src/api/server.rs
+          echo "mutant 2 killed"
+
+  build-linux:
+    name: build herdr-linux-x86_64
+    needs: [crate-tests, listener-liveness-mutants]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Same LIBGHOSTTY_VT_* settings as preview.yml's release builds (ReleaseFast / SIMD
+    # on), which is what the dcc server ran before this binary replaced it and what the
+    # fork's Windows package uses. The build-artifacts-manual.yml input defaults
+    # (ReleaseSafe / false) would silently swap the server's VT engine for a slower one.
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: 'true'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Prefer official Ubuntu mirrors over Azure
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i '/azure.archive.ubuntu.com/d' /etc/apt/apt-mirrors.txt
+            echo "Using apt mirrors:"
+            cat /etc/apt/apt-mirrors.txt
+          fi
+
+      - name: Install Linux build tools
+        run: |
+          sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build musl-tools
+
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Package artifact
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/herdr herdr-linux-x86_64
+          file herdr-linux-x86_64 > BUILD_INFO.txt
+          ldd herdr-linux-x86_64 2>&1 | tee -a BUILD_INFO.txt
+          grep -q "statically linked" BUILD_INFO.txt
+          if nm -u herdr-linux-x86_64 2>/dev/null | grep -E '(__cxa|GLIBCXX|CXXABI|_ZSt)'; then
+            echo "error: Linux artifact has unresolved C++ runtime symbols" >&2
+            exit 1
+          fi
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "target=x86_64-unknown-linux-musl"
+            echo "libghostty_vt_optimize=$LIBGHOSTTY_VT_OPTIMIZE"
+            echo "libghostty_vt_simd=$LIBGHOSTTY_VT_SIMD"
+          } >> BUILD_INFO.txt
+          python3 -m pip install --quiet blake3
+          python3 -c "import blake3, pathlib; artifact = pathlib.Path('herdr-linux-x86_64'); print(f'blake3={blake3.blake3(artifact.read_bytes()).hexdigest()}  {artifact.name}')" >> BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-linux-x86_64-fixo0i8
+          path: |
+            herdr-linux-x86_64
+            BUILD_INFO.txt
+          retention-days: 7
