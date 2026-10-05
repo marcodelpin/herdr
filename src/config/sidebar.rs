@@ -139,6 +139,7 @@ pub enum SpaceSidebarToken {
 }
 
 impl AgentSidebarToken {
+    #[cfg(test)]
     pub(crate) fn style_for_value(&self, value: &str) -> Option<SidebarTokenStyle> {
         self.style_for(value, &|_| None)
     }
@@ -167,10 +168,6 @@ impl AgentSidebarToken {
 }
 
 impl SpaceSidebarToken {
-    pub(crate) fn style_for_value(&self, value: &str) -> Option<SidebarTokenStyle> {
-        self.style_for(value, &|_| None)
-    }
-
     // style_for resolves the style with `lookup` answering the other custom tokens of the same
     // pane, for rules that name a `source` (herdr-upm).
     pub(crate) fn style_for<'v>(
