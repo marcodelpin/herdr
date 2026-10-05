@@ -5,6 +5,11 @@
 # retried every ~16 s for ~50 h (dcc 2026-10-02..05, NRestarts 11,346). Now the bridge starts the
 # unit when it is installed (default session, no socket override), never falls back to an unmanaged
 # server when that start fails, and keeps the direct spawn only when no unit is installed.
+# Round hwaz6-r2 (codex hwaz6-r1 findings): the plan follows the EFFECTIVE sockets, so `--session
+# default` and HERDR_SOCKET_PATH naming the default socket also take the unit path; the unit is
+# found by asking the user manager for LoadState (masked refuses), with a scan of every systemd
+# --user search dir as the fallback; the saved-machine client shows the bridge's own error; the
+# tests drive the entry point and the systemctl wiring through seams.
 # This host cannot build the crate (no Zig 0.16.0), so the tests run here. Each mutant removes one
 # guard and must turn the named tests red. bd herdr-waz6.
 name: Fork waz6 bridge starts unit
@@ -54,11 +59,11 @@ jobs:
 
       - name: Run the fork tests by name
         run: |
-          filter='test(/^remote::host::tests::/)'
+          filter='test(/^remote::host::tests::/) | test(/^client::endpoint::supervisor::tests::(bridge_failure|handshake_error_stands)/)'
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=9
+          expected=18
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
@@ -71,26 +76,77 @@ jobs:
       matrix:
         include:
           - name: unit never chosen
-            perl: 's/if unit_installed && !explicit_session && !socket_override \{/if false \&\& unit_installed \&\& !explicit_session \&\& !socket_override \/* MUTANT *\/ {/'
-            expect: "plan_uses_the_unit_when_installed_on_the_default_session"
-          - name: explicit session guard dropped
-            perl: 's/if unit_installed && !explicit_session && !socket_override \{/if unit_installed \&\& !socket_override \/* MUTANT *\/ {/'
-            expect: "plan_spawns_directly_for_an_explicit_session"
-          - name: socket override guard dropped
-            perl: 's/if unit_installed && !explicit_session && !socket_override \{/if unit_installed \&\& !explicit_session \/* MUTANT *\/ {/'
-            expect: "plan_spawns_directly_for_a_socket_override"
-          - name: unit always chosen
-            perl: 's/if unit_installed && !explicit_session && !socket_override \{/if true \/* MUTANT *\/ {/'
-            expect: "plan_spawns_directly_without_a_unit plan_spawns_directly_for_an_explicit_session plan_spawns_directly_for_a_socket_override"
+            file: src/remote/host.rs
+            perl: 's/\(EndpointTarget::Unit, UnitState::Installed\) => Ok\(ServerStartPlan::SystemdUnit\)/(EndpointTarget::Unit, UnitState::Installed) => Ok(ServerStartPlan::DirectSpawn) \/* MUTANT *\//'
+            expect: "entry_starts_the_unit_for_the_default_endpoint_and_never_spawns plan_table"
+          - name: unit chosen for another session
+            file: src/remote/host.rs
+            perl: 's/\(EndpointTarget::Other, _\) \| \(_, UnitState::Absent\) =>/(_, UnitState::Absent) => Ok(ServerStartPlan::DirectSpawn),\n        (EndpointTarget::Other, UnitState::Installed) => Ok(ServerStartPlan::SystemdUnit),\n        (EndpointTarget::Other, UnitState::Masked) =>/'
+            expect: "plan_table"
+          - name: other session asks systemd
+            file: src/remote/host.rs
+            perl: 's/EndpointTarget::Other => UnitState::Absent,/EndpointTarget::Other => host.unit_state(), \/* MUTANT *\//'
+            expect: "entry_spawns_directly_for_another_session_without_asking_systemd"
+          - name: mixed endpoint read as other
+            file: src/remote/host.rs
+            perl: 's/_ => EndpointTarget::Mixed,/_ => EndpointTarget::Other, \/* MUTANT *\//'
+            expect: "endpoint_target_classifies_other_and_mixed entry_refuses_a_mixed_endpoint_when_the_unit_is_installed cli_session_selection_decides_by_effective_sockets"
+          - name: endpoint compared by spelling
+            file: src/remote/host.rs
+            perl: 's/a == b \|\| normalized\(a\) == normalized\(b\)/a == b \/* MUTANT *\/ || normalized(a) == normalized(b) \&\& false/'
+            expect: "socket_override_naming_the_default_socket_targets_the_unit"
+          - name: masked unit spawns directly
+            file: src/remote/host.rs
+            perl: 's/\(_, UnitState::Absent\) =>/(_, UnitState::Absent | UnitState::Masked) => \/* MUTANT *\//'
+            expect: "entry_refuses_when_the_unit_is_masked plan_table"
+          - name: load state ignored
+            file: src/remote/host.rs
+            perl: 's/Ok\(output\) if output.success =>/Ok(output) if false \&\& output.success => \/* MUTANT *\//'
+            expect: "unit_state_follows_the_user_manager_load_state"
+          - name: masked load state read as absent
+            file: src/remote/host.rs
+            perl: 's/"masked" => UnitState::Masked,/"masked" => UnitState::Absent, \/* MUTANT *\//'
+            expect: "unit_state_follows_the_user_manager_load_state"
+          - name: data home search dir dropped
+            file: src/remote/host.rs
+            perl: 's/dirs.push\(data_home.join\("systemd\/user"\)\);/{ let _ = data_home; } \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: runtime search dir dropped
+            file: src/remote/host.rs
+            perl: 's/        dirs.push\(runtime.join\("systemd\/user"\)\);/        let _ = runtime; \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: symlink mask not seen
+            file: src/remote/host.rs
+            perl: 's/let masked = metadata.file_type\(\).is_symlink\(\)/let masked = false \/* MUTANT *\/ \&\& metadata.file_type().is_symlink()/'
+            expect: "unit_state_scans_the_dirs_when_systemd_cannot_be_asked"
+          - name: start without --user
+            file: src/remote/host.rs
+            perl: 's/systemctl\(&\["--user", "start", HERDR_UNIT\]\)/systemctl(\&["start", HERDR_UNIT]) \/* MUTANT *\//'
+            expect: "start_unit_runs_systemctl_user_start_herdr_service"
           - name: failed unit start falls back to direct spawn
-            perl: 's/            \}\)\?;\n            wait_for_socket\(UNIT_START_WAIT\)/            }).or_else(|_: io::Error| spawn_direct()).map_err(|e| e);\n            wait_for_socket(UNIT_START_WAIT)/'
-            expect: "failed_unit_start_is_a_clear_error_without_fallback"
+            file: src/remote/host.rs
+            perl: 's/start_unit\(\).map_err\(\|err\| \{/start_unit().or_else(|_| spawn_direct()).map_err(|err| { \/* MUTANT *\//'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns"
+          - name: socket wait failure falls back to direct spawn
+            file: src/remote/host.rs
+            perl: 's/wait_for_socket\(UNIT_START_WAIT\).map_err\(\|err\| \{/wait_for_socket(UNIT_START_WAIT).or_else(|_| spawn_direct()).map_err(|err| { \/* MUTANT *\//'
+            expect: "entry_unit_socket_wait_failure_is_unit_specific_without_fallback"
+          - name: unit error loses the remedy
+            file: src/remote/host.rs
+            perl: 's/if the unit hit its start limit, run `systemctl --user reset-failed herdr.service`/if the unit hit its start limit, reset it/'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns entry_unit_socket_wait_failure_is_unit_specific_without_fallback"
           - name: unit start error loses its explanation
-            perl: 's/not starting an unmanaged server beside the unit/unit start failed/'
-            expect: "failed_unit_start_is_a_clear_error_without_fallback"
+            file: src/remote/host.rs
+            perl: 's/` failed: \{err\}; not starting an unmanaged server beside the unit/` failed/'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns"
           - name: no unit still starts the unit
+            file: src/remote/host.rs
             perl: 's/ServerStartPlan::DirectSpawn => \{\n            spawn_direct\(\)\?;/ServerStartPlan::DirectSpawn => {\n            start_unit()?;\n            spawn_direct()?;/'
-            expect: "direct_plan_spawns_and_never_touches_the_unit"
+            expect: "entry_spawns_directly_when_no_unit_is_installed"
+          - name: bridge failure dropped by the saved client
+            file: src/client/endpoint/supervisor.rs
+            perl: 's/    reported.unwrap_or\(handshake_error\)/    let _ = reported; \/* MUTANT *\/\n    handshake_error/'
+            expect: "bridge_failure_replaces_the_bare_handshake_error"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -118,17 +174,20 @@ jobs:
 
       - name: Apply the mutant and require its tests to fail
         env:
+          FILTER: 'test(/^remote::host::tests::/) | test(/^client::endpoint::supervisor::tests::(bridge_failure|handshake_error_stands)/)'
           PERL_EXPR: ${{ matrix.perl }}
           EXPECT: ${{ matrix.expect }}
+          FILE: ${{ matrix.file }}
         run: |
-          perl -0777 -pi -e "$PERL_EXPR" src/remote/host.rs
-          git diff --stat -- src/remote/host.rs
-          [ -n "$(git diff --name-only -- src/remote/host.rs)" ] || { echo "mutation did not land"; exit 1; }
-          cargo nextest run --locked --bin herdr --no-run
+          # The baseline must be green first: a red baseline would "kill" every mutant.
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E "$FILTER"
+          perl -0777 -pi -e "$PERL_EXPR" "$FILE"
+          git diff --stat -- "$FILE"
+          [ -n "$(git diff --name-only -- "$FILE")" ] || { echo "mutation did not land"; exit 1; }
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/^remote::host::tests::/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E "$FILTER" > mutant.log 2>&1 || rc=$?
           cat mutant.log
-          [ "$rc" != 0 ] || { echo "MUTANT SURVIVED: every host test passed"; exit 1; }
+          [ "$rc" != 0 ] || { echo "MUTANT SURVIVED: every fork test passed"; exit 1; }
           for test in $EXPECT; do
             grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not"; exit 1; }
           done
