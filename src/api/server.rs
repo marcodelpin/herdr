@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestS
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
     poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    socket_file_identity, LocalListener, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
 #[cfg(test)]
@@ -32,29 +32,147 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// Attempts to start a connection thread before the connection falls back to
+/// the reserve worker. Thread creation fails with EAGAIN when the cgroup hits
+/// pids.max; a short retry rides out a spike without stalling accept for long.
+const CONNECTION_SPAWN_ATTEMPTS: u32 = 4;
+const CONNECTION_SPAWN_BACKOFF: Duration = Duration::from_millis(10);
+/// A connection thread spawn outage shorter than this is a spike and is only
+/// logged at debug level; a longer one is reported as an error.
+const SPAWN_OUTAGE_REPORT_AFTER: Duration = Duration::from_secs(2);
+/// Interval between repeated error lines while an outage lasts (thread spawn
+/// failing, or the api listener dying again and again).
+const OUTAGE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Delay before the first api listener respawn; it doubles per consecutive
+/// death up to LISTENER_RESTART_BACKOFF_MAX.
+const LISTENER_RESTART_BACKOFF: Duration = Duration::from_millis(100);
+const LISTENER_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// A listener run at least this long counts as healthy: the next death starts
+/// a new outage with the initial backoff.
+const LISTENER_HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// Test-only fault injection: the accept loop serves the Nth accepted
+/// connection inline on the listener thread, then panics (herdr-x843).
+const LISTENER_FAULT_ENV: &str = "HERDR_TEST_API_LISTENER_PANIC_AFTER";
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
-    path: PathBuf,
-    identity: SocketFileIdentity,
+    control: Arc<ListenerControl>,
+}
+
+/// State shared by the server handle and the api listener supervisor. The
+/// supervisor reads the real shutdown and handoff state from here: `running`
+/// is cleared when the handle drops, `server_stop` is the flag SIGTERM and
+/// server.stop set, and `socket.retired` is set when the socket file is
+/// removed for a live handoff.
+struct ListenerControl {
     running: Arc<AtomicBool>,
+    server_stop: Option<Arc<AtomicBool>>,
+    path: PathBuf,
+    socket: std::sync::Mutex<ListenerSocket>,
+    restarts: AtomicU64,
+}
+
+struct ListenerSocket {
+    identity: SocketFileIdentity,
+    retired: bool,
+}
+
+impl ListenerControl {
+    fn new(
+        running: Arc<AtomicBool>,
+        server_stop: Option<Arc<AtomicBool>>,
+        path: PathBuf,
+        identity: SocketFileIdentity,
+    ) -> Self {
+        Self {
+            running,
+            server_stop,
+            path,
+            socket: std::sync::Mutex::new(ListenerSocket {
+                identity,
+                retired: false,
+            }),
+            restarts: AtomicU64::new(0),
+        }
+    }
+
+    fn lock_socket(&self) -> std::sync::MutexGuard<'_, ListenerSocket> {
+        self.socket
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn serving_with(&self, socket: &ListenerSocket) -> bool {
+        self.running.load(Ordering::Acquire)
+            && !self
+                .server_stop
+                .as_ref()
+                .is_some_and(|stop| stop.load(Ordering::Acquire))
+            && !socket.retired
+    }
+
+    /// True while the server still expects the api listener to serve.
+    fn should_serve(&self) -> bool {
+        let socket = self.lock_socket();
+        self.serving_with(&socket)
+    }
+
+    /// Retires the socket (no respawn or rebind from now on) and removes the
+    /// socket file if it is still the one this server bound.
+    fn retire_socket(&self) -> std::io::Result<()> {
+        let mut socket = self.lock_socket();
+        socket.retired = true;
+        remove_socket_file_if_owned(&self.path, &socket.identity)
+    }
+
+    /// Readies the listener for a respawn. Returns false when the listener
+    /// must not come back: shutdown or handoff was requested, or the socket
+    /// path now belongs to another listener. A missing socket file is rebound.
+    fn prepare_restart(&self, listener: &mut LocalListener) -> std::io::Result<bool> {
+        let mut socket = self.lock_socket();
+        if !self.serving_with(&socket) {
+            return Ok(false);
+        }
+        match socket_file_identity(&self.path) {
+            Ok(identity) if identity == socket.identity => Ok(true),
+            Ok(_) => {
+                error!(
+                    path = %self.path.display(),
+                    "api socket path now belongs to another listener; not respawning the api listener"
+                );
+                Ok(false)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let rebound = bind_local_listener(&self.path)?;
+                restrict_socket_permissions(&self.path)?;
+                socket.identity = socket_file_identity(&self.path)?;
+                *listener = rebound;
+                warn!(path = %self.path.display(), "api socket file was missing; rebound it");
+                Ok(true)
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.control.running.store(false, Ordering::Release);
 
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
+                warn!(path = %self.control.path.display(), err = %err, "failed to remove api socket on shutdown");
             }
         }
     }
 }
 
 impl ServerHandle {
+    /// Removes the api socket file if this server still owns it. The listener
+    /// is retired first, so it is never respawned or rebound afterwards: the
+    /// live handoff calls this before the new server binds the same path.
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
-        remove_socket_file_if_owned(&self.path, &self.identity)
+        self.control.retire_socket()
     }
 }
 
@@ -117,44 +235,76 @@ fn start_server_inner(
     }
 
     let running = Arc::new(AtomicBool::new(true));
-    let listener_running = Arc::clone(&running);
-    let thread = std::thread::spawn(move || {
-        run_accept_loop(
-            listener.incoming(),
-            &listener_running,
-            ACCEPT_ERROR_BACKOFF,
-            |stream| {
-                let api_tx = api_tx.clone();
-                let event_hub = event_hub.clone();
-                let capabilities = capabilities.clone();
-                let server_stop = server_stop.clone();
-                let connection_running = Arc::clone(&listener_running);
-                #[cfg(unix)]
-                let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_connection_with_stop(
-                        stream,
-                        &api_tx,
-                        &event_hub,
-                        &connection_running,
-                        capabilities,
-                        server_stop.as_ref(),
-                        #[cfg(unix)]
-                        ssh_agents.as_ref(),
-                    ) {
-                        warn!(err = %err, "api connection failed");
-                    }
-                });
-            },
-        );
-        debug!("api server thread exiting");
-    });
+    let control = Arc::new(ListenerControl::new(
+        Arc::clone(&running),
+        server_stop.clone(),
+        path,
+        identity,
+    ));
+    let listener_control = Arc::clone(&control);
+    let fault_after = listener_fault_from_env();
+    let thread = std::thread::Builder::new()
+        .name("herdr-api-listener".to_string())
+        .spawn(move || {
+            let control = listener_control;
+            let mut reserve = ReserveWorker::start();
+            let mut outage = SpawnOutage::default();
+            let mut accepted = 0_u64;
+            let restarts = supervise_listener(
+                listener,
+                || control.should_serve(),
+                |listener| control.prepare_restart(listener),
+                |listener| {
+                    run_accept_loop(
+                        listener.incoming(),
+                        &control.running,
+                        ACCEPT_ERROR_BACKOFF,
+                        |stream| {
+                            accepted = accepted.saturating_add(1);
+                            let api_tx = api_tx.clone();
+                            let event_hub = event_hub.clone();
+                            let capabilities = capabilities.clone();
+                            let server_stop = server_stop.clone();
+                            let connection_running = Arc::clone(&control.running);
+                            #[cfg(unix)]
+                            let ssh_agents = ssh_agents.clone();
+                            let work = move || {
+                                if let Err(err) = handle_connection_with_stop(
+                                    stream,
+                                    &api_tx,
+                                    &event_hub,
+                                    &connection_running,
+                                    capabilities,
+                                    server_stop.as_ref(),
+                                    #[cfg(unix)]
+                                    ssh_agents.as_ref(),
+                                ) {
+                                    warn!(err = %err, "api connection failed");
+                                }
+                            };
+                            if fault_after == Some(accepted) {
+                                work();
+                                panic!("injected api listener fault ({LISTENER_FAULT_ENV})");
+                            }
+                            dispatch_connection(
+                                Box::new(work),
+                                CONNECTION_SPAWN_ATTEMPTS,
+                                CONNECTION_SPAWN_BACKOFF,
+                                spawn_named_connection_thread,
+                                &mut reserve,
+                                &mut outage,
+                            );
+                        },
+                    );
+                },
+                &control.restarts,
+            );
+            debug!(restarts, "api server thread exiting");
+        })?;
 
     Ok(ServerHandle {
         _thread: thread,
-        path,
-        identity,
-        running,
+        control,
     })
 }
 
@@ -190,6 +340,326 @@ fn run_accept_loop<S>(
                 }
             }
         }
+    }
+}
+
+fn listener_fault_from_env() -> Option<u64> {
+    std::env::var(LISTENER_FAULT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|after| *after > 0)
+}
+
+/// Runs the api accept loop and brings it back in-process when it dies (a
+/// panic or a return) while the server still expects it to serve. The
+/// server never exits on its own over a dead listener: an unwinding panic
+/// used to end only the accept thread and left the process up with no api
+/// listener (herdr-o0i8). A respawn waits with a doubling backoff, rebinds the
+/// socket when its file is gone, and stops for good once shutdown or handoff
+/// is requested. Returns the number of respawns.
+fn supervise_listener<L>(
+    mut listener: L,
+    should_serve: impl Fn() -> bool,
+    mut prepare_restart: impl FnMut(&mut L) -> io::Result<bool>,
+    mut body: impl FnMut(&L),
+    restarts: &AtomicU64,
+) -> u64 {
+    supervise_listener_with(
+        &mut listener,
+        should_serve,
+        &mut prepare_restart,
+        &mut body,
+        restarts,
+        RestartTiming::PRODUCTION,
+        std::thread::sleep,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestartTiming {
+    initial: Duration,
+    max: Duration,
+    healthy_run: Duration,
+    log_interval: Duration,
+}
+
+impl RestartTiming {
+    const PRODUCTION: Self = Self {
+        initial: LISTENER_RESTART_BACKOFF,
+        max: LISTENER_RESTART_BACKOFF_MAX,
+        healthy_run: LISTENER_HEALTHY_RUN,
+        log_interval: OUTAGE_LOG_INTERVAL,
+    };
+}
+
+fn supervise_listener_with<L>(
+    listener: &mut L,
+    should_serve: impl Fn() -> bool,
+    prepare_restart: &mut impl FnMut(&mut L) -> io::Result<bool>,
+    body: &mut impl FnMut(&L),
+    restarts: &AtomicU64,
+    timing: RestartTiming,
+    sleep: impl Fn(Duration),
+) -> u64 {
+    let mut delay = timing.initial;
+    let mut outage_since: Option<Instant> = None;
+    let mut last_log: Option<Instant> = None;
+    loop {
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(listener)));
+        if !should_serve() {
+            debug!("api listener ended after a shutdown or handoff request; not respawning");
+            return restarts.load(Ordering::Acquire);
+        }
+        let now = Instant::now();
+        if now.duration_since(started) >= timing.healthy_run {
+            delay = timing.initial;
+            outage_since = None;
+        }
+        let since = *outage_since.get_or_insert(now);
+        let deaths_logged = last_log.is_some_and(|at| {
+            outage_since == Some(since) && now.duration_since(at) < timing.log_interval
+        });
+        if !deaths_logged {
+            let cause = if result.is_err() {
+                "panicked"
+            } else {
+                "returned"
+            };
+            error!(
+                cause,
+                outage_secs = now.duration_since(since).as_secs(),
+                restarts = restarts.load(Ordering::Acquire),
+                "api listener died while the server is running; respawning it"
+            );
+            last_log = Some(now);
+        }
+        loop {
+            sleep(delay);
+            delay = delay.saturating_mul(2).min(timing.max);
+            if !should_serve() {
+                debug!("shutdown or handoff requested while the api listener was down");
+                return restarts.load(Ordering::Acquire);
+            }
+            match prepare_restart(listener) {
+                Ok(true) => break,
+                Ok(false) => return restarts.load(Ordering::Acquire),
+                Err(err) => {
+                    let now = Instant::now();
+                    if last_log.is_none_or(|at| now.duration_since(at) >= timing.log_interval) {
+                        error!(err = %err, "api listener cannot be rebound yet; retrying");
+                        last_log = Some(now);
+                    }
+                }
+            }
+        }
+        let total = restarts.fetch_add(1, Ordering::AcqRel) + 1;
+        info!(restarts = total, "api listener respawned");
+    }
+}
+
+type ConnectionWork = Box<dyn FnOnce() + Send + 'static>;
+
+fn spawn_named_connection_thread(work: ConnectionWork) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("herdr-api-conn".to_string())
+        .spawn(work)
+        .map(drop)
+}
+
+/// Starts `work` on a new thread through `spawn`, retrying with a doubling
+/// backoff when thread creation fails (EAGAIN under pids.max). On the final
+/// failure the work is handed back, not run and not dropped, with the error.
+fn spawn_connection_thread(
+    work: ConnectionWork,
+    attempts: u32,
+    backoff: Duration,
+    mut spawn: impl FnMut(ConnectionWork) -> io::Result<()>,
+) -> Result<(), (io::Error, ConnectionWork)> {
+    // A failed spawn drops the closure it was given, so the work lives in a
+    // shared slot and each attempt only carries a handle to it.
+    let slot = Arc::new(std::sync::Mutex::new(Some(work)));
+    let mut delay = backoff;
+    let mut last_err = None;
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        let attempt_slot = Arc::clone(&slot);
+        let attempt_work: ConnectionWork = Box::new(move || {
+            let work = attempt_slot.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(work) = work {
+                work();
+            }
+        });
+        match spawn(attempt_work) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    std::thread::sleep(delay);
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+    }
+    let err = last_err.unwrap_or_else(|| io::Error::other("connection thread spawn failed"));
+    let work = slot.lock().ok().and_then(|mut slot| slot.take());
+    match work {
+        Some(work) => Err((err, work)),
+        None => Ok(()),
+    }
+}
+
+/// One api worker thread started with the server and kept for the case where
+/// new threads cannot be created: when a connection thread cannot be spawned
+/// the connection is served here if the worker is idle, so ping and
+/// server.stop keep working through a sustained pids.max exhaustion.
+struct ReserveWorker {
+    tx: Option<std::sync::mpsc::SyncSender<ConnectionWork>>,
+}
+
+impl ReserveWorker {
+    fn start() -> Self {
+        let mut reserve = Self { tx: None };
+        reserve.ensure_started();
+        reserve
+    }
+
+    #[cfg(test)]
+    fn with_sender(tx: Option<std::sync::mpsc::SyncSender<ConnectionWork>>) -> Self {
+        Self { tx }
+    }
+
+    fn ensure_started(&mut self) {
+        if self.tx.is_some() {
+            return;
+        }
+        // A rendezvous channel: try_send succeeds only while the worker idles in recv.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<ConnectionWork>(0);
+        let spawned = std::thread::Builder::new()
+            .name("herdr-api-reserve".to_string())
+            .spawn(move || {
+                for work in rx {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+                        error!("api connection panicked on the reserve worker");
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => self.tx = Some(tx),
+            Err(err) => debug!(err = %err, "api reserve worker not started"),
+        }
+    }
+
+    /// Hands `work` to the reserve worker. Gives it back when the worker is
+    /// busy or missing.
+    fn try_serve(&mut self, work: ConnectionWork) -> Result<(), ConnectionWork> {
+        self.ensure_started();
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(work);
+        };
+        match tx.try_send(work) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(work)) => Err(work),
+            Err(std::sync::mpsc::TrySendError::Disconnected(work)) => {
+                self.tx = None;
+                Err(work)
+            }
+        }
+    }
+}
+
+/// Tracks connection thread spawn failures ACROSS connections. A spike
+/// shorter than SPAWN_OUTAGE_REPORT_AFTER stays at debug level; a longer
+/// outage logs an error, repeats it every OUTAGE_LOG_INTERVAL while it lasts,
+/// and logs once more when spawning works again.
+#[derive(Debug, Default)]
+struct SpawnOutage {
+    since: Option<Instant>,
+    failures: u64,
+    dropped: u64,
+    last_report: Option<Instant>,
+}
+
+impl SpawnOutage {
+    /// Records a failed spawn; returns true when it logged an error line.
+    fn record_failure(&mut self, now: Instant, err: &io::Error, dropped: bool) -> bool {
+        let since = *self.since.get_or_insert(now);
+        self.failures = self.failures.saturating_add(1);
+        if dropped {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        let outage = now.duration_since(since);
+        let due = self
+            .last_report
+            .is_none_or(|at| now.duration_since(at) >= OUTAGE_LOG_INTERVAL);
+        if outage >= SPAWN_OUTAGE_REPORT_AFTER && due {
+            error!(
+                err = %err,
+                outage_secs = outage.as_secs(),
+                failures = self.failures,
+                dropped = self.dropped,
+                "api connection threads cannot be spawned; serving on the reserve worker"
+            );
+            self.last_report = Some(now);
+            return true;
+        }
+        debug!(err = %err, dropped, "api connection thread spawn failed");
+        false
+    }
+
+    /// Records a successful spawn; returns true when it ended a reported outage.
+    fn record_success(&mut self, now: Instant) -> bool {
+        let Some(since) = self.since.take() else {
+            return false;
+        };
+        let reported = self.last_report.take().is_some();
+        if reported {
+            info!(
+                outage_secs = now.duration_since(since).as_secs(),
+                failures = self.failures,
+                dropped = self.dropped,
+                "api connection thread spawning recovered"
+            );
+        }
+        self.failures = 0;
+        self.dropped = 0;
+        reported
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dispatch {
+    Spawned,
+    Reserve,
+    Dropped,
+}
+
+/// Runs one accepted connection: on its own thread when one can be spawned,
+/// else on the idle reserve worker, else the connection is dropped (closed).
+fn dispatch_connection(
+    work: ConnectionWork,
+    attempts: u32,
+    backoff: Duration,
+    spawn: impl FnMut(ConnectionWork) -> io::Result<()>,
+    reserve: &mut ReserveWorker,
+    outage: &mut SpawnOutage,
+) -> Dispatch {
+    match spawn_connection_thread(work, attempts, backoff, spawn) {
+        Ok(()) => {
+            outage.record_success(Instant::now());
+            Dispatch::Spawned
+        }
+        Err((err, work)) => match reserve.try_serve(work) {
+            Ok(()) => {
+                outage.record_failure(Instant::now(), &err, false);
+                Dispatch::Reserve
+            }
+            Err(work) => {
+                drop(work);
+                outage.record_failure(Instant::now(), &err, true);
+                Dispatch::Dropped
+            }
+        },
     }
 }
 
@@ -233,6 +703,336 @@ mod accept_loop_tests {
         });
 
         assert_eq!(attempts, 3);
+    }
+
+    fn would_block() -> io::Error {
+        io::Error::from_raw_os_error(11)
+    }
+
+    const FAST: RestartTiming = RestartTiming {
+        initial: Duration::from_millis(1),
+        max: Duration::from_millis(4),
+        healthy_run: Duration::from_secs(3600),
+        log_interval: Duration::from_secs(3600),
+    };
+
+    // A control over a real file, so socket identity checks see a real inode.
+    fn test_control(server_stop: Option<Arc<AtomicBool>>) -> (ListenerControl, PathBuf) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-x843-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"").unwrap();
+        let identity = socket_file_identity(&path).unwrap();
+        let control = ListenerControl::new(
+            Arc::new(AtomicBool::new(true)),
+            server_stop,
+            path.clone(),
+            identity,
+        );
+        (control, path)
+    }
+
+    // herdr-x843: a panic in the accept thread used to end only that thread and
+    // left the process with no api listener. The supervisor brings it back.
+    #[test]
+    fn listener_selfheal_respawns_after_panic() {
+        let restarts = AtomicU64::new(0);
+        let mut runs = 0;
+        let (control, path) = test_control(None);
+        let total = supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| Ok(true),
+            &mut |_| {
+                runs += 1;
+                if runs < 3 {
+                    panic!("failed to spawn thread: WouldBlock");
+                }
+                control.running.store(false, Ordering::Release);
+            },
+            &restarts,
+            FAST,
+            |_| {},
+        );
+        assert_eq!(runs, 3);
+        assert_eq!(total, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn listener_selfheal_respawns_after_loop_return() {
+        let restarts = AtomicU64::new(0);
+        let mut runs = 0;
+        let (control, path) = test_control(None);
+        supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| Ok(true),
+            &mut |_| {
+                runs += 1;
+                if runs == 2 {
+                    control.running.store(false, Ordering::Release);
+                }
+            },
+            &restarts,
+            FAST,
+            |_| {},
+        );
+        assert_eq!(runs, 2);
+        assert_eq!(restarts.load(Ordering::Acquire), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // server.stop and SIGTERM set the server_stop flag; a listener death after
+    // it must not be respawned.
+    #[test]
+    fn listener_selfheal_no_respawn_after_stop_request() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (control, path) = test_control(Some(Arc::clone(&stop)));
+        let restarts = AtomicU64::new(0);
+        let mut runs = 0;
+        supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| Ok(true),
+            &mut |_| {
+                runs += 1;
+                if runs > 1 {
+                    control.running.store(false, Ordering::Release);
+                    return;
+                }
+                stop.store(true, Ordering::Release);
+                panic!("late panic during shutdown");
+            },
+            &restarts,
+            FAST,
+            |_| {},
+        );
+        assert_eq!(runs, 1);
+        assert_eq!(restarts.load(Ordering::Acquire), 0);
+        assert!(control.running.load(Ordering::Acquire));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The live handoff removes the socket file through retire_socket before
+    // the new server binds the path; the old listener must stay down after it.
+    #[test]
+    fn listener_selfheal_no_respawn_after_handoff_retire() {
+        let (control, path) = test_control(Some(Arc::new(AtomicBool::new(false))));
+        let restarts = AtomicU64::new(0);
+        let mut runs = 0;
+        supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| Ok(true),
+            &mut |_| {
+                runs += 1;
+                if runs > 1 {
+                    control.running.store(false, Ordering::Release);
+                    return;
+                }
+                control.retire_socket().unwrap();
+                panic!("listener died after the handoff");
+            },
+            &restarts,
+            FAST,
+            |_| {},
+        );
+        assert_eq!(runs, 1);
+        assert_eq!(restarts.load(Ordering::Acquire), 0);
+        assert!(!path.exists(), "retire removes the owned socket file");
+        assert!(control.running.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_selfheal_prepare_restart_refuses_after_retire() {
+        let (control, path) = test_control(None);
+        control.retire_socket().unwrap();
+        let socket = std::env::temp_dir().join(format!("herdr-x843-l-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let mut listener = bind_local_listener(&socket).unwrap();
+        assert!(!control.prepare_restart(&mut listener).unwrap());
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn listener_selfheal_backoff_doubles_and_caps() {
+        let (control, path) = test_control(None);
+        let restarts = AtomicU64::new(0);
+        let sleeps = std::sync::Mutex::new(Vec::new());
+        let mut runs = 0;
+        supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| Ok(true),
+            &mut |_| {
+                runs += 1;
+                if runs == 5 {
+                    control.running.store(false, Ordering::Release);
+                }
+            },
+            &restarts,
+            FAST,
+            |delay| sleeps.lock().unwrap().push(delay),
+        );
+        let sleeps = sleeps.into_inner().unwrap();
+        let ms: Vec<u128> = sleeps.iter().map(Duration::as_millis).collect();
+        assert_eq!(ms, vec![1, 2, 4, 4]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // A rebind that keeps failing is retried until it works, not given up.
+    #[test]
+    fn listener_selfheal_retries_failed_rebind() {
+        let (control, path) = test_control(None);
+        let restarts = AtomicU64::new(0);
+        let mut prepares = 0;
+        let mut runs = 0;
+        supervise_listener_with(
+            &mut (),
+            || control.should_serve(),
+            &mut |_| {
+                prepares += 1;
+                if prepares < 4 {
+                    return Err(would_block());
+                }
+                Ok(true)
+            },
+            &mut |_| {
+                runs += 1;
+                if runs == 2 {
+                    control.running.store(false, Ordering::Release);
+                }
+            },
+            &restarts,
+            FAST,
+            |_| {},
+        );
+        assert_eq!(prepares, 4);
+        assert_eq!(runs, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn listener_selfheal_spawn_retries_past_would_block() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_work = Arc::clone(&ran);
+        let mut calls = 0;
+        let result = spawn_connection_thread(
+            Box::new(move || ran_in_work.store(true, Ordering::Relaxed)),
+            5,
+            Duration::ZERO,
+            |work| {
+                calls += 1;
+                if calls < 3 {
+                    return Err(would_block());
+                }
+                work();
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+        assert!(ran.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn listener_selfheal_spawn_failure_hands_the_work_back() {
+        let mut calls = 0;
+        let result = spawn_connection_thread(Box::new(|| {}), 4, Duration::ZERO, |_work| {
+            calls += 1;
+            Err(would_block())
+        });
+        let (err, _work) = result.expect_err("every spawn attempt failed");
+        assert_eq!(err.raw_os_error(), Some(11));
+        assert_eq!(calls, 4);
+    }
+
+    // F1: with thread creation failing on every connection, connections are
+    // served on the reserve worker instead of being dropped one by one.
+    #[test]
+    fn listener_selfheal_sustained_spawn_failure_uses_reserve() {
+        let mut reserve = ReserveWorker::start();
+        let mut outage = SpawnOutage::default();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        for n in 0..3 {
+            let done_tx = done_tx.clone();
+            // Wait until the reserve worker idles in recv again.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let outcome = loop {
+                let done_tx = done_tx.clone();
+                let outcome = dispatch_connection(
+                    Box::new(move || done_tx.send(n).unwrap()),
+                    2,
+                    Duration::ZERO,
+                    |_| Err(would_block()),
+                    &mut reserve,
+                    &mut outage,
+                );
+                if outcome == Dispatch::Reserve || Instant::now() > deadline {
+                    break outcome;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(outcome, Dispatch::Reserve);
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), n);
+            drop(done_tx);
+        }
+        assert!(outage.since.is_some());
+    }
+
+    #[test]
+    fn listener_selfheal_busy_reserve_drops_the_connection() {
+        // A rendezvous sender whose receiver never receives is always busy.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<ConnectionWork>(0);
+        let mut reserve = ReserveWorker::with_sender(Some(tx));
+        let mut outage = SpawnOutage::default();
+        let connection = Arc::new(());
+        let held = Arc::clone(&connection);
+        let outcome = dispatch_connection(
+            Box::new(move || drop(held)),
+            1,
+            Duration::ZERO,
+            |_| Err(would_block()),
+            &mut reserve,
+            &mut outage,
+        );
+        assert_eq!(outcome, Dispatch::Dropped);
+        assert_eq!(
+            Arc::strong_count(&connection),
+            1,
+            "the connection is closed"
+        );
+        assert_eq!(outage.dropped, 1);
+    }
+
+    // A short spike stays quiet; a sustained outage is reported and repeated
+    // on the interval; recovery is reported only after a reported outage.
+    #[test]
+    fn listener_selfheal_spawn_outage_reporting() {
+        let err = would_block();
+        let t0 = Instant::now();
+        let mut outage = SpawnOutage::default();
+        assert!(!outage.record_failure(t0, &err, false));
+        assert!(!outage.record_failure(t0 + Duration::from_millis(500), &err, false));
+        assert!(!outage.record_success(t0 + Duration::from_secs(1)));
+
+        assert!(!outage.record_failure(t0, &err, false));
+        assert!(outage.record_failure(t0 + SPAWN_OUTAGE_REPORT_AFTER, &err, true));
+        assert!(!outage.record_failure(t0 + SPAWN_OUTAGE_REPORT_AFTER * 2, &err, false));
+        assert!(outage.record_failure(
+            t0 + SPAWN_OUTAGE_REPORT_AFTER + OUTAGE_LOG_INTERVAL,
+            &err,
+            false
+        ));
+        assert!(outage.record_success(t0 + OUTAGE_LOG_INTERVAL * 2));
+        assert!(outage.since.is_none());
     }
 }
 

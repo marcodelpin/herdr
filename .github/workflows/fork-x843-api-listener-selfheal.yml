@@ -1,0 +1,112 @@
+# Fork-only workflow for fix/x843-api-listener-selfheal (not for upstream). bd herdr-x843,
+# redo of herdr-o0i8 after codex round ho0i8-r1. The api listener is supervised in-process:
+# a dead accept loop is respawned with backoff (socket rebound if its file is gone), a reserve
+# worker serves connections while threads cannot be spawned, and the server never exits on its
+# own. No respawn after server.stop, SIGTERM or a live handoff.
+# Strict clippy (-D warnings) runs unscoped: herdr-9s1j is fixed on this branch. Every mutant
+# below must make at least one test fail, else the guard it removes is not load-bearing.
+name: Fork x843 api listener selfheal
+
+on:
+  push:
+    branches: [fix/x843-api-listener-selfheal]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  linux:
+    name: clippy, tests, mutants (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: clippy, rustfmt
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Format and strict clippy
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Crate unit tests
+        run: cargo test --locked --bin herdr
+
+      - name: Fork tests by name (count check)
+        run: |
+          cargo test --locked --bin herdr listener_selfheal_ 2>&1 | tee unit.txt
+          grep -q 'test result: ok. 12 passed' unit.txt || { echo "expected 12 listener_selfheal_ unit tests"; exit 1; }
+
+      - name: Subprocess tests (selfheal, api ping, headless server)
+        run: |
+          cargo test --locked --test api_listener_selfheal 2>&1 | tee sub.txt
+          grep -q 'listener_selfheal_respawns_and_answers_after_injected_death ... ok' sub.txt
+          grep -q 'listener_selfheal_no_respawn_after_server_stop ... ok' sub.txt
+          cargo test --locked --test api_ping
+          cargo test --locked --test server_headless
+
+      - name: Live handoff tests
+        run: cargo test --locked --test live_handoff
+
+      - name: Mutants (each must fail a test)
+        run: |
+          set -u
+          mutate() {
+            name="$1"; expr="$2"; shift 2
+            git checkout -- src/api/server.rs
+            perl -0pi -e "$expr" src/api/server.rs
+            if git diff --quiet -- src/api/server.rs; then echo "mutant $name did not apply"; exit 1; fi
+            if timeout 1200 "$@" > "mutant-$name.txt" 2>&1; then
+              tail -30 "mutant-$name.txt"; echo "mutant $name SURVIVED"; exit 1
+            fi
+            echo "mutant $name killed: $(grep -E 'FAILED|panicked' "mutant-$name.txt" | head -3 | tr '\n' ' ')"
+          }
+          unit="cargo test --locked --bin herdr listener_selfheal_"
+          sub="cargo test --locked --test api_listener_selfheal"
+          mutate respawn 's/Ok\(true\) => break,/Ok(true) => return 0,/' $unit
+          mutate respawn-sub 's/Ok\(true\) => break,/Ok(true) => return 0,/' $sub
+          mutate stop-flag 's/\.is_some_and\(\|stop\| stop\.load\(Ordering::Acquire\)\)/.is_some_and(|_stop| false)/' $unit
+          mutate stop-flag-sub 's/\.is_some_and\(\|stop\| stop\.load\(Ordering::Acquire\)\)/.is_some_and(|_stop| false)/' $sub
+          mutate handoff-retire 's/&& !socket\.retired/&& true/' $unit
+          mutate exit-on-death 's/(respawning it"\s*\);)/$1\n            std::process::exit(70);/' $sub
+          mutate reserve 's/match reserve\.try_serve\(work\)/match Err::<(), ConnectionWork>(work)/' $unit
+          mutate spawn-retry 's/for attempt in 1\.\.=attempts \{/for attempt in 1..=1 {/' $unit
+          git checkout -- src/api/server.rs
+
+  windows:
+    name: crate tests (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+      - name: Crate unit tests
+        run: cargo test --locked --bin herdr
