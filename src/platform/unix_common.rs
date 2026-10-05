@@ -242,6 +242,7 @@ pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }
 
+#[cfg(not(test))]
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
@@ -253,13 +254,26 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     }
 }
 
+// The disposition is process-wide. Under cfg(test) the unit tests share one
+// process, so these helpers leave it alone: SIG_DFL there would turn any other
+// test's write to a closed socket into a SIGPIPE kill of the test binary
+// (herdr-x843). The subprocess tests in tests/broken_pipe.rs cover the real
+// behavior against the built binary.
+#[cfg(not(test))]
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }
 
+#[cfg(not(test))]
 pub(crate) fn end_cli_output() {
     set_sigpipe_disposition(libc::SIG_IGN);
 }
+
+#[cfg(test)]
+pub(crate) fn begin_cli_output() {}
+
+#[cfg(test)]
+pub(crate) fn end_cli_output() {}
 
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
     super::RemoteSshConfigPaths {
