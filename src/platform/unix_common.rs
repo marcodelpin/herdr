@@ -634,3 +634,34 @@ mod shared_ssh_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+// herdr-x843: the unit tests share one process. A cli test that prints flips
+// SIGPIPE to its default through begin_cli_output, and from then on any other
+// test that writes to a closed socket kills the whole test binary (signal 13).
+#[cfg(test)]
+mod sigpipe_tests {
+    fn sigpipe_handler() -> libc::sighandler_t {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut action) };
+        action.sa_sigaction
+    }
+
+    #[test]
+    fn cli_output_helpers_leave_sigpipe_ignored_in_the_test_binary() {
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN, "Rust starts ignoring it");
+        super::begin_cli_output();
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN);
+        super::end_cli_output();
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN);
+    }
+
+    #[test]
+    fn write_to_a_closed_socket_is_an_error_not_a_signal() {
+        use std::io::Write;
+        let (mut near, far) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(far);
+        super::begin_cli_output();
+        let err = near.write_all(b"x").expect_err("peer is closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+}
