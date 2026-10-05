@@ -1826,14 +1826,28 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
         std::fs::create_dir_all(&root).unwrap();
         let executable = root.join("herdr test");
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-        let result = std::process::Command::new(&executable)
-            .args([
-                "--exact",
-                "app::api::plugins::tests::plugin_launch_survives_executable_replacement",
-                "--nocapture",
-            ])
-            .env(CHILD_ROOT, &root)
-            .output();
+        // A concurrent fork in another test can hold the copy's write fd until
+        // its exec, so the first spawn may see ETXTBSY: retry that, only.
+        let mut attempts = 0;
+        let result = loop {
+            let result = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "app::api::plugins::tests::plugin_launch_survives_executable_replacement",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, &root)
+                .output();
+            attempts += 1;
+            let busy = matches!(
+                &result,
+                Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+            );
+            if !busy || attempts >= 100 {
+                break result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
         std::fs::remove_dir_all(&root).unwrap();
         let output = result.unwrap();
         assert!(

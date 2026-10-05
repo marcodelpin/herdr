@@ -1995,6 +1995,8 @@ mod tests {
 
     #[test]
     fn finite_clipboard_commands_report_exit_status() {
+        // Resolves `sh` through PATH, which the fake-clipboard tests repoint.
+        let _guard = env_lock().lock().unwrap();
         let success = ClipboardCommand {
             program: "sh",
             args: &["-c", "cat >/dev/null"],
