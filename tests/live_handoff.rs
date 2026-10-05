@@ -585,6 +585,7 @@ fn live_server_holds_one_pty_master_fd_per_pane() {
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let server_pid = spawned
         .child
@@ -667,6 +668,7 @@ fn live_handoff_unknown_pane_exit_preserves_session_on_shutdown() {
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
@@ -1805,6 +1807,7 @@ fn live_handoff_preserves_python_http_server() {
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_api(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
     let created = request(
