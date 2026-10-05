@@ -118,6 +118,8 @@ pub struct App {
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
+    /// A refresh worker failed to start; retry it even without a client.
+    pub(crate) git_refresh_spawn_retry_pending: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) worktree_read_slots: std::sync::Arc<tokio::sync::Semaphore>,
@@ -547,13 +549,19 @@ impl App {
         );
         if version_check_enabled {
             let update_tx = event_tx.clone();
-            std::thread::spawn(move || crate::update::auto_update(update_tx));
+            if let Err(err) = crate::thread_spawn::spawn_named("herdr-update-check", move || {
+                crate::update::auto_update(update_tx)
+            }) {
+                tracing::warn!(err = %err, "failed to spawn update check thread");
+            }
         }
         if manifest_check_enabled {
             let manifest_update_tx = event_tx.clone();
-            std::thread::spawn(move || {
+            if let Err(err) = crate::thread_spawn::spawn_named("herdr-manifest-check", move || {
                 crate::detect::manifest_update::auto_update(manifest_update_tx)
-            });
+            }) {
+                tracing::warn!(err = %err, "failed to spawn agent manifest check thread");
+            }
         }
 
         let last_focus = state.active.and_then(|idx| {
@@ -580,6 +588,7 @@ impl App {
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
+            git_refresh_spawn_retry_pending: false,
             git_status_cache: HashMap::new(),
             pending_api_worktree_creates: HashMap::new(),
             worktree_read_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
