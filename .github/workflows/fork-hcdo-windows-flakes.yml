@@ -56,6 +56,11 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
       - name: Build test binary
         shell: bash
         run: cargo test --locked --bin herdr --no-run
@@ -80,5 +85,11 @@ jobs:
           for i in $(seq 1 15); do one cargo test --locked --bin herdr app::api::worktrees::tests; done
           for i in $(seq 1 15); do one cargo test --locked --bin herdr app::api::plugins::tests; done
           for i in $(seq 1 5); do one cargo test --locked --bin herdr; done
+          # The real CI harness: one process per test, all processes in parallel on the shared
+          # %APPDATA%/herdr tree. The XDG_CONFIG_HOME race above is impossible there, so a
+          # failure in this block names a cross-process cause.
+          for i in $(seq 1 30); do one cargo nextest run --locked --bin herdr -E "test(=$T1)"; done
+          for i in $(seq 1 30); do one cargo nextest run --locked --bin herdr -E "test(=$T2)"; done
+          for i in $(seq 1 5); do one cargo nextest run --locked --bin herdr -E 'not binary(live_handoff)'; done
           echo "iterations=$runs failures=$fails"
           test "$fails" -eq 0
