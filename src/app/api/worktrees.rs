@@ -594,6 +594,10 @@ mod tests {
         run_git(&repo, &["init", "--quiet"]);
         run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
         run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        // Windows git defaults to core.autocrlf=true: the checkout of a linked worktree
+        // then rewrites README.md as CRLF and `git status` has to re-hash it through the
+        // LF conversion, which can read the fixture as dirty before the stat cache settles.
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
@@ -2193,6 +2197,10 @@ mod tests {
                 checkout.to_str().unwrap(),
                 "HEAD",
             ],
+        );
+        assert!(
+            !crate::worktree::checkout_has_dirty_files(&checkout, false).unwrap(),
+            "fixture checkout must start clean"
         );
 
         let mut app = test_app();

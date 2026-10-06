@@ -980,7 +980,38 @@ action = "bootstrap"
         manifest
     }
 
+    thread_local! {
+        static PLUGIN_ENV_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Reentrant hold of the crate-wide config env lock. Linking creates dirs under
+    /// config_dir(), which follows the process-global XDG_CONFIG_HOME; tests that point
+    /// it at a scratch dir and delete that dir hold the lock for their whole body, so a
+    /// link racing the delete (or a test computing its expected dirs from a half-switched
+    /// env) fails, most visibly on Windows where deleted dirs linger as delete-pending.
+    struct PluginEnvGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+    impl Drop for PluginEnvGuard {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                PLUGIN_ENV_HELD.with(|held| held.set(false));
+            }
+        }
+    }
+
+    fn plugin_env_guard() -> PluginEnvGuard {
+        if PLUGIN_ENV_HELD.with(|held| held.get()) {
+            return PluginEnvGuard(None);
+        }
+        let guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PLUGIN_ENV_HELD.with(|held| held.set(true));
+        PluginEnvGuard(Some(guard))
+    }
+
     fn link_manifest(app: &mut App, root: &std::path::Path) {
+        let _env_guard = plugin_env_guard();
         let result = app.handle_api_request(Request {
             id: "link".into(),
             method: Method::PluginLink(PluginLinkParams {
@@ -997,6 +1028,7 @@ action = "bootstrap"
 
     #[test]
     fn plugin_link_creates_stable_config_and_state_dirs() {
+        let _env_guard = plugin_env_guard();
         let mut app = test_app();
         let root = unique_temp_path("plugin-link-dirs");
         let config_dir = super::env::plugin_config_dir("example.config-dirs");
@@ -1026,6 +1058,7 @@ platforms = ["linux", "macos", "windows"]
 
     #[test]
     fn plugin_link_seeds_stable_config_dir_from_legacy_unhashed_dir() {
+        let _env_guard = plugin_env_guard();
         let mut app = test_app();
         let root = unique_temp_path("plugin-link-legacy-config");
         let config_dir = super::env::plugin_config_dir("example.legacy-config");
@@ -1543,6 +1576,7 @@ platforms = ["linux", "macos"]
 
     #[test]
     fn plugin_pane_open_rejects_popup_size_for_non_popup_placement() {
+        let _env_guard = plugin_env_guard();
         let mut app = test_app();
         let root = unique_temp_path("plugin-pane-non-popup-size-param");
         write_manifest(&root);
@@ -2725,6 +2759,7 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_ACTION_ID\""]
     #[cfg(unix)]
     #[test]
     fn manifest_action_invoke_injects_plugin_paths() {
+        let _env_guard = plugin_env_guard();
         let mut app = test_app();
         let root = unique_temp_path("plugin-action-path-env");
         write_manifest_content(

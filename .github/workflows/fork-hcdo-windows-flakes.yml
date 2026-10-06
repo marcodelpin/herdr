@@ -1,0 +1,84 @@
+# Fork-only workflow for fix/hcdo-windows-test-flakes (not for upstream). bd herdr-hcdo, herdr-9exs.
+# Determinism gate for two Windows-only test flakes: each test runs 30 times alone, then the module
+# groups and the whole binary run under the normal parallel harness (cargo test, threads in one
+# process, so the process-global XDG_CONFIG_HOME race is reachable). Every iteration is counted and
+# the job fails if ANY failed. The matrix runs the unfixed base commit as well: that arm is expected
+# RED and proves the loop can reproduce the flakes; the head arm must be green.
+name: Fork hcdo windows flakes
+
+on:
+  push:
+    branches: [fix/hcdo-windows-test-flakes]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  loop:
+    name: loop (${{ matrix.arm }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: base-unfixed
+            ref: 2b4fee25
+          - arm: head-fixed
+            ref: ""
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Select source under test
+        shell: bash
+        env:
+          ARM_REF: ${{ matrix.ref }}
+        run: |
+          if [ -n "$ARM_REF" ]; then
+            git checkout "$ARM_REF" -- src Cargo.toml Cargo.lock
+          fi
+          git log --oneline -1
+          git status --short | head
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Build test binary
+        shell: bash
+        run: cargo test --locked --bin herdr --no-run
+
+      - name: Loop the two tests alone (30 each) and in parallel groups
+        shell: bash
+        run: |
+          fails=0
+          runs=0
+          T1=app::api::worktrees::tests::deferred_api_worktree_remove_rejects_duplicate_in_flight_request
+          T2=app::api::plugins::tests::output_changed_event_hooks_do_not_run_even_if_event_is_emitted
+          one() {
+            runs=$((runs + 1))
+            if ! "$@" > .loop.log 2>&1; then
+              fails=$((fails + 1))
+              echo "::error::FAILED: $*"
+              grep -E "panicked|assert|left|right|expected|LF will" .loop.log | head -8
+            fi
+          }
+          for i in $(seq 1 30); do one cargo test --locked --bin herdr "$T1" -- --exact; done
+          for i in $(seq 1 30); do one cargo test --locked --bin herdr "$T2" -- --exact; done
+          for i in $(seq 1 15); do one cargo test --locked --bin herdr app::api::worktrees::tests; done
+          for i in $(seq 1 15); do one cargo test --locked --bin herdr app::api::plugins::tests; done
+          for i in $(seq 1 5); do one cargo test --locked --bin herdr; done
+          echo "iterations=$runs failures=$fails"
+          test "$fails" -eq 0
