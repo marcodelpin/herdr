@@ -1,8 +1,8 @@
 # Fork-only workflow for ci/84qv-windows-bisect (not for upstream). bd herdr-84qv.
-# Places the first red of app::api::tests::agent_explain_evaluates_with_server_manifest_cache on
-# windows-latest: each matrix job checks out one sha, runs that single test 10 times under cargo
-# nextest (one process per run) and 10 times under plain cargo test --exact, then prints counts.
-# The job itself never fails on a red test, it only reports; read the "counts" step.
+# Step 2: ONE windows-latest job runs the FULL crate suite at 58019e7a three times in a row with the
+# upstream ci.yml filter and nothing else running, to see whether the full-suite failure of
+# agent_explain_evaluates_with_server_manifest_cache reproduces. The job never fails on a red
+# test, it only reports; read the "counts" step.
 name: Fork 84qv windows bisect
 
 on:
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: ["88389065", "900c619d", "2b4fee25", "58019e7a"]
+        sha: ["58019e7a"]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -57,38 +57,22 @@ jobs:
         shell: bash
         run: cargo test --locked --bin herdr --no-run
 
-      - name: Run the test 10x per harness and print counts
+      - name: Full suite 3x, print failing test names and counts
         shell: bash
         run: |
-          T=app::api::tests::agent_explain_evaluates_with_server_manifest_cache
-          nx_pass=0; nx_fail=0; nx_missing=0
-          cg_pass=0; cg_fail=0; cg_missing=0
-          for i in $(seq 1 10); do
-            if cargo nextest run --locked --bin herdr -E "test(=$T)" > .nx.log 2>&1; then
-              nx_pass=$((nx_pass + 1))
-            elif grep -q "no tests to run" .nx.log; then
-              nx_missing=$((nx_missing + 1))
-            else
-              nx_fail=$((nx_fail + 1))
-              grep -E "panicked|left:|right:" .nx.log | head -3
-            fi
+          for i in 1 2 3; do
+            echo "=== run $i ==="
+            rc=0
+            cargo nextest run --locked --bin herdr -E 'not binary(live_handoff)' \
+              --no-fail-fast --failure-output final > .nx$i.log 2>&1 || rc=$?
+            echo "run=$i rc=$rc"
+            grep -E "^\s+(FAIL|SIGABRT|SIGSEGV|TIMEOUT) " .nx$i.log | sort -u
+            grep -E "^\s+Summary" .nx$i.log
+            grep -E "agent_explain_evaluates_with_server_manifest_cache" .nx$i.log | head -5
+            echo "run=$i failed_names=$(grep -E '^\s+FAIL ' .nx$i.log | sort -u | wc -l)"
+            {
+              echo "### run $i rc=$rc"
+              grep -E "^\s+Summary" .nx$i.log
+              grep -E '^\s+FAIL ' .nx$i.log | sort -u | head -50
+            } >> "$GITHUB_STEP_SUMMARY"
           done
-          for i in $(seq 1 10); do
-            if cargo test --locked --bin herdr "$T" -- --exact > .cg.log 2>&1; then
-              if grep -q "running 0 tests" .cg.log; then
-                cg_missing=$((cg_missing + 1))
-              else
-                cg_pass=$((cg_pass + 1))
-              fi
-            else
-              cg_fail=$((cg_fail + 1))
-              grep -E "panicked|left:|right:" .cg.log | head -3
-            fi
-          done
-          echo "counts sha=${{ matrix.sha }} nextest pass=$nx_pass fail=$nx_fail missing=$nx_missing"
-          echo "counts sha=${{ matrix.sha }} cargo-test pass=$cg_pass fail=$cg_fail missing=$cg_missing"
-          {
-            echo "### sha ${{ matrix.sha }}"
-            echo "- nextest: pass=$nx_pass fail=$nx_fail missing=$nx_missing"
-            echo "- cargo test --exact: pass=$cg_pass fail=$cg_fail missing=$cg_missing"
-          } >> "$GITHUB_STEP_SUMMARY"
