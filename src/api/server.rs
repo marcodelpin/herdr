@@ -1255,6 +1255,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             handle_connection_with_stop(
                 server,
+                None,
                 &tx,
                 &EventHub::default(),
                 &Arc::new(AtomicBool::new(true)),
