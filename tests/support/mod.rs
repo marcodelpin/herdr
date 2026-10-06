@@ -549,11 +549,13 @@ fn ensure_cleanup_hooks() {
 
         let _ = CLEANUP_GUARD.set(CleanupGuard);
 
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |panic_info| {
-            cleanup_registered_herdr_pids();
-            previous_hook(panic_info);
-        }));
+        // No panic hook here. A panic hook runs for EVERY panic in the test
+        // process, including panics another test catches on purpose, and a
+        // process-wide kill there terminates the servers of every concurrent
+        // test mid-request (herdr-n67r: empty API responses under parallel
+        // runs). A panicking test still stops its own server through
+        // SpawnedHerdr::drop while unwinding; the watchdog, CleanupGuard and
+        // the atexit hook cover whatever outlives the process.
 
         let _ = ctrlc::set_handler(|| {
             cleanup_registered_herdr_pids();
@@ -857,6 +859,28 @@ mod tests {
             "herdr-watchdog-scoping-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn caught_panic_does_not_terminate_registered_processes() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Some(child.id());
+        register_spawned_herdr_pid(pid);
+
+        let caught = std::panic::catch_unwind(|| panic!("intentional test panic"));
+        assert!(caught.is_err());
+        let survived = child.try_wait().expect("poll sleep").is_none();
+
+        unregister_spawned_herdr_pid(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            survived,
+            "a panic caught in one test must not kill processes other tests registered"
+        );
     }
 
     #[test]
