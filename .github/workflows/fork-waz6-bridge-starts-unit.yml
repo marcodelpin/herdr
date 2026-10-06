@@ -63,7 +63,7 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=18
+          expected=19
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
@@ -143,6 +143,14 @@ jobs:
             file: src/remote/host.rs
             perl: 's/ServerStartPlan::DirectSpawn => \{\n            spawn_direct\(\)\?;/ServerStartPlan::DirectSpawn => {\n            start_unit()?;\n            spawn_direct()?;/'
             expect: "entry_spawns_directly_when_no_unit_is_installed"
+          - name: production host never asks the user manager
+            file: src/remote/host.rs
+            perl: 's/herdr_unit_state\(&self.systemctl, /herdr_unit_state(\&|_: \&[\&str]| -> io::Result<SystemctlOutput> { Err(io::Error::other("mutant")) }, \/* MUTANT *\/ /'
+            expect: "system_host_wires_unit_state_and_start_through_systemctl"
+          - name: production host start skips systemctl
+            file: src/remote/host.rs
+            perl: 's/systemctl_start_unit\(&self.systemctl\)/Ok(()) \/* MUTANT *\//'
+            expect: "system_host_wires_unit_state_and_start_through_systemctl"
           - name: bridge failure dropped by the saved client
             file: src/client/endpoint/supervisor.rs
             perl: 's/    reported.unwrap_or\(handshake_error\)/    let _ = reported; \/* MUTANT *\/\n    handshake_error/'

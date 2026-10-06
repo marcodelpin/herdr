@@ -39,7 +39,7 @@ pub(crate) fn run_remote_client_bridge(args: &[String]) -> io::Result<()> {
 }
 
 fn ensure_remote_server_running() -> io::Result<()> {
-    ensure_remote_server_running_with(&SystemHost)
+    ensure_remote_server_running_with(&SYSTEM_HOST)
 }
 
 /// The host facts and actions the bridge needs to bring a server up. `SystemHost` is production;
@@ -73,7 +73,15 @@ enum UnitState {
     Absent,
 }
 
-struct SystemHost;
+/// Production host. `systemctl` is the one process seam, so tests can check the wiring of
+/// `unit_state` and `start_unit` without a user manager.
+struct SystemHost {
+    systemctl: fn(&[&str]) -> io::Result<SystemctlOutput>,
+}
+
+const SYSTEM_HOST: SystemHost = SystemHost {
+    systemctl: run_systemctl,
+};
 
 impl RemoteHost for SystemHost {
     fn server_listening(&self) -> bool {
@@ -107,11 +115,11 @@ impl RemoteHost for SystemHost {
     }
 
     fn unit_state(&self) -> UnitState {
-        herdr_unit_state(&run_systemctl, &unit_dirs(&|name| std::env::var_os(name)))
+        herdr_unit_state(&self.systemctl, &unit_dirs(&|name| std::env::var_os(name)))
     }
 
     fn start_unit(&self) -> io::Result<()> {
-        systemctl_start_unit(&run_systemctl)
+        systemctl_start_unit(&self.systemctl)
     }
 
     fn spawn_direct(&self) -> io::Result<()> {
@@ -239,7 +247,7 @@ fn start_remote_server(
                     ),
                 )
             })?;
-            wait_for_socket(UNIT_START_WAIT).or_else(|_| spawn_direct()).map_err(|err| { /* MUTANT */
+            wait_for_socket(UNIT_START_WAIT).map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!(
@@ -609,6 +617,14 @@ mod tests {
 
     /// Runs the CLI session parsing for `args` and returns where the bridge's sockets land.
     fn target_for_cli(args: &[&str], env: &[(&str, &str)]) -> EndpointTarget {
+        // Same env vars as the session and update tests: hold both of their locks.
+        let _session_guard = crate::session::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(unix)]
+        let _update_guard = crate::update::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for name in [
             crate::session::SESSION_ENV_VAR,
             crate::api::SOCKET_PATH_ENV_VAR,
@@ -622,8 +638,8 @@ mod tests {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         crate::session::configure_from_args(&args).unwrap();
         let target = endpoint_target(
-            &SystemHost.effective_endpoint(),
-            &SystemHost.unit_endpoint(),
+            &SYSTEM_HOST.effective_endpoint(),
+            &SYSTEM_HOST.unit_endpoint(),
         );
         for (name, _) in env {
             std::env::remove_var(name);
@@ -736,6 +752,7 @@ mod tests {
 
     // --- unit discovery: ask systemd, scan every search dir only as the fallback ---
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unit_state_follows_the_user_manager_load_state() {
         let calls = RefCell::new(Vec::new());
@@ -767,6 +784,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unit_state_scans_the_dirs_when_systemd_cannot_be_asked() {
         let root = temp_root("scan");
@@ -858,5 +876,38 @@ mod tests {
         };
         let err = systemctl_start_unit(&refused).unwrap_err();
         assert!(err.to_string().contains("repeated too quickly"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_host_wires_unit_state_and_start_through_systemctl() {
+        thread_local! {
+            static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+        }
+        fn fake(args: &[&str]) -> io::Result<SystemctlOutput> {
+            CALLS.with(|calls| {
+                calls
+                    .borrow_mut()
+                    .push(args.iter().map(|a| a.to_string()).collect())
+            });
+            ok(if args.contains(&"show") { "loaded" } else { "" })
+        }
+        let host = SystemHost { systemctl: fake };
+        assert_eq!(host.unit_state(), UnitState::Installed);
+        host.start_unit().unwrap();
+        CALLS.with(|calls| {
+            let calls = calls.borrow();
+            assert_eq!(
+                calls[0],
+                [
+                    "--user",
+                    "show",
+                    "--property=LoadState",
+                    "--value",
+                    "herdr.service"
+                ]
+            );
+            assert_eq!(calls[1], ["--user", "start", "herdr.service"]);
+        });
     }
 }

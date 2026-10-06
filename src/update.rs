@@ -2500,6 +2500,12 @@ fn platform_target() -> (&'static str, &'static str) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The env-var lock this module's tests hold; other modules' tests that set the same vars share it.
+#[cfg(all(test, unix))]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    tests::env_lock()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2608,7 +2614,7 @@ mod tests {
         );
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
