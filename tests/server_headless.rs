@@ -535,3 +535,150 @@ fn no_hello_client_closed_within_five_seconds() {
 
     cleanup_spawned_herdr(spawned, base);
 }
+
+/// Outcome of one API request issued while the server may be shutting down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InFlightOutcome {
+    NotSent,
+    Reply,
+    ErrorReply,
+    Empty,
+    Reset,
+    Partial,
+    Hang,
+}
+
+fn request_during_shutdown(socket_path: &Path, id: &str) -> InFlightOutcome {
+    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+        return InFlightOutcome::NotSent;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let request = format!(r#"{{"id":"{id}","method":"workspace.list","params":{{}}}}"#);
+    if writeln!(stream, "{request}").is_err() {
+        return InFlightOutcome::NotSent;
+    }
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.ends_with(b"\n") {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return InFlightOutcome::Hang;
+            }
+            Err(_) if buf.is_empty() => return InFlightOutcome::Reset,
+            Err(_) => return InFlightOutcome::Partial,
+        }
+    }
+    if buf.is_empty() {
+        return InFlightOutcome::Empty;
+    }
+    match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(value) if value.get("error").is_some() => InFlightOutcome::ErrorReply,
+        Ok(_) => InFlightOutcome::Reply,
+        Err(_) => InFlightOutcome::Partial,
+    }
+}
+
+/// herdr-pttw: SIGTERM must not end the process while accepted API requests are
+/// unanswered. Before the fix, connection threads still reading or writing were
+/// killed by process exit: the client read EOF with no bytes, or ECONNRESET on a
+/// request it had already written.
+#[test]
+fn sigterm_answers_every_in_flight_api_request() {
+    let _lock = test_lock();
+    const ROUNDS: usize = 3;
+    const CLIENTS: usize = 24;
+    let mut totals = std::collections::HashMap::<InFlightOutcome, usize>::new();
+
+    for round in 0..ROUNDS {
+        let base = unique_test_dir();
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        let client_socket = runtime_dir.join("herdr-client.sock");
+
+        let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+        wait_for_socket(&api_socket, Duration::from_secs(10));
+        // The API socket is bound before the app loop installs the SIGTERM
+        // handler; measure the running server, not that startup window.
+        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        while request_during_shutdown(&api_socket, "ready") != InFlightOutcome::Reply {
+            assert!(Instant::now() < ready_deadline, "server never answered");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let pid = spawned.child.process_id().expect("server pid");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|client| {
+                let stop = stop.clone();
+                let api_socket = api_socket.clone();
+                thread::spawn(move || {
+                    let mut outcomes = Vec::new();
+                    let mut seq = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        seq += 1;
+                        let id = format!("r{round}-c{client}-{seq}");
+                        match request_during_shutdown(&api_socket, &id) {
+                            InFlightOutcome::NotSent => thread::sleep(Duration::from_millis(2)),
+                            outcome => outcomes.push(outcome),
+                        }
+                    }
+                    outcomes
+                })
+            })
+            .collect();
+
+        thread::sleep(Duration::from_millis(300));
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = spawned.child.try_wait() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        for client in clients {
+            for outcome in client.join().unwrap() {
+                *totals.entry(outcome).or_default() += 1;
+            }
+        }
+        cleanup_spawned_herdr(spawned, base);
+        assert!(exited, "server did not exit within 15s of SIGTERM");
+    }
+
+    let silent: usize = [
+        InFlightOutcome::Empty,
+        InFlightOutcome::Reset,
+        InFlightOutcome::Partial,
+        InFlightOutcome::Hang,
+    ]
+    .iter()
+    .map(|outcome| totals.get(outcome).copied().unwrap_or(0))
+    .sum();
+    assert!(
+        totals.get(&InFlightOutcome::Reply).copied().unwrap_or(0) > 0,
+        "no request was answered before SIGTERM: {totals:?}"
+    );
+    assert_eq!(
+        silent, 0,
+        "requests sent before or during SIGTERM got no reply: {totals:?}"
+    );
+}

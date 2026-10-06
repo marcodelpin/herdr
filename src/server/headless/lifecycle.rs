@@ -1,6 +1,9 @@
 use super::*;
 
 const LIVE_HANDOFF_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(6);
+/// Upper bound on how long shutdown waits for accepted API requests to be
+/// answered before the process exits.
+const API_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) fn wait_for_live_handoff_response_write(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -340,8 +343,18 @@ impl HeadlessServer {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Reject only the requests already queued when shutdown reached cleanup.
-        self.reject_queued_api_requests_for_shutdown();
+        // Reject the queued requests, then keep rejecting until every accepted
+        // API connection has written its reply: process exit kills connection
+        // threads mid-write and the client reads an empty reply (herdr-pttw).
+        match self.api_server.take() {
+            Some(api_server) => {
+                api_server.drain_for_shutdown(API_SHUTDOWN_DRAIN_TIMEOUT, || {
+                    self.reject_queued_api_requests_for_shutdown()
+                });
+                self.api_server = Some(api_server);
+            }
+            None => self.reject_queued_api_requests_for_shutdown(),
+        }
 
         // Close all client connections.
         let staged_files = self

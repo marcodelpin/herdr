@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,12 +32,33 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+const SHUTDOWN_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const SHUTDOWN_DRAIN_QUIET_POLLS: u32 = 3;
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Counts an accepted API connection until it has written its one-shot reply.
+/// Process exit kills connection threads, so shutdown waits on this count
+/// before returning (herdr-pttw).
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Drop for ServerHandle {
@@ -55,6 +76,47 @@ impl Drop for ServerHandle {
 impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, &self.identity)
+    }
+
+    /// Stops new API connections from reaching this server and waits, up to
+    /// `timeout`, until every accepted one-shot request has written its reply.
+    /// `reject_queued` answers requests already waiting in the app queue; it is
+    /// called on every poll because a connection thread can dispatch after the
+    /// app loop stopped draining. Streaming and wait methods do not count.
+    /// Returns false when the deadline passed with requests still in flight.
+    pub(crate) fn drain_for_shutdown(
+        &self,
+        timeout: Duration,
+        mut reject_queued: impl FnMut(),
+    ) -> bool {
+        if let Err(err) = self.remove_socket_file_if_owned() {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        let mut quiet_polls = 0;
+        loop {
+            reject_queued();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                // Connections still in the listen backlog are accepted within
+                // microseconds; a few quiet polls let them register first.
+                quiet_polls += 1;
+                if quiet_polls >= SHUTDOWN_DRAIN_QUIET_POLLS {
+                    return true;
+                }
+            } else {
+                quiet_polls = 0;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    in_flight = self.in_flight.load(Ordering::Acquire),
+                    "api requests still in flight at shutdown deadline"
+                );
+                return false;
+            }
+            std::thread::sleep(SHUTDOWN_DRAIN_POLL_INTERVAL);
+        }
     }
 }
 
@@ -118,6 +180,8 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let listener_in_flight = Arc::clone(&in_flight);
     let thread = std::thread::spawn(move || {
         run_accept_loop(
             listener.incoming(),
@@ -129,11 +193,15 @@ fn start_server_inner(
                 let capabilities = capabilities.clone();
                 let server_stop = server_stop.clone();
                 let connection_running = Arc::clone(&listener_running);
+                // Counted in the accept thread, before the connection thread
+                // exists, so a drain never misses an accepted connection.
+                let in_flight = InFlightGuard::new(&listener_in_flight);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection_with_stop(
                         stream,
+                        Some(in_flight),
                         &api_tx,
                         &event_hub,
                         &connection_running,
@@ -155,6 +223,7 @@ fn start_server_inner(
         path,
         identity,
         running,
+        in_flight,
     })
 }
 
@@ -283,6 +352,7 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     handle_connection_with_stop(
         stream,
+        None,
         api_tx,
         event_hub,
         running,
@@ -295,6 +365,7 @@ fn handle_connection(
 
 fn handle_connection_with_stop(
     mut stream: LocalStream,
+    in_flight: Option<InFlightGuard>,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -348,6 +419,14 @@ fn handle_connection_with_stop(
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
+    // Streams and waits can outlive any shutdown deadline; only one-shot
+    // requests hold the drain.
+    let _in_flight = if is_one_shot_method(&request.method) {
+        in_flight
+    } else {
+        drop(in_flight);
+        None
+    };
 
     match request.method {
         #[cfg(unix)]
@@ -510,6 +589,19 @@ fn finish_wait_response(
         Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
     }
     result
+}
+
+fn is_one_shot_method(method: &Method) -> bool {
+    match method {
+        #[cfg(unix)]
+        Method::ServerSshAgentRegister(_) => false,
+        Method::EventsSubscribe(_)
+        | Method::EventsWait(_)
+        | Method::AgentPrompt(_)
+        | Method::AgentWait(_)
+        | Method::PaneWaitForOutput(_) => false,
+        _ => true,
+    }
 }
 
 fn handle_request(
