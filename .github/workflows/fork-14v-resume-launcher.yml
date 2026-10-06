@@ -15,7 +15,7 @@ name: Fork 14v resume launcher
 
 on:
   push:
-    branches: [fix/14v-resume-launcher, fix/adopt-0.9.3]
+    branches: [fix/14v-resume-launcher, fix/adopt-0.9.3, fix/pttw-sigterm-inflight]
 
 permissions:
   contents: read
