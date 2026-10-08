@@ -66,13 +66,21 @@ jobs:
             cargo nextest run --locked --bin herdr -E 'not binary(live_handoff)' \
               --no-fail-fast --failure-output final > .nx$i.log 2>&1 || rc=$?
             echo "run=$i rc=$rc"
-            grep -E "^\s+(FAIL|SIGABRT|SIGSEGV|TIMEOUT) " .nx$i.log | sort -u
-            grep -E "^\s+Summary" .nx$i.log
-            grep -E "agent_explain_evaluates_with_server_manifest_cache" .nx$i.log | head -5
+            # A green run has no FAIL line, and grep exits 1 on zero matches:
+            # under `bash -e -o pipefail` that ended the job after run 1.
+            grep -E "^\s+(FAIL|SIGABRT|SIGSEGV|TIMEOUT) " .nx$i.log | sort -u || true
+            grep -E "^\s+Summary" .nx$i.log || true
+            grep -E "agent_explain_evaluates_with_server_manifest_cache" .nx$i.log | head -5 || true
             echo "run=$i failed_names=$(grep -E '^\s+FAIL ' .nx$i.log | sort -u | wc -l)"
             {
               echo "### run $i rc=$rc"
-              grep -E "^\s+Summary" .nx$i.log
-              grep -E '^\s+FAIL ' .nx$i.log | sort -u | head -50
+              grep -E "^\s+Summary" .nx$i.log || true
+              grep -E '^\s+FAIL ' .nx$i.log | sort -u | head -50 || true
             } >> "$GITHUB_STEP_SUMMARY"
+            echo "$rc" > ".nx$i.rc"
           done
+          # The job verdict is the three nextest exit codes, not the grep exit codes.
+          fails=0
+          for i in 1 2 3; do [ "$(cat .nx$i.rc)" = 0 ] || fails=$((fails + 1)); done
+          echo "nextest runs with failures: $fails of 3"
+          [ "$fails" -eq 0 ]
