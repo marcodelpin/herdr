@@ -658,3 +658,70 @@ fn server_stop_request_logs_its_caller() {
 
     cleanup_spawned_herdr(spawned, base);
 }
+
+/// A connection the server accepted, or that still sits in its listen
+/// backlog, when SIGTERM arrives was made to a live server. It gets an
+/// explicit error line before the process exits, never a close with no bytes.
+/// The clients withhold the end of their request, so every one of them is at
+/// that boundary when the signal lands; no timing puts them there.
+#[test]
+fn sigterm_answers_connections_that_have_not_finished_their_request() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
+    // The signal handler is installed right after this startup line; a
+    // SIGTERM before it kills the process outright (herdr-9ds0).
+    wait_for_log_line(
+        &server_log_path(&config_home),
+        "app.startup",
+        Duration::from_secs(30),
+    );
+    thread::sleep(Duration::from_millis(200));
+
+    let mut clients = Vec::new();
+    for index in 0..4 {
+        let mut client = UnixStream::connect(&api_socket).expect("connect to a live server");
+        client
+            .write_all(format!(r#"{{"id":"partial-{index}","method":"pi"#).as_bytes())
+            .unwrap();
+        clients.push(("partial request", client));
+    }
+    for _ in 0..4 {
+        let client = UnixStream::connect(&api_socket).expect("connect to a live server");
+        clients.push(("nothing sent", client));
+    }
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+
+    for (kind, client) in clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut line = String::new();
+        let read = BufReader::new(client).read_line(&mut line);
+        assert!(
+            matches!(read, Ok(bytes) if bytes > 0) && line.ends_with('\n'),
+            "connection with {kind} got no reply at shutdown: {read:?} {line:?}"
+        );
+        assert!(
+            line.contains(r#""code":"server_unavailable""#)
+                && line.contains("server is shutting down"),
+            "connection with {kind}: {line}"
+        );
+    }
+
+    assert!(
+        wait_for_exit(&mut spawned.child, Duration::from_secs(15)),
+        "server must stop on SIGTERM"
+    );
+    assert!(!api_socket.exists(), "api socket must be removed");
+
+    cleanup_spawned_herdr(spawned, base);
+}

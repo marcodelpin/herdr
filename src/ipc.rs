@@ -277,6 +277,72 @@ fn windows_named_pipe_closed_error(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(6 | 109 | 232 | 233))
 }
 
+/// Upper bound on connections taken out of the listen backlog at shutdown.
+const MAX_PENDING_CONNECTIONS_AT_SHUTDOWN: usize = 4096;
+
+/// Makes the listener refuse further connections where the platform can do it
+/// atomically. Linux fails `connect()` on a shut-down listening socket under
+/// the same lock that queues a connection, so every connection is either
+/// already queued or refused. Elsewhere this changes nothing and the caller
+/// relies on removing the public name and closing the listener.
+pub(crate) fn refuse_new_local_connections(listener: &LocalListener) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let LocalListener::UdSocket(listener) = listener;
+        // SAFETY: the descriptor is borrowed from a live listener for this call.
+        let _ = unsafe { libc::shutdown(listener.as_fd().as_raw_fd(), libc::SHUT_RD) };
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = listener;
+    }
+}
+
+/// Takes every connection already queued on the listener, without blocking.
+/// The listener stays in nonblocking accept mode; the caller closes it next.
+pub(crate) fn take_pending_local_connections(listener: &LocalListener) -> Vec<LocalStream> {
+    use interprocess::local_socket::{traits::Listener as _, ListenerNonblockingMode};
+
+    let mut pending = Vec::new();
+    if listener
+        .set_nonblocking(ListenerNonblockingMode::Accept)
+        .is_err()
+    {
+        return pending;
+    }
+    while pending.len() < MAX_PENDING_CONNECTIONS_AT_SHUTDOWN {
+        match listener.accept() {
+            Ok(stream) => pending.push(stream),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    pending
+}
+
+/// Returns once the peer has received everything written to `stream`.
+///
+/// A Unix socket keeps written bytes readable after the writer closes. A
+/// Windows named pipe discards them when the server end closes, and
+/// `interprocess` only flushes a dropped stream from a background thread that
+/// process exit kills, so the writer has to wait here itself.
+pub(crate) fn wait_until_peer_received(stream: &LocalStream) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = stream;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let LocalStream::NamedPipe(pipe) = stream;
+        pipe.inner().flush()
+    }
+}
+
 pub(crate) fn socket_file_identity(path: &Path) -> io::Result<SocketFileIdentity> {
     #[cfg(windows)]
     {

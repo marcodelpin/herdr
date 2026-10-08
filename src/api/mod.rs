@@ -1,4 +1,5 @@
 pub mod client;
+mod drain;
 mod event_hub;
 pub mod schema;
 mod server;
