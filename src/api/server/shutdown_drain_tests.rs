@@ -1,0 +1,519 @@
+//! Shutdown drain: a connection the server accepted gets a reply or an
+//! explicit `server_unavailable` error, never a close with no bytes.
+//!
+//! Every case holds its connection at one boundary with a barrier (the test
+//! owns the app side of the request channel, or the client withholds bytes),
+//! then announces shutdown. None of them depends on timing to reach the
+//! boundary.
+
+use super::*;
+use serde_json::Value;
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::AtomicU64;
+use tokio::sync::mpsc;
+
+/// Generous: only reached when the behavior under test is broken.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn unique_socket_path(name: &str) -> PathBuf {
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "herdr-drain-{name}-{}-{}.sock",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Line(String),
+    ClosedWithoutReply,
+    Failed(io::ErrorKind),
+}
+
+/// Reads one reply line on a helper thread so that a missing reply fails the
+/// test instead of hanging it.
+fn read_reply(stream: LocalStream) -> Outcome {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let outcome = match BufReader::new(stream).read_line(&mut line) {
+            Ok(_) if line.ends_with('\n') => Outcome::Line(line),
+            Ok(_) => Outcome::ClosedWithoutReply,
+            Err(err) => Outcome::Failed(err.kind()),
+        };
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(REPLY_TIMEOUT)
+        .expect("the client got neither a reply nor a close")
+}
+
+fn error_of(outcome: Outcome) -> (String, String, String) {
+    let Outcome::Line(line) = outcome else {
+        panic!("expected a reply line, got {outcome:?}");
+    };
+    let value: Value = serde_json::from_str(&line).expect("reply is one json line");
+    let text = |pointer: &str| {
+        value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("reply has no {pointer}: {line}"))
+            .to_owned()
+    };
+    (text("/id"), text("/error/code"), text("/error/message"))
+}
+
+fn assert_shutting_down(outcome: Outcome, id: &str) {
+    assert_eq!(
+        error_of(outcome),
+        (
+            id.to_owned(),
+            "server_unavailable".to_owned(),
+            "server is shutting down".to_owned()
+        )
+    );
+}
+
+/// Serves one accepted stream the way the accept loop does: counted first,
+/// then handed to its own thread.
+fn serve_connection(
+    drain: &Arc<ApiDrain>,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+    stream: LocalStream,
+) {
+    let in_flight = drain.admit();
+    let api_tx = api_tx.clone();
+    let running = Arc::clone(running);
+    std::thread::spawn(move || {
+        let _ = handle_connection_with_stop(
+            stream,
+            &api_tx,
+            &EventHub::default(),
+            &running,
+            None,
+            ConnectionShutdown {
+                server_stop: None,
+                in_flight,
+            },
+            #[cfg(unix)]
+            None,
+        );
+    });
+}
+
+/// The app side of the API: the test receives requests and decides whether a
+/// responder is ever answered.
+struct App {
+    drain: Arc<ApiDrain>,
+    running: Arc<AtomicBool>,
+    api_tx: ApiRequestSender,
+    api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
+    paths: Vec<PathBuf>,
+}
+
+impl App {
+    fn new() -> Self {
+        let (api_tx, api_rx) = mpsc::unbounded_channel();
+        Self {
+            drain: Arc::new(ApiDrain::default()),
+            running: Arc::new(AtomicBool::new(true)),
+            api_tx,
+            api_rx,
+            paths: Vec::new(),
+        }
+    }
+
+    fn serve(&self, stream: LocalStream) {
+        serve_connection(&self.drain, &self.api_tx, &self.running, stream);
+    }
+
+    /// An accepted connection and its client end.
+    fn connect(&mut self, name: &str) -> LocalStream {
+        use interprocess::local_socket::traits::Listener as _;
+
+        let path = unique_socket_path(name);
+        let listener = bind_local_listener(&path).unwrap();
+        self.paths.push(path.clone());
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        self.serve(listener.accept().unwrap());
+        client
+    }
+
+    /// Barrier: returns once the connection thread dispatched its request and
+    /// waits for the app. The caller keeps the message, so the responder
+    /// stays alive and unanswered.
+    fn held_request(&mut self) -> ApiRequestMessage {
+        let deadline = Instant::now() + REPLY_TIMEOUT;
+        loop {
+            match self.api_rx.try_recv() {
+                Ok(request) => return request,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "request never reached the app");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("app request channel closed: {err}"),
+            }
+        }
+    }
+
+    /// What `ServerHandle::drain_for_shutdown` announces.
+    fn begin_shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.drain.begin_shutdown();
+    }
+
+    fn assert_drained(&self) {
+        assert_eq!(self.drain.wait_idle(Instant::now() + REPLY_TIMEOUT), Ok(()));
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Windows listener marker files, and Unix socket files.
+        for path in self.paths.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A request the app took and holds unanswered is counted as in flight under
+/// its method and gets the explicit error once shutdown is announced.
+fn assert_held_request_is_answered(name: &str, method: &'static str, params: &str) {
+    let mut app = App::new();
+    let mut client = app.connect(name);
+    writeln!(
+        client,
+        r#"{{"id":"held","method":"{method}","params":{params}}}"#
+    )
+    .unwrap();
+
+    let held = app.held_request();
+    assert_eq!(
+        app.drain.in_flight_stages(),
+        vec![method],
+        "a dispatched request must hold shutdown"
+    );
+
+    app.begin_shutdown();
+
+    assert_shutting_down(read_reply(client), "held");
+    app.assert_drained();
+    drop(held);
+}
+
+#[test]
+fn queued_request_is_answered_at_shutdown() {
+    assert_held_request_is_answered("queued", "workspace.list", "{}");
+}
+
+#[test]
+fn agent_prompt_without_wait_holds_shutdown_and_is_answered() {
+    assert_held_request_is_answered(
+        "prompt",
+        "agent.prompt",
+        r#"{"target":"agent_1","text":"hello"}"#,
+    );
+}
+
+#[test]
+fn agent_prompt_with_wait_holds_shutdown_and_is_answered() {
+    assert_held_request_is_answered(
+        "prompt-wait",
+        "agent.prompt",
+        r#"{"target":"agent_1","text":"hello","wait":{"timeout_ms":60000}}"#,
+    );
+}
+
+#[test]
+fn deferred_alt_screen_read_is_answered_at_shutdown() {
+    // The app parks such a read in its pending or deferred list and stops
+    // polling it at shutdown; the responder is never answered.
+    assert_held_request_is_answered(
+        "alt-screen",
+        "pane.read",
+        r#"{"pane_id":"pane_1","source":"recent","lines":200}"#,
+    );
+}
+
+#[test]
+fn deferred_worktree_operation_is_answered_at_shutdown() {
+    // The completion of a worktree operation travels through the internal
+    // event queue, which shutdown no longer processes.
+    assert_held_request_is_answered("worktree", "worktree.create", r#"{"branch":"feature"}"#);
+}
+
+#[test]
+fn response_sent_before_shutdown_wins_over_the_shutdown_error() {
+    let mut app = App::new();
+    let mut client = app.connect("answered");
+    writeln!(
+        client,
+        r#"{{"id":"done","method":"workspace.list","params":{{}}}}"#
+    )
+    .unwrap();
+
+    let held = app.held_request();
+    // The app answered just before it announced shutdown. The connection
+    // thread must deliver that response, not replace it with the error.
+    held.respond_to
+        .send(r#"{"id":"done","result":{"type":"ok"}}"#.to_owned())
+        .unwrap();
+    app.begin_shutdown();
+
+    let Outcome::Line(line) = read_reply(client) else {
+        panic!("expected the app response");
+    };
+    assert_eq!(line.trim_end(), r#"{"id":"done","result":{"type":"ok"}}"#);
+    app.assert_drained();
+}
+
+#[test]
+fn reply_being_written_holds_shutdown_until_the_client_has_it() {
+    let mut app = App::new();
+    let mut client = app.connect("writing");
+    writeln!(
+        client,
+        r#"{{"id":"big","method":"workspace.list","params":{{}}}}"#
+    )
+    .unwrap();
+
+    // Larger than any socket or pipe buffer: the write cannot finish while
+    // the client is not reading.
+    let reply = format!(
+        r#"{{"id":"big","result":"{}"}}"#,
+        "x".repeat(8 * 1024 * 1024)
+    );
+    app.held_request().respond_to.send(reply.clone()).unwrap();
+    app.begin_shutdown();
+
+    assert_eq!(
+        app.drain
+            .wait_idle(Instant::now() + Duration::from_millis(300)),
+        Err(vec!["workspace.list"]),
+        "shutdown must wait for a reply the client has not read yet"
+    );
+
+    let Outcome::Line(line) = read_reply(client) else {
+        panic!("expected the full reply");
+    };
+    assert_eq!(
+        line.len(),
+        reply.len() + 1,
+        "the reply must not be truncated"
+    );
+    app.assert_drained();
+}
+
+#[test]
+fn client_still_sending_its_request_gets_an_explicit_error() {
+    let mut app = App::new();
+    let mut client = app.connect("slow");
+    // No newline: the request is incomplete and stays so.
+    client.write_all(br#"{"id":"slow","method":"pi"#).unwrap();
+    client.flush().unwrap();
+
+    app.begin_shutdown();
+
+    assert_shutting_down(read_reply(client), "");
+    app.assert_drained();
+}
+
+#[test]
+fn connected_client_that_sent_nothing_gets_an_explicit_error() {
+    let mut app = App::new();
+    let client = app.connect("idle");
+
+    app.begin_shutdown();
+
+    assert_shutting_down(read_reply(client), "");
+    app.assert_drained();
+}
+
+fn stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+    use interprocess::local_socket::traits::Listener as _;
+
+    let path = unique_socket_path(name);
+    let listener = bind_local_listener(&path).unwrap();
+    let client = crate::ipc::connect_local_stream(&path).unwrap();
+    let server = listener.accept().unwrap();
+    (client, server, path)
+}
+
+#[test]
+fn wait_that_ends_because_the_server_stops_is_told_so() {
+    let (client, mut server, path) = stream_pair("wait-stop");
+    let running = AtomicBool::new(false);
+
+    finish_wait_response(&mut server, None, "wait", "events.wait", false, &running).unwrap();
+    drop(server);
+
+    assert_shutting_down(read_reply(client), "wait");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn wait_that_ends_because_the_client_left_writes_nothing() {
+    let (client, mut server, path) = stream_pair("wait-left");
+    let running = AtomicBool::new(true);
+
+    finish_wait_response(&mut server, None, "wait", "events.wait", false, &running).unwrap();
+    drop(server);
+
+    assert_eq!(read_reply(client), Outcome::ClosedWithoutReply);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Connections already queued on the listener when shutdown begins were made
+/// to a live server. The accept loop serves them before it acknowledges that
+/// admission is closed, and nothing can connect after the acknowledgement.
+#[test]
+fn connections_queued_before_shutdown_are_served_and_later_ones_refused() {
+    let app = App::new();
+    let path = unique_socket_path("backlog");
+    let listener = bind_local_listener(&path).unwrap();
+    let identity = socket_file_identity(&path).unwrap();
+
+    // A named pipe has one pending instance; a Unix socket has a backlog.
+    let queued = if cfg!(windows) { 1 } else { 3 };
+    let clients: Vec<LocalStream> = (0..queued)
+        .map(|index| {
+            let mut client = crate::ipc::connect_local_stream(&path).unwrap();
+            writeln!(
+                client,
+                r#"{{"id":"q{index}","method":"ping","params":{{}}}}"#
+            )
+            .unwrap();
+            client
+        })
+        .collect();
+
+    // Nothing accepted them yet: the in-flight count is zero when shutdown
+    // is announced, which is the state a sampled counter misreads as idle.
+    assert!(app.drain.in_flight_stages().is_empty());
+    app.begin_shutdown();
+    assert!(
+        !app.drain.wait_admission_closed(Instant::now()),
+        "admission is not closed until the accept loop says so"
+    );
+
+    serve_api_listener(
+        listener,
+        &path,
+        &identity,
+        &app.running,
+        &app.drain,
+        |stream| app.serve(stream),
+    );
+
+    assert!(app.drain.admission_closed());
+    for (index, client) in clients.into_iter().enumerate() {
+        let Outcome::Line(line) = read_reply(client) else {
+            panic!("queued connection {index} got no reply");
+        };
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], format!("q{index}"));
+        assert!(reply["result"].is_object(), "{line}");
+    }
+    app.assert_drained();
+
+    assert!(!path.exists(), "the public name is removed");
+    assert!(
+        crate::ipc::connect_local_stream(&path).is_err(),
+        "no connection is admitted after the acknowledgement"
+    );
+}
+
+/// The whole path through `ServerHandle::drain_for_shutdown`: the accept
+/// thread is blocked in `accept()` and has to be woken, acknowledge, and the
+/// drain has to wait for a connection that is still in flight.
+#[test]
+fn drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted() {
+    let path = unique_socket_path("handle");
+    let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+    let listener = bind_local_listener(&path).unwrap();
+    let identity = socket_file_identity(&path).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let drain = Arc::new(ApiDrain::default());
+    let thread = {
+        let (path, identity) = (path.clone(), identity.clone());
+        let (running, drain) = (Arc::clone(&running), Arc::clone(&drain));
+        std::thread::spawn(move || {
+            serve_api_listener(listener, &path, &identity, &running, &drain, |stream| {
+                serve_connection(&drain, &api_tx, &running, stream)
+            });
+        })
+    };
+    let handle = ServerHandle {
+        _thread: thread,
+        path: path.clone(),
+        identity,
+        running,
+        drain,
+    };
+
+    let mut held_client = crate::ipc::connect_local_stream(&path).unwrap();
+    writeln!(
+        held_client,
+        r#"{{"id":"held","method":"workspace.list","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut slow_client = crate::ipc::connect_local_stream(&path).unwrap();
+    slow_client.write_all(br#"{"id":"slow","#).unwrap();
+    slow_client.flush().unwrap();
+
+    // Barrier: the first request is with the app, unanswered.
+    let held = api_rx.blocking_recv().expect("request reaches the app");
+
+    handle.drain_for_shutdown();
+
+    assert!(
+        handle.drain.admission_closed(),
+        "the accept loop acknowledged"
+    );
+    assert!(
+        handle.drain.in_flight_stages().is_empty(),
+        "the drain returned only after every accepted connection finished"
+    );
+    assert_shutting_down(read_reply(held_client), "held");
+    assert_shutting_down(read_reply(slow_client), "");
+    assert!(!path.exists());
+    assert!(crate::ipc::connect_local_stream(&path).is_err());
+    drop(held);
+}
+
+/// A named pipe drops unread bytes when the server end closes, so a reply
+/// only counts as delivered once the client has read it.
+#[cfg(windows)]
+#[test]
+fn windows_final_reply_is_not_delivered_until_the_client_read_it() {
+    use interprocess::local_socket::traits::Listener as _;
+
+    let path = unique_socket_path("flush");
+    let listener = bind_local_listener(&path).unwrap();
+    let client = crate::ipc::connect_local_stream(&path).unwrap();
+    let mut server = listener.accept().unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let result = write_final_reply(&mut server, r#"{"id":"flush"}"#);
+        let _ = done_tx.send(result);
+    });
+
+    // One-sided: a writer that does not wait for the client finishes at once.
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the reply must not count as delivered before the client read it"
+    );
+
+    assert_eq!(
+        read_reply(client),
+        Outcome::Line("{\"id\":\"flush\"}\n".to_owned())
+    );
+    done_rx
+        .recv_timeout(REPLY_TIMEOUT)
+        .expect("the writer returns once the client has the reply")
+        .unwrap();
+    writer.join().unwrap();
+    let _ = std::fs::remove_file(path);
+}

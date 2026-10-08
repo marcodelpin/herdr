@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(all(test, unix))]
 use std::fs;
 
+use crate::api::drain::{current_connection_drain, enter_connection, ApiDrain, InFlight};
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
@@ -18,11 +19,14 @@ use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_ou
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    poll_local_stream_read, refuse_new_local_connections, remove_socket_file_if_owned,
+    set_local_stream_polling, socket_file_identity, take_pending_local_connections,
+    wait_until_peer_received, LocalListener, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 
+#[cfg(test)]
+mod shutdown_drain_tests;
 #[cfg(test)]
 mod subscription_socket_tests;
 
@@ -33,12 +37,27 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// How often a connection thread waiting for the app looks for shutdown.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long shutdown waits for the accept loop to acknowledge that it stopped.
+const API_ADMISSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on the whole API shutdown drain.
+///
+/// It covers the longest I/O an accepted connection can still be in: a reply
+/// write, which gives up after `STREAM_WRITE_TIMEOUT`. Reads need no share of
+/// it: a connection still sending its request when shutdown begins gets an
+/// explicit error within one `CONNECTION_POLL_INTERVAL`, and a connection
+/// waiting for the app answers for itself within one `SHUTDOWN_POLL_INTERVAL`.
+/// Whatever is still in flight at expiry is abandoned and logged.
+const API_SHUTDOWN_DRAIN_TIMEOUT: Duration =
+    STREAM_WRITE_TIMEOUT.saturating_add(Duration::from_secs(2));
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    drain: Arc<ApiDrain>,
 }
 
 impl Drop for ServerHandle {
@@ -56,6 +75,52 @@ impl Drop for ServerHandle {
 impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, &self.identity)
+    }
+
+    /// Stops admitting API connections and waits until every accepted one has
+    /// its reply or an explicit error. Call only once the app loop no longer
+    /// handles requests: from here on connection threads answer for themselves.
+    pub(crate) fn drain_for_shutdown(&self) {
+        let deadline = Instant::now() + API_SHUTDOWN_DRAIN_TIMEOUT;
+        self.running.store(false, Ordering::Relaxed);
+        self.drain.begin_shutdown();
+
+        if self.drain.admission_closed() || self.wake_accept_loop() {
+            let acknowledge_by = deadline.min(Instant::now() + API_ADMISSION_CLOSE_TIMEOUT);
+            if !self.drain.wait_admission_closed(acknowledge_by) {
+                warn!(
+                    path = %self.path.display(),
+                    "api accept loop did not acknowledge shutdown; connections still queued on the listener are abandoned"
+                );
+            }
+        } else {
+            debug!(
+                path = %self.path.display(),
+                "api socket is no longer ours; accept loop not woken for shutdown"
+            );
+        }
+
+        match self.drain.wait_idle(deadline) {
+            Ok(()) => debug!("api shutdown drain complete"),
+            Err(abandoned) => warn!(
+                count = abandoned.len(),
+                stages = ?abandoned,
+                timeout_ms = API_SHUTDOWN_DRAIN_TIMEOUT.as_millis() as u64,
+                "api shutdown drain timed out; abandoning accepted connections without a reply"
+            ),
+        }
+    }
+
+    /// The accept thread blocks in `accept()`; a throwaway connection makes it
+    /// return and observe the shutdown. Only our own socket is touched: after
+    /// a live handoff the path belongs to the next server.
+    fn wake_accept_loop(&self) -> bool {
+        match socket_file_identity(&self.path) {
+            Ok(identity) if identity == self.identity => {
+                crate::ipc::connect_local_stream(&self.path).is_ok()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -119,12 +184,21 @@ fn start_server_inner(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let drain = Arc::new(ApiDrain::default());
+    let accept_drain = Arc::clone(&drain);
+    let accept_path = path.clone();
+    let accept_identity = identity.clone();
     let spawned = crate::thread_spawn::spawn_named("herdr-api-accept", move || {
-        run_accept_loop(
-            listener.incoming(),
+        serve_api_listener(
+            listener,
+            &accept_path,
+            &accept_identity,
             &listener_running,
-            ACCEPT_ERROR_BACKOFF,
+            &accept_drain,
             |stream| {
+                // Counted here, on the accept thread: the connection is in
+                // flight before its worker exists and before shutdown can ask.
+                let in_flight = accept_drain.admit();
                 let api_tx = api_tx.clone();
                 let event_hub = event_hub.clone();
                 let capabilities = capabilities.clone();
@@ -139,7 +213,10 @@ fn start_server_inner(
                         &event_hub,
                         &connection_running,
                         capabilities,
-                        server_stop.as_ref(),
+                        ConnectionShutdown {
+                            server_stop: server_stop.as_ref(),
+                            in_flight,
+                        },
                         #[cfg(unix)]
                         ssh_agents.as_ref(),
                     ) {
@@ -164,7 +241,48 @@ fn start_server_inner(
         path,
         identity,
         running,
+        drain,
     })
+}
+
+/// Runs the accept loop on `listener`. When the loop ends the listener is
+/// closed first and admission is acknowledged as stopped only afterwards, so
+/// the acknowledgement means no connection can be taken any more.
+fn serve_api_listener(
+    listener: LocalListener,
+    path: &Path,
+    identity: &SocketFileIdentity,
+    running: &AtomicBool,
+    drain: &ApiDrain,
+    handle: impl FnMut(LocalStream),
+) {
+    run_accept_loop(
+        listener.incoming(),
+        running,
+        ACCEPT_ERROR_BACKOFF,
+        drain,
+        || close_api_admission(&listener, path, identity),
+        handle,
+    );
+    drop(listener);
+    drain.acknowledge_admission_closed();
+}
+
+/// Stops new API connections and returns the ones that were already queued.
+/// The order matters: refuse or unlink first, so nothing can queue behind the
+/// last connection taken.
+fn close_api_admission(
+    listener: &LocalListener,
+    path: &Path,
+    identity: &SocketFileIdentity,
+) -> Vec<LocalStream> {
+    refuse_new_local_connections(listener);
+    if let Err(err) = remove_socket_file_if_owned(path, identity) {
+        if err.kind() != io::ErrorKind::NotFound {
+            warn!(path = %path.display(), err = %err, "failed to remove api socket on shutdown");
+        }
+    }
+    take_pending_local_connections(listener)
 }
 
 /// Starts one connection's worker. When the OS refuses a thread, only this
@@ -179,6 +297,8 @@ fn run_accept_loop<S>(
     incoming: impl IntoIterator<Item = io::Result<S>>,
     running: &AtomicBool,
     error_backoff: Duration,
+    drain: &ApiDrain,
+    mut close_admission: impl FnMut() -> Vec<S>,
     mut handle: impl FnMut(S),
 ) {
     let mut consecutive_errors = 0_u64;
@@ -191,6 +311,8 @@ fn run_accept_loop<S>(
                 }
                 handle(stream);
             }
+            // A draining server expects its listener to fail; go close it.
+            Err(_) if drain.is_draining() => {}
             Err(err) => {
                 if !running.load(Ordering::Relaxed) {
                     break;
@@ -202,10 +324,18 @@ fn run_accept_loop<S>(
                 }
                 consecutive_errors = consecutive_errors.saturating_add(1);
                 std::thread::sleep(error_backoff);
-                if !running.load(Ordering::Relaxed) {
+                if !running.load(Ordering::Relaxed) && !drain.is_draining() {
                     break;
                 }
             }
+        }
+        if drain.is_draining() {
+            // Shutdown began. Close admission, then serve what was queued
+            // before it closed: those clients connected to a live server.
+            for stream in close_admission() {
+                handle(stream);
+            }
+            break;
         }
     }
 }
@@ -227,10 +357,64 @@ mod accept_loop_tests {
             [Ok(1), accept_error(), accept_error(), Ok(2)],
             &running,
             Duration::ZERO,
+            &ApiDrain::default(),
+            Vec::new,
             |stream| handled.push(stream),
         );
 
         assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn shutdown_serves_the_queued_connections_then_stops_accepting() {
+        let running = AtomicBool::new(true);
+        let drain = ApiDrain::default();
+        let mut handled = Vec::new();
+        let mut closed = 0;
+        let incoming = [Ok(1), Ok(2), Ok(99)].into_iter().inspect(|stream| {
+            // Shutdown begins while connection 2 is being accepted.
+            if matches!(stream, Ok(2)) {
+                drain.begin_shutdown();
+            }
+        });
+
+        run_accept_loop(
+            incoming,
+            &running,
+            Duration::ZERO,
+            &drain,
+            || {
+                closed += 1;
+                vec![3, 4]
+            },
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(closed, 1, "admission is closed exactly once");
+        assert_eq!(
+            handled,
+            vec![1, 2, 3, 4],
+            "the accepted connection and the queued ones are served, nothing after"
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_admission_when_the_listener_fails() {
+        let running = AtomicBool::new(false);
+        let drain = ApiDrain::default();
+        drain.begin_shutdown();
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [accept_error(), Ok(99)],
+            &running,
+            Duration::ZERO,
+            &drain,
+            || vec![7],
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(handled, vec![7]);
     }
 
     #[test]
@@ -239,10 +423,17 @@ mod accept_loop_tests {
         let (tx, rx) = std::sync::mpsc::channel();
 
         crate::thread_spawn::test_hook::fail_next_spawns(1);
-        run_accept_loop([Ok(1), Ok(2)], &running, Duration::ZERO, |stream| {
-            let tx = tx.clone();
-            spawn_connection_handler(move || tx.send(stream).unwrap());
-        });
+        run_accept_loop(
+            [Ok(1), Ok(2)],
+            &running,
+            Duration::ZERO,
+            &ApiDrain::default(),
+            Vec::new,
+            |stream| {
+                let tx = tx.clone();
+                spawn_connection_handler(move || tx.send(stream).unwrap());
+            },
+        );
         drop(tx);
 
         assert_eq!(rx.iter().collect::<Vec<_>>(), vec![2]);
@@ -260,9 +451,14 @@ mod accept_loop_tests {
             Some(accept_error())
         });
 
-        run_accept_loop(incoming, &running, Duration::ZERO, |_| {
-            panic!("no connection should be handled")
-        });
+        run_accept_loop(
+            incoming,
+            &running,
+            Duration::ZERO,
+            &ApiDrain::default(),
+            Vec::new,
+            |_| panic!("no connection should be handled"),
+        );
 
         assert_eq!(attempts, 3);
     }
@@ -319,10 +515,21 @@ fn handle_connection(
         event_hub,
         running,
         capabilities,
-        None,
+        ConnectionShutdown {
+            server_stop: None,
+            in_flight: Arc::new(ApiDrain::default()).admit(),
+        },
         #[cfg(unix)]
         None,
     )
+}
+
+/// What one connection needs to take part in server shutdown.
+struct ConnectionShutdown<'a> {
+    server_stop: Option<&'a ServerStop>,
+    /// Held until the reply is written. Dropped early only by the handlers
+    /// that keep a connection open after replying.
+    in_flight: InFlight,
 }
 
 fn handle_connection_with_stop(
@@ -331,15 +538,29 @@ fn handle_connection_with_stop(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
-    server_stop: Option<&ServerStop>,
+    shutdown: ConnectionShutdown<'_>,
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
 ) -> std::io::Result<()> {
+    let ConnectionShutdown {
+        server_stop,
+        in_flight,
+    } = shutdown;
+    let _connection = enter_connection(Arc::clone(in_flight.drain()));
+
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
 
-    let Some(line) = read_initial_request_line(&mut stream)? else {
-        return Ok(());
+    let line = match read_initial_request_line(&mut stream) {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(()),
+        Err(err) if is_shutdown_before_request(&err) => {
+            // The client connected to a live server and has not finished its
+            // request. Shutdown does not wait out the read timeout for it and
+            // does not drop it silently either.
+            return write_final_reply(&mut stream, &shutting_down_response(String::new()));
+        }
+        Err(err) => return Err(err),
     };
 
     let line = line.trim();
@@ -372,6 +593,7 @@ fn handle_connection_with_stop(
                     },
                 });
             write_json_line_allow_disconnect(&mut stream, &response)?;
+            make_reply_consumable(&stream);
             return Ok(());
         }
     };
@@ -379,6 +601,7 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+    in_flight.set_stage(method);
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
@@ -390,7 +613,7 @@ fn handle_connection_with_stop(
             let lease = match lease {
                 Ok(lease) => lease,
                 Err(error) => {
-                    return write_text_line_allow_disconnect(
+                    return write_final_reply(
                         &mut stream,
                         &error_response_json(
                             request_id,
@@ -411,6 +634,9 @@ fn handle_connection_with_stop(
                     result: ResponseResult::Ok {},
                 },
             )?;
+            // Replied. The connection stays open only to hold the lease, so it
+            // must not hold shutdown.
+            drop(in_flight);
             set_local_stream_polling(&mut stream, true)?;
             let mut byte = [0];
             while running.load(Ordering::Relaxed) {
@@ -426,6 +652,8 @@ fn handle_connection_with_stop(
             Ok(())
         }
         Method::EventsSubscribe(params) => {
+            // A subscription is a stream with no final reply to wait for.
+            drop(in_flight);
             let result = stream_subscriptions(
                 stream,
                 request_id.clone(),
@@ -456,8 +684,17 @@ fn handle_connection_with_stop(
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(
+                &mut stream,
+                response,
+                &request_id,
+                method,
+                changes_ui,
+                running,
+            )
         }
+        // With `wait` unset this is a plain dispatch that returns a response,
+        // with it set a wait: both end in a reply, so both stay in flight.
         Method::AgentPrompt(params) => {
             let response = prompt_agent(
                 request_id.clone(),
@@ -467,7 +704,14 @@ fn handle_connection_with_stop(
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(
+                &mut stream,
+                response,
+                &request_id,
+                method,
+                changes_ui,
+                running,
+            )
         }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
@@ -478,12 +722,26 @@ fn handle_connection_with_stop(
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(
+                &mut stream,
+                response,
+                &request_id,
+                method,
+                changes_ui,
+                running,
+            )
         }
         Method::PaneWaitForOutput(params) => {
             let response =
                 wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(
+                &mut stream,
+                response,
+                &request_id,
+                method,
+                changes_ui,
+                running,
+            )
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
@@ -502,6 +760,7 @@ fn handle_connection_with_stop(
                 Some(response_write_rx),
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
+            make_reply_consumable(&stream);
             let _ = response_write_tx.send(());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -525,17 +784,25 @@ fn finish_wait_response(
     request_id: &str,
     method: &'static str,
     changes_ui: bool,
+    running: &AtomicBool,
 ) -> std::io::Result<()> {
-    let Some(response) = response else {
-        crate::logging::api_request_completed(
-            request_id,
-            method,
-            "client_disconnected",
-            changes_ui,
-        );
-        return Ok(());
+    let response = match response {
+        Some(response) => response,
+        // A wait that ended without a response while the server stops did not
+        // lose its client: the server is leaving. Say so instead of closing.
+        None if !running.load(Ordering::Relaxed) => shutting_down_response(request_id.to_owned()),
+        None => {
+            crate::logging::api_request_completed(
+                request_id,
+                method,
+                "client_disconnected",
+                changes_ui,
+            );
+            return Ok(());
+        }
     };
     let result = write_text_line_allow_disconnect(stream, &response);
+    make_reply_consumable(stream);
     match &result {
         Ok(()) => crate::logging::api_request_completed(
             request_id,
@@ -767,6 +1034,11 @@ fn read_initial_request_line_with_limits(
                 }
             }
             LocalStreamRead::Pending => {
+                // Everything the client sent so far has been read. A request
+                // that is complete was returned above; this one is not.
+                if current_connection_drain().is_some_and(|drain| drain.is_draining()) {
+                    break Err(io::Error::other(ShutdownBeforeRequest));
+                }
                 if Instant::now() >= deadline {
                     break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -779,6 +1051,27 @@ fn read_initial_request_line_with_limits(
     };
     set_local_stream_polling(stream, false)?;
     result
+}
+
+/// The server began shutting down before the client finished its request.
+#[derive(Debug)]
+struct ShutdownBeforeRequest;
+
+impl std::fmt::Display for ShutdownBeforeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("server began shutting down before the api request was complete")
+    }
+}
+
+impl std::error::Error for ShutdownBeforeRequest {}
+
+fn is_shutdown_before_request(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<ShutdownBeforeRequest>())
+}
+
+fn shutting_down_response(id: String) -> String {
+    error_response_json(id, "server_unavailable", "server is shutting down".into())
 }
 
 #[cfg(all(test, windows))]
@@ -1006,6 +1299,23 @@ fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> st
     }
 }
 
+/// Waits until the peer can read the reply even if the process exits right
+/// after. Called before the connection stops counting as in flight.
+fn make_reply_consumable(stream: &LocalStream) {
+    if let Err(err) = wait_until_peer_received(stream) {
+        if !is_connection_closed_error(&err) {
+            debug!(err = %err, "api reply was not confirmed as received");
+        }
+    }
+}
+
+/// Writes the last line of a connection.
+fn write_final_reply(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
+    let result = write_text_line_allow_disconnect(stream, value);
+    make_reply_consumable(stream);
+    result
+}
+
 fn write_json_line<T: serde::Serialize>(
     stream: &mut LocalStream,
     value: &T,
@@ -1078,23 +1388,46 @@ fn dispatch_to_app(
         );
     }
 
-    let response = match timeout {
-        Some(timeout) => response_rx.recv_timeout(timeout).map_err(|err| match err {
-            std::sync::mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
+    // The app may hold this responder for a long time or never answer it: a
+    // request still queued, a deferred alternate-screen read, a worktree
+    // operation whose completion travels through the event queue. Once
+    // shutdown is announced the app handles nothing more, so an empty channel
+    // stays empty and this thread, which owns the stream, answers itself.
+    let drain = current_connection_drain();
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let response = loop {
+        let wait = match deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(SHUTDOWN_POLL_INTERVAL),
+            None => SHUTDOWN_POLL_INTERVAL,
+        };
+        match response_rx.recv_timeout(wait) {
+            Ok(response) => break Ok(response),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "app response channel closed",
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if drain.as_ref().is_some_and(|drain| drain.is_draining()) {
+            // A response sent before the announcement is already queued.
+            match response_rx.try_recv() {
+                Ok(response) => break Ok(response),
+                Err(_) => return shutting_down_response(request_id),
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "timed out waiting for app response after {} ms",
-                    timeout.as_millis()
+                    timeout.unwrap_or_default().as_millis()
                 ),
-            ),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "app response channel closed",
-            ),
-        }),
-        None => response_rx
-            .recv()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err)),
+            ));
+        }
     };
 
     match response {
@@ -1206,7 +1539,10 @@ mod tests {
                 &EventHub::default(),
                 &Arc::new(AtomicBool::new(true)),
                 None,
-                None,
+                ConnectionShutdown {
+                    server_stop: None,
+                    in_flight: Arc::new(ApiDrain::default()).admit(),
+                },
                 Some(&worker_registry),
             )
             .unwrap();
