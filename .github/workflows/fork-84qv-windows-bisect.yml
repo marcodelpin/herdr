@@ -3,8 +3,10 @@
 # Step 3: a contamination contrast on ONE windows-latest VM at 58019e7a. Arm "fresh" probes
 # agent_explain_evaluates_with_server_manifest_cache before anything ran; plain `cargo test` then
 # runs the suite twice, as the hcdo arms did; arm "dirty" probes the test and runs the full nextest
-# suite; arm "moved" repeats both after %APPDATA%\herdr and %LOCALAPPDATA%\herdr are moved aside.
-# Each arm lists those directories. The job reports, it does not fail on a red test.
+# suite; arm "moved" repeats both after the herdr dirs under %APPDATA% and %LOCALAPPDATA% are moved
+# aside. Each arm lists those directories. The job reports, it does not fail on a red test.
+# Run 37758806528 reproduced the failure after cargo test but listed only "herdr": a test build has
+# debug_assertions, so app_dir_name() is "herdr-dev" (src/config/io.rs). Both names are covered now.
 name: Fork 84qv windows bisect
 
 on:
@@ -69,7 +71,7 @@ jobs:
           A=$(cygpath -u "$APPDATA")
           L=$(cygpath -u "$LOCALAPPDATA")
           state() {
-            for d in "$A/herdr" "$L/herdr"; do
+            for d in "$A/herdr" "$A/herdr-dev" "$L/herdr" "$L/herdr-dev"; do
               if [ -d "$d" ]; then
                 echo "--- $d: $(find "$d" -type f | wc -l) files"
                 find "$d" -type f -printf '%TY-%Tm-%Td %TH:%TM %9s %P\n' | sort | head -80
@@ -110,7 +112,7 @@ jobs:
           probe dirty
           full_nextest dirty
           echo "=== arm moved"
-          for d in "$A/herdr" "$L/herdr"; do
+          for d in "$A/herdr" "$A/herdr-dev" "$L/herdr" "$L/herdr-dev"; do
             if [ -d "$d" ]; then mv "$d" "$d.moved-84qv"; echo "moved $d"; fi
           done
           state
