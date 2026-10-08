@@ -31,9 +31,22 @@ enum Outcome {
     Failed(io::ErrorKind),
 }
 
-/// Reads one reply line on a helper thread so that a missing reply fails the
-/// test instead of hanging it.
-fn read_reply(stream: LocalStream) -> Outcome {
+/// A client already reading its reply on a helper thread.
+struct PendingReply(std::sync::mpsc::Receiver<Outcome>);
+
+impl PendingReply {
+    /// Fails the test instead of hanging it when no reply and no close come.
+    fn wait(self, stage: &str) -> Outcome {
+        self.0
+            .recv_timeout(REPLY_TIMEOUT)
+            .unwrap_or_else(|_| panic!("{stage}: the client got neither a reply nor a close"))
+    }
+}
+
+/// Starts reading one reply line. Use it before the server side writes when
+/// that write waits for the client: a Windows reply is not delivered until the
+/// client read it, so a test that reads only afterwards deadlocks itself.
+fn start_reading_reply(stream: LocalStream) -> PendingReply {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -44,8 +57,11 @@ fn read_reply(stream: LocalStream) -> Outcome {
         };
         let _ = tx.send(outcome);
     });
-    rx.recv_timeout(REPLY_TIMEOUT)
-        .expect("the client got neither a reply nor a close")
+    PendingReply(rx)
+}
+
+fn read_reply(stream: LocalStream) -> Outcome {
+    start_reading_reply(stream).wait("reading the reply")
 }
 
 fn error_of(outcome: Outcome) -> (String, String, String) {
@@ -344,11 +360,12 @@ fn stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
 fn wait_that_ends_because_the_server_stops_is_told_so() {
     let (client, mut server, path) = stream_pair("wait-stop");
     let running = AtomicBool::new(false);
+    let reply = start_reading_reply(client);
 
     finish_wait_response(&mut server, None, "wait", "events.wait", false, &running).unwrap();
     drop(server);
 
-    assert_shutting_down(read_reply(client), "wait");
+    assert_shutting_down(reply.wait("wait ended by the server stopping"), "wait");
     let _ = std::fs::remove_file(path);
 }
 
@@ -464,8 +481,21 @@ fn drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted() {
 
     // Barrier: the first request is with the app, unanswered.
     let held = api_rx.blocking_recv().expect("request reaches the app");
+    // The clients read while the drain runs: a Windows reply counts as
+    // delivered only once the client read it, and the drain waits for that.
+    let held_reply = start_reading_reply(held_client);
+    let slow_reply = start_reading_reply(slow_client);
 
-    handle.drain_for_shutdown();
+    let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+    let drainer = std::thread::spawn(move || {
+        handle.drain_for_shutdown();
+        let _ = drained_tx.send(());
+        handle
+    });
+    drained_rx
+        .recv_timeout(API_SHUTDOWN_DRAIN_TIMEOUT + REPLY_TIMEOUT)
+        .expect("drain_for_shutdown did not return within its own bound");
+    let handle = drainer.join().expect("drain thread panicked");
 
     assert!(
         handle.drain.admission_closed(),
@@ -475,8 +505,8 @@ fn drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted() {
         handle.drain.in_flight_stages().is_empty(),
         "the drain returned only after every accepted connection finished"
     );
-    assert_shutting_down(read_reply(held_client), "held");
-    assert_shutting_down(read_reply(slow_client), "");
+    assert_shutting_down(held_reply.wait("held request at shutdown"), "held");
+    assert_shutting_down(slow_reply.wait("slow client at shutdown"), "");
     assert!(!path.exists());
     assert!(crate::ipc::connect_local_stream(&path).is_err());
     drop(held);
@@ -515,5 +545,38 @@ fn windows_final_reply_is_not_delivered_until_the_client_read_it() {
         .expect("the writer returns once the client has the reply")
         .unwrap();
     writer.join().unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+/// Delivering a reply waits for the client, but never past the write timeout:
+/// a client that never reads must not hold its connection, and with it the
+/// shutdown drain, forever.
+#[cfg(windows)]
+#[test]
+fn windows_final_reply_to_a_client_that_never_reads_is_abandoned_at_the_write_timeout() {
+    use interprocess::local_socket::traits::Listener as _;
+
+    let path = unique_socket_path("never-reads");
+    let listener = bind_local_listener(&path).unwrap();
+    let client = crate::ipc::connect_local_stream(&path).unwrap();
+    let mut server = listener.accept().unwrap();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let result = write_final_reply(&mut server, r#"{"id":"unread"}"#);
+        let _ = done_tx.send(result.map_err(|err| err.kind()));
+    });
+
+    let result = done_rx
+        .recv_timeout(STREAM_WRITE_TIMEOUT + REPLY_TIMEOUT)
+        .expect("the writer is still waiting for a client that never reads");
+    assert_eq!(result, Ok(()), "the write itself succeeded");
+    assert!(
+        started.elapsed() >= STREAM_WRITE_TIMEOUT - Duration::from_millis(100),
+        "the writer gave up before the write timeout: {:?}",
+        started.elapsed()
+    );
+    drop(client);
     let _ = std::fs::remove_file(path);
 }

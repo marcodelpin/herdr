@@ -315,7 +315,15 @@ pub(crate) fn take_pending_local_connections(listener: &LocalListener) -> Vec<Lo
     }
     while pending.len() < MAX_PENDING_CONNECTIONS_AT_SHUTDOWN {
         match listener.accept() {
-            Ok(stream) => pending.push(stream),
+            Ok(stream) => {
+                // A Windows pipe instance created in nonblocking accept mode
+                // hands out a nonblocking stream, whose writes can stop short.
+                // The connection handler expects a blocking stream.
+                if let Err(err) = stream.set_nonblocking(false) {
+                    tracing::debug!(err = %err, "queued api connection stays nonblocking");
+                }
+                pending.push(stream);
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => break,
         }
@@ -323,23 +331,61 @@ pub(crate) fn take_pending_local_connections(listener: &LocalListener) -> Vec<Lo
     pending
 }
 
-/// Returns once the peer has received everything written to `stream`.
+/// Returns once the peer has received everything written to `stream`, or
+/// fails with `TimedOut` once `bound` has passed.
 ///
 /// A Unix socket keeps written bytes readable after the writer closes. A
 /// Windows named pipe discards them when the server end closes, and
 /// `interprocess` only flushes a dropped stream from a background thread that
 /// process exit kills, so the writer has to wait here itself.
-pub(crate) fn wait_until_peer_received(stream: &LocalStream) -> io::Result<()> {
+pub(crate) fn wait_until_peer_received(
+    stream: &LocalStream,
+    bound: std::time::Duration,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let _ = stream;
+        let _ = (stream, bound);
         Ok(())
     }
 
     #[cfg(windows)]
     {
+        use std::os::windows::io::AsHandle;
+
         let LocalStream::NamedPipe(pipe) = stream;
-        pipe.inner().flush()
+        // FlushFileBuffers on a pipe returns only once the client has read
+        // everything, and has no timeout of its own: a client that never reads
+        // would hold the caller forever. It runs on a duplicate of the handle on
+        // a helper thread, which ends when the client reads or disconnects, or
+        // with the process; the caller stops waiting at the bound.
+        let pipe = std::fs::File::from(pipe.inner().as_handle().try_clone_to_owned()?);
+        run_with_bound("herdr-api-flush", bound, move || pipe.sync_all())
+    }
+}
+
+/// Runs `work` on its own thread and waits at most `bound` for its result.
+/// On timeout the thread is left to finish on its own.
+#[cfg(any(windows, test))]
+pub(crate) fn run_with_bound(
+    name: &str,
+    bound: std::time::Duration,
+    work: impl FnOnce() -> io::Result<()> + Send + 'static,
+) -> io::Result<()> {
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+
+    let (done_tx, done_rx) = sync_channel(1);
+    crate::thread_spawn::spawn_named(name, move || {
+        let _ = done_tx.send(work());
+    })?;
+    match done_rx.recv_timeout(bound) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{name} did not finish within {} ms", bound.as_millis()),
+        )),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other(format!("{name} ended without a result")))
+        }
     }
 }
 
@@ -405,6 +451,41 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn run_with_bound_returns_the_result_of_work_that_finishes() {
+        assert!(run_with_bound("bound-ok", Duration::from_secs(10), || Ok(())).is_ok());
+        let err = run_with_bound("bound-err", Duration::from_secs(10), || {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// The Windows reply flush has no timeout of its own: a client that never
+    /// reads must not hold the writer past its bound.
+    #[test]
+    fn run_with_bound_stops_waiting_for_work_that_never_finishes() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let result = run_with_bound("bound-stuck", Duration::from_millis(200), move || {
+                let _ = release_rx.recv();
+                Ok(())
+            });
+            let _ = outcome_tx.send(result.map_err(|err| err.kind()));
+        });
+
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run_with_bound kept waiting past its bound");
+        assert_eq!(outcome, Err(io::ErrorKind::TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        drop(release_tx);
+    }
+
     use super::*;
     #[cfg(windows)]
     use interprocess::local_socket::traits::Listener as _;
