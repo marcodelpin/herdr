@@ -592,8 +592,9 @@ fn handle_connection_with_stop(
                         message: format!("invalid request: {request_error}"),
                     },
                 });
+            let started = Instant::now();
             write_json_line_allow_disconnect(&mut stream, &response)?;
-            make_reply_consumable(&stream);
+            make_reply_consumable(&stream, started);
             return Ok(());
         }
     };
@@ -759,8 +760,9 @@ fn handle_connection_with_stop(
                 stop_caller,
                 Some(response_write_rx),
             );
+            let started = Instant::now();
             let result = write_text_line_allow_disconnect(&mut stream, &response);
-            make_reply_consumable(&stream);
+            make_reply_consumable(&stream, started);
             let _ = response_write_tx.send(());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -801,8 +803,9 @@ fn finish_wait_response(
             return Ok(());
         }
     };
+    let started = Instant::now();
     let result = write_text_line_allow_disconnect(stream, &response);
-    make_reply_consumable(stream);
+    make_reply_consumable(stream, started);
     match &result {
         Ok(()) => crate::logging::api_request_completed(
             request_id,
@@ -1301,18 +1304,28 @@ fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> st
 
 /// Waits until the peer can read the reply even if the process exits right
 /// after. Called before the connection stops counting as in flight.
-fn make_reply_consumable(stream: &LocalStream) {
-    if let Err(err) = wait_until_peer_received(stream) {
-        if !is_connection_closed_error(&err) {
-            debug!(err = %err, "api reply was not confirmed as received");
-        }
+///
+/// Writing and delivering one reply share `STREAM_WRITE_TIMEOUT`, counted from
+/// `write_started`, which is what `API_SHUTDOWN_DRAIN_TIMEOUT` budgets for. A
+/// client that has not read its reply by then is abandoned, and logged.
+fn make_reply_consumable(stream: &LocalStream, write_started: Instant) {
+    let bound = STREAM_WRITE_TIMEOUT.saturating_sub(write_started.elapsed());
+    match wait_until_peer_received(stream, bound) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => warn!(
+            err = %err,
+            "api client did not read its reply within the write timeout; abandoning it"
+        ),
+        Err(err) if is_connection_closed_error(&err) => {}
+        Err(err) => debug!(err = %err, "api reply was not confirmed as received"),
     }
 }
 
 /// Writes the last line of a connection.
 fn write_final_reply(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
+    let started = Instant::now();
     let result = write_text_line_allow_disconnect(stream, value);
-    make_reply_consumable(stream);
+    make_reply_consumable(stream, started);
     result
 }
 
