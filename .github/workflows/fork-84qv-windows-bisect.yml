@@ -1,8 +1,10 @@
 # Fork-only workflow for ci/84qv-windows-bisect (not for upstream). bd herdr-84qv.
-# Step 2: ONE windows-latest job runs the FULL crate suite at 58019e7a three times in a row with the
-# upstream ci.yml filter and nothing else running, to see whether the full-suite failure of
-# agent_explain_evaluates_with_server_manifest_cache reproduces. The job never fails on a red
-# test, it only reports; read the "counts" step.
+# Step 2 (runs 37406207946 and 37757041739): on a fresh VM the full suite under nextest passed 4 of 4.
+# Step 3: a contamination contrast on ONE windows-latest VM at 58019e7a. Arm "fresh" probes
+# agent_explain_evaluates_with_server_manifest_cache before anything ran; plain `cargo test` then
+# runs the suite twice, as the hcdo arms did; arm "dirty" probes the test and runs the full nextest
+# suite; arm "moved" repeats both after %APPDATA%\herdr and %LOCALAPPDATA%\herdr are moved aside.
+# Each arm lists those directories. The job reports, it does not fail on a red test.
 name: Fork 84qv windows bisect
 
 on:
@@ -57,30 +59,63 @@ jobs:
         shell: bash
         run: cargo test --locked --bin herdr --no-run
 
-      - name: Full suite 3x, print failing test names and counts
+      - name: Contamination contrast
         shell: bash
+        env:
+          # Plain output: with colour on, "^\s+FAIL" never matches and a red run counts 0 failures.
+          CARGO_TERM_COLOR: never
         run: |
-          for i in 1 2 3; do
-            echo "=== run $i ==="
+          T='test(=app::api::tests::agent_explain_evaluates_with_server_manifest_cache)'
+          A=$(cygpath -u "$APPDATA")
+          L=$(cygpath -u "$LOCALAPPDATA")
+          state() {
+            for d in "$A/herdr" "$L/herdr"; do
+              if [ -d "$d" ]; then
+                echo "--- $d: $(find "$d" -type f | wc -l) files"
+                find "$d" -type f -printf '%TY-%Tm-%Td %TH:%TM %9s %P\n' | sort | head -80
+              else
+                echo "--- $d: absent"
+              fi
+            done
+          }
+          probe() { # <arm>: the one test under nextest, 3 times
+            for i in 1 2 3; do
+              rc=0
+              cargo nextest run --locked --bin herdr -E "$T" --failure-output final > ".probe-$1-$i.log" 2>&1 || rc=$?
+              echo "probe $1 run=$i rc=$rc $(grep -aE '^\s+Summary ' ".probe-$1-$i.log" | tail -1)"
+              grep -aE 'panicked at|left:|right:' ".probe-$1-$i.log" | head -3 || true
+              echo "$rc" >> ".rc-$1"
+            done
+          }
+          full_nextest() { # <arm>: the whole suite under nextest, once
             rc=0
             cargo nextest run --locked --bin herdr -E 'not binary(live_handoff)' \
-              --no-fail-fast --failure-output final > .nx$i.log 2>&1 || rc=$?
-            echo "run=$i rc=$rc"
-            # A green run has no FAIL line, and grep exits 1 on zero matches:
-            # under `bash -e -o pipefail` that ended the job after run 1.
-            grep -E "^\s+(FAIL|SIGABRT|SIGSEGV|TIMEOUT) " .nx$i.log | sort -u || true
-            grep -E "^\s+Summary" .nx$i.log || true
-            grep -E "agent_explain_evaluates_with_server_manifest_cache" .nx$i.log | head -5 || true
-            echo "run=$i failed_names=$(grep -E '^\s+FAIL ' .nx$i.log | sort -u | wc -l)"
-            {
-              echo "### run $i rc=$rc"
-              grep -E "^\s+Summary" .nx$i.log || true
-              grep -E '^\s+FAIL ' .nx$i.log | sort -u | head -50 || true
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "$rc" > ".nx$i.rc"
+              --no-fail-fast --failure-output final > ".full-$1.log" 2>&1 || rc=$?
+            echo "full $1 rc=$rc $(grep -aE '^\s+Summary ' ".full-$1.log" | tail -1)"
+            grep -aE '^\s+(FAIL|SIGABRT|SIGSEGV|TIMEOUT) ' ".full-$1.log" | sort -u | head -30 || true
+            echo "$rc" >> ".rc-$1"
+          }
+          echo "=== arm fresh"
+          state
+          probe fresh
+          echo "=== contaminate: plain cargo test --bin herdr, twice"
+          for i in 1 2; do
+            rc=0
+            cargo test --locked --bin herdr > ".cargo-test-$i.log" 2>&1 || rc=$?
+            echo "cargo test run=$i rc=$rc $(grep -aE '^test result:' ".cargo-test-$i.log" | tail -1)"
+            grep -aE '^test .* \.\.\. FAILED' ".cargo-test-$i.log" | sort -u | head -30 || true
           done
-          # The job verdict is the three nextest exit codes, not the grep exit codes.
-          fails=0
-          for i in 1 2 3; do [ "$(cat .nx$i.rc)" = 0 ] || fails=$((fails + 1)); done
-          echo "nextest runs with failures: $fails of 3"
-          [ "$fails" -eq 0 ]
+          echo "=== arm dirty"
+          state
+          probe dirty
+          full_nextest dirty
+          echo "=== arm moved"
+          for d in "$A/herdr" "$L/herdr"; do
+            if [ -d "$d" ]; then mv "$d" "$d.moved-84qv"; echo "moved $d"; fi
+          done
+          state
+          probe moved
+          full_nextest moved
+          v="fresh=[$(paste -sd, .rc-fresh)] dirty=[$(paste -sd, .rc-dirty)] moved=[$(paste -sd, .rc-moved)]"
+          echo "VERDICT $v (probe rc x3, then the full-suite rc)"
+          echo "### 84qv contamination contrast: $v" >> "$GITHUB_STEP_SUMMARY"
