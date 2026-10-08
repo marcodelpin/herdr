@@ -62,8 +62,25 @@ jobs:
       # binary died with SIGPIPE (signal 13) in the plugins action tests on the first run
       # of the animated-working-indicator workflow (run 34568308787), taking every later
       # test with it.
+      # herdr-pttw (not for landing): the shutdown drain tests run first, on their own,
+      # with their failure text printed as it happens and every test terminated after
+      # 2 minutes, so a hang costs minutes and still leaves its output in the log.
+      - name: Write the bounded nextest profile
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/nextest"
+          printf '%s\n' '[profile.bounded]' 'slow-timeout = { period = "30s", terminate-after = 4 }' 'fail-fast = false' > "$RUNNER_TEMP/nextest/nextest.toml"
+          cat "$RUNNER_TEMP/nextest/nextest.toml"
+
+      - name: Run the shutdown drain tests
+        shell: bash
+        timeout-minutes: 20
+        run: cargo nextest run --locked --bin herdr --config-file "$RUNNER_TEMP/nextest/nextest.toml" --profile bounded --no-fail-fast --status-level all --final-status-level all --failure-output immediate --success-output never -E 'test(/shutdown_drain_tests::/) | test(/accept_loop_tests::/)'
+
       - name: Run the crate tests
-        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: cargo nextest run --locked --bin herdr --config-file "$RUNNER_TEMP/nextest/nextest.toml" --profile bounded --status-level fail --final-status-level slow --failure-output immediate --success-output never
 
       # The fork's own tests, by name: 10 platform-agnostic pure tests of resume_command()
       # (the stock path, the launcher-prefix composition, verbatim spacing, control-character
