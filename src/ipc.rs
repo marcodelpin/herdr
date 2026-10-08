@@ -304,6 +304,9 @@ pub(crate) fn refuse_new_local_connections(listener: &LocalListener) {
 /// Takes every connection already queued on the listener, without blocking.
 /// The listener stays in nonblocking accept mode; the caller closes it next.
 pub(crate) fn take_pending_local_connections(listener: &LocalListener) -> Vec<LocalStream> {
+    // Unix builds import the stream trait at module level.
+    #[cfg(windows)]
+    use interprocess::local_socket::traits::Stream as _;
     use interprocess::local_socket::{traits::Listener as _, ListenerNonblockingMode};
 
     let mut pending = Vec::new();
