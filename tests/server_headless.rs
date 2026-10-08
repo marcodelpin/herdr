@@ -594,6 +594,18 @@ fn server_survives_hangup_and_logs_why_it_stops() {
     );
     assert!(ping_socket(&api_socket).contains("pong"));
 
+    // The API socket is bound before the event loop installs the SIGTERM
+    // handler. On a loaded host that gap exceeds the 500 ms above, and a
+    // SIGTERM landing inside it ends the process with no shutdown line
+    // (herdr-9ds0). Wait for the startup line the loop logs first.
+    wait_for_log_line(
+        &server_log_path(&config_home),
+        "app.startup",
+        Duration::from_secs(30),
+    );
+    // Startup line and handler install are adjacent statements.
+    thread::sleep(Duration::from_millis(200));
+
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     assert!(
         wait_for_exit(&mut spawned.child, Duration::from_secs(10)),
