@@ -51,6 +51,36 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
+/// Connects like `connect_local_stream`, giving up after `within` when the
+/// listener does not take the connection (every Windows pipe instance busy,
+/// a full Unix backlog).
+pub(crate) fn connect_local_stream_within(
+    path: &Path,
+    within: std::time::Duration,
+) -> io::Result<LocalStream> {
+    use interprocess::local_socket::ConnectOptions;
+    use interprocess::ConnectWaitMode;
+
+    #[cfg(unix)]
+    let name = {
+        use interprocess::local_socket::{prelude::*, GenericFilePath};
+        path.to_fs_name::<GenericFilePath>()?
+    };
+    #[cfg(windows)]
+    let name = {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced};
+        path.to_string_lossy()
+            .to_string()
+            .to_ns_name::<GenericNamespaced>()?
+    };
+    ConnectOptions::new()
+        .name(name)
+        .wait_mode(ConnectWaitMode::Timeout(
+            within.max(std::time::Duration::from_millis(1)),
+        ))
+        .connect_sync()
+}
+
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
@@ -116,6 +146,32 @@ fn stale_socket_connect_error(kind: io::ErrorKind) -> bool {
 
 pub(crate) fn local_stream_peer_closed(stream: &mut LocalStream) -> io::Result<bool> {
     probe_stream_closed(stream)
+}
+
+/// Waits at most `timeout` for room to write on a nonblocking stream. Returns
+/// on readiness, on timeout, or on a signal; the caller rechecks its deadline.
+#[cfg(unix)]
+pub(crate) fn wait_local_stream_writable(
+    stream: &LocalStream,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let LocalStream::UdSocket(socket) = stream;
+    let mut poll_fd = libc::pollfd {
+        fd: socket.as_fd().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let timeout_ms = timeout.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: one valid pollfd for a descriptor borrowed from a live stream.
+    if unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) } < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) -> io::Result<()> {
@@ -361,9 +417,37 @@ pub(crate) fn wait_until_peer_received(
         // would hold the caller forever. It runs on a duplicate of the handle on
         // a helper thread, which ends when the client reads or disconnects, or
         // with the process; the caller stops waiting at the bound.
-        let pipe = std::fs::File::from(pipe.inner().as_handle().try_clone_to_owned()?);
+        let handle = pipe
+            .inner()
+            .as_handle()
+            .try_clone_to_owned()
+            .map_err(confirmation_not_started)?;
+        let pipe = std::fs::File::from(handle);
         run_with_bound("herdr-api-flush", bound, move || pipe.sync_all())
     }
+}
+
+/// The work of a bounded wait could not even start: the outcome it would have
+/// observed is unknown, not a failure of the peer.
+#[derive(Debug)]
+struct ConfirmationNotStarted(io::Error);
+
+impl std::fmt::Display for ConfirmationNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "delivery confirmation could not start: {}", self.0)
+    }
+}
+
+impl std::error::Error for ConfirmationNotStarted {}
+
+#[cfg(any(windows, test))]
+fn confirmation_not_started(err: io::Error) -> io::Error {
+    io::Error::new(err.kind(), ConfirmationNotStarted(err))
+}
+
+pub(crate) fn is_confirmation_not_started(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<ConfirmationNotStarted>())
 }
 
 /// Runs `work` on its own thread and waits at most `bound` for its result.
@@ -379,7 +463,8 @@ pub(crate) fn run_with_bound(
     let (done_tx, done_rx) = sync_channel(1);
     crate::thread_spawn::spawn_named(name, move || {
         let _ = done_tx.send(work());
-    })?;
+    })
+    .map_err(confirmation_not_started)?;
     match done_rx.recv_timeout(bound) {
         Ok(result) => result,
         Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
