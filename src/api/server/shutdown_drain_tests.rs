@@ -160,17 +160,7 @@ impl App {
     /// waits for the app. The caller keeps the message, so the responder
     /// stays alive and unanswered.
     fn held_request(&mut self) -> ApiRequestMessage {
-        let deadline = Instant::now() + REPLY_TIMEOUT;
-        loop {
-            match self.api_rx.try_recv() {
-                Ok(request) => return request,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    assert!(Instant::now() < deadline, "request never reached the app");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(err) => panic!("app request channel closed: {err}"),
-            }
-        }
+        recv_request_within(&mut self.api_rx)
     }
 
     /// What `ServerHandle::drain_for_shutdown` announces.
@@ -191,6 +181,35 @@ impl Drop for App {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Bounded: a broken dispatcher fails the test instead of hanging it.
+fn recv_request_within(
+    api_rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>,
+) -> ApiRequestMessage {
+    let deadline = Instant::now() + REPLY_TIMEOUT;
+    loop {
+        match api_rx.try_recv() {
+            Ok(request) => return request,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "request never reached the app");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => panic!("app request channel closed: {err}"),
+        }
+    }
+}
+
+/// Runs `work` on its own thread and fails the test if it does not finish in
+/// time, so a missing shutdown exit cannot hang the suite.
+fn finish_within<T: Send + 'static>(stage: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(work());
+    });
+    done_rx
+        .recv_timeout(REPLY_TIMEOUT)
+        .unwrap_or_else(|_| panic!("{stage} did not finish"))
 }
 
 /// A request the app took and holds unanswered is counted as in flight under
@@ -414,14 +433,19 @@ fn connections_queued_before_shutdown_are_served_and_later_ones_refused() {
         "admission is not closed until the accept loop says so"
     );
 
-    serve_api_listener(
-        listener,
-        &path,
-        &identity,
-        &app.running,
-        &app.drain,
-        |stream| app.serve(stream),
-    );
+    {
+        let (path, drain, running, api_tx) = (
+            path.clone(),
+            Arc::clone(&app.drain),
+            Arc::clone(&app.running),
+            app.api_tx.clone(),
+        );
+        finish_within("the accept loop at shutdown", move || {
+            serve_api_listener(listener, &path, &identity, &running, &drain, |stream| {
+                serve_connection(&drain, &api_tx, &running, stream)
+            });
+        });
+    }
 
     assert!(app.drain.admission_closed());
     for (index, client) in clients.into_iter().enumerate() {
@@ -480,7 +504,7 @@ fn drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted() {
     slow_client.flush().unwrap();
 
     // Barrier: the first request is with the app, unanswered.
-    let held = api_rx.blocking_recv().expect("request reaches the app");
+    let held = recv_request_within(&mut api_rx);
     // The clients read while the drain runs: a Windows reply counts as
     // delivered only once the client read it, and the drain waits for that.
     let held_reply = start_reading_reply(held_client);
@@ -524,12 +548,19 @@ fn windows_final_reply_is_not_delivered_until_the_client_read_it() {
     let client = crate::ipc::connect_local_stream(&path).unwrap();
     let mut server = listener.accept().unwrap();
 
+    let drain = draining_drain();
+    let (writing_tx, writing_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
+        let _connection = enter_connection(drain);
+        let _ = writing_tx.send(());
         let result = write_final_reply(&mut server, r#"{"id":"flush"}"#);
-        let _ = done_tx.send(result);
+        let _ = done_tx.send((result, confirmations_started_on_this_thread()));
     });
 
+    writing_rx
+        .recv_timeout(REPLY_TIMEOUT)
+        .expect("the writer thread started");
     // One-sided: a writer that does not wait for the client finishes at once.
     assert!(
         done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
@@ -540,10 +571,14 @@ fn windows_final_reply_is_not_delivered_until_the_client_read_it() {
         read_reply(client),
         Outcome::Line("{\"id\":\"flush\"}\n".to_owned())
     );
-    done_rx
+    let (result, confirmations) = done_rx
         .recv_timeout(REPLY_TIMEOUT)
-        .expect("the writer returns once the client has the reply")
-        .unwrap();
+        .expect("the writer returns once the client has the reply");
+    result.unwrap();
+    assert_eq!(
+        confirmations, 1,
+        "the writer went through delivery confirmation"
+    );
     writer.join().unwrap();
     let _ = std::fs::remove_file(path);
 }
@@ -561,9 +596,11 @@ fn windows_final_reply_to_a_client_that_never_reads_is_abandoned_at_the_write_ti
     let client = crate::ipc::connect_local_stream(&path).unwrap();
     let mut server = listener.accept().unwrap();
 
+    let drain = draining_drain();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
     std::thread::spawn(move || {
+        let _connection = enter_connection(drain);
         let result = write_final_reply(&mut server, r#"{"id":"unread"}"#);
         let _ = done_tx.send(result.map_err(|err| err.kind()));
     });
@@ -578,5 +615,167 @@ fn windows_final_reply_to_a_client_that_never_reads_is_abandoned_at_the_write_ti
         started.elapsed()
     );
     drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(windows)]
+fn draining_drain() -> Arc<ApiDrain> {
+    let drain = Arc::new(ApiDrain::default());
+    drain.begin_shutdown();
+    drain
+}
+
+/// A subscription whose setup waits for the app has not replied yet: it holds
+/// shutdown and gets the explicit error, like any request.
+#[test]
+fn subscription_waiting_for_its_setup_holds_shutdown_and_is_answered() {
+    let mut app = App::new();
+    let mut client = app.connect("subscribe-setup");
+    writeln!(
+        client,
+        r#"{{"id":"sub","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.output_matched","pane_id":"pane_1","source":"recent","match":{{"type":"substring","value":"never"}}}}]}}}}"#
+    )
+    .unwrap();
+
+    let held = app.held_request();
+    assert_eq!(
+        app.drain.in_flight_stages(),
+        vec!["events.subscribe"],
+        "a subscription still setting up must hold shutdown"
+    );
+
+    app.begin_shutdown();
+
+    // The setup reports the failed probe as its own error; what matters here
+    // is that the client gets an explicit error line for its request.
+    let (id, code, _) = error_of(read_reply(client));
+    assert_eq!(id, "sub");
+    assert!(!code.is_empty());
+    app.assert_drained();
+    drop(held);
+}
+
+/// Once `subscription_started` is written the stream has no final reply to
+/// wait for and must not hold shutdown.
+#[test]
+fn established_subscription_does_not_hold_shutdown() {
+    let mut app = App::new();
+    let mut client = app.connect("subscribe-started");
+    writeln!(
+        client,
+        r#"{{"id":"sub","method":"events.subscribe","params":{{"subscriptions":[{{"type":"workspace.renamed"}}]}}}}"#
+    )
+    .unwrap();
+    let reader = BufReader::new(client);
+    let (line, reader) = finish_within("reading subscription_started", move || {
+        let mut reader = reader;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        (line, reader)
+    });
+    let value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(value["result"]["type"], "subscription_started", "{line}");
+    app.assert_drained();
+    drop(reader);
+}
+
+/// Normal replies keep the base behaviour; only a draining server confirms
+/// delivery, so a client that never reads cannot pin a helper thread and a
+/// duplicated handle for the server's lifetime.
+#[test]
+fn delivery_is_confirmed_only_while_the_server_drains() {
+    let drain = Arc::new(ApiDrain::default());
+
+    let (client, mut server, path) = stream_pair("confirm-normal");
+    let reply = start_reading_reply(client);
+    {
+        let _connection = enter_connection(Arc::clone(&drain));
+        write_final_reply(&mut server, r#"{"id":"normal"}"#).unwrap();
+    }
+    drop(server);
+    assert_eq!(
+        reply.wait("normal reply"),
+        Outcome::Line("{\"id\":\"normal\"}\n".to_owned())
+    );
+    assert_eq!(
+        confirmations_started_on_this_thread(),
+        0,
+        "no confirmation in normal operation"
+    );
+    let _ = std::fs::remove_file(path);
+
+    let (client, mut server, path) = stream_pair("confirm-draining");
+    let reply = start_reading_reply(client);
+    drain.begin_shutdown();
+    {
+        let _connection = enter_connection(Arc::clone(&drain));
+        write_final_reply(&mut server, r#"{"id":"draining"}"#).unwrap();
+    }
+    drop(server);
+    assert_eq!(
+        reply.wait("draining reply"),
+        Outcome::Line("{\"id\":\"draining\"}\n".to_owned())
+    );
+    assert_eq!(
+        confirmations_started_on_this_thread(),
+        1,
+        "a draining server confirms delivery"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// When the confirmation machinery cannot start, nothing is known about the
+/// client: the reply keeps its connection until the bound instead of being
+/// treated as delivered.
+#[test]
+fn confirmation_that_cannot_start_holds_the_reply_until_the_bound() {
+    crate::thread_spawn::test_hook::fail_next_spawns(1);
+    let err =
+        crate::ipc::run_with_bound("confirm-no-thread", REPLY_TIMEOUT, || Ok(())).unwrap_err();
+    assert!(is_confirmation_not_started(&err), "{err}");
+
+    let deadline = Instant::now() + Duration::from_millis(200);
+    settle_reply_confirmation(Err(err), deadline);
+    assert!(Instant::now() >= deadline, "released before the bound");
+}
+
+/// The write timeout bounds the whole reply line, not each socket operation:
+/// a client that keeps reading slowly must not stretch it.
+#[cfg(unix)]
+#[test]
+fn reply_write_stops_at_its_deadline_even_while_the_client_keeps_reading() {
+    use std::io::Read;
+
+    let (mut client, mut server, path) = stream_pair("deadline");
+    let started = Instant::now();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        let mut total = 0_usize;
+        // Each read frees room well within any per-operation send timeout.
+        while started.elapsed() < Duration::from_secs(3) {
+            match client.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => total += read,
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        total
+    });
+
+    let value = "x".repeat(16 * 1024 * 1024);
+    let result = write_reply_line_by(&mut server, &value, started + Duration::from_millis(300));
+    let elapsed = started.elapsed();
+    drop(server);
+    let read = reader.join().unwrap();
+
+    assert_eq!(
+        result.map_err(|err| err.kind()),
+        Err(io::ErrorKind::TimedOut)
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the write ran {elapsed:?} past a 300 ms deadline"
+    );
+    assert!(read > 0, "the client was reading");
     let _ = std::fs::remove_file(path);
 }

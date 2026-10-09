@@ -28,11 +28,17 @@ struct DrainState {
     in_flight: BTreeMap<u64, &'static str>,
 }
 
+/// Test seam: runs at the start of `begin_shutdown`, before draining is set.
+#[cfg(test)]
+type BeforeShutdownHook = Box<dyn FnOnce() + Send>;
+
 #[derive(Default)]
 pub(crate) struct ApiDrain {
     state: Mutex<DrainState>,
     changed: Condvar,
     draining: AtomicBool,
+    #[cfg(test)]
+    before_shutdown: Mutex<Option<BeforeShutdownHook>>,
 }
 
 impl ApiDrain {
@@ -58,6 +64,17 @@ impl ApiDrain {
     /// requests: after this, a connection thread whose response channel is
     /// empty answers `server_unavailable` itself.
     pub(crate) fn begin_shutdown(&self) {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_shutdown
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let _state = self.lock();
         self.draining.store(true, Ordering::Release);
         self.changed.notify_all();
@@ -116,6 +133,17 @@ impl ApiDrain {
                 .0;
         }
         Ok(())
+    }
+
+    /// Runs `hook` inside the next `begin_shutdown`, before draining is set:
+    /// what another thread observes at that moment is what it can observe in
+    /// the middle of the shutdown transition.
+    #[cfg(test)]
+    pub(crate) fn before_begin_shutdown(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_shutdown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
     }
 
     #[cfg(test)]
