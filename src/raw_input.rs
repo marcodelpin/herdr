@@ -541,7 +541,9 @@ impl RawInputByteFramer {
             return chunks;
         }
 
-        if self.lone_escape_recently_flushed && self.buffer.starts_with(b"[<") {
+        if self.lone_escape_recently_flushed
+            && starts_with_incomplete_orphaned_sgr_mouse_tail(&self.buffer)
+        {
             tracing::debug!(
                 len = self.buffer.len(),
                 "discarding incomplete orphaned SGR mouse tail after input timeout"
@@ -760,7 +762,14 @@ impl RawInputByteFramer {
                     SgrMouseContinuation::Complete(len) => {
                         self.buffer.drain(..len);
                     }
-                    SgrMouseContinuation::Invalid => {}
+                    SgrMouseContinuation::Invalid => {
+                        // `ESC [` alone is also how a key or a legacy sequence
+                        // can start. If it never became SGR, release the
+                        // bracket so ordinary input is preserved.
+                        if prefix.as_slice() == b"\x1b[" {
+                            chunks.push(vec![b'[']);
+                        }
+                    }
                 }
                 self.timed_out_mouse_prefix = None;
             }
@@ -948,7 +957,7 @@ fn plausible_host_color_tail_byte(byte: u8) -> bool {
 fn plausible_control_string_tail(family: ControlStringFamily, buffer: &[u8]) -> bool {
     match family {
         ControlStringFamily::Osc => buffer.iter().all(|byte| {
-            byte.is_ascii_digit()
+            byte.is_ascii_hexdigit()
                 || matches!(
                     *byte,
                     b';' | b':'
@@ -1409,11 +1418,30 @@ enum SgrMouseContinuation {
 fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContinuation {
     let remaining = MAX_DISCARDED_CONTROL_TAIL_BYTES.saturating_sub(prefix.len());
     let tail = &tail[..tail.len().min(remaining)];
+
+    // A prefix can stop before the `[<` introducer is complete, and a further
+    // read supplies the rest.
+    let mut report = prefix.to_vec();
+    let mut consumed_from_tail = 0;
+    if let Some(rest) = b"\x1b[<"
+        .strip_prefix(prefix)
+        .filter(|rest| !rest.is_empty())
+    {
+        if tail.len() < rest.len() {
+            return SgrMouseContinuation::Incomplete;
+        }
+        if !tail.starts_with(rest) {
+            return SgrMouseContinuation::Invalid;
+        }
+        report.extend_from_slice(rest);
+        consumed_from_tail = rest.len();
+    }
+    let tail = &tail[consumed_from_tail..];
+
     let final_index = tail
         .iter()
         .position(|byte| !byte.is_ascii_digit() && *byte != b';');
     let payload_len = final_index.unwrap_or(tail.len());
-    let mut report = prefix.to_vec();
     report.extend_from_slice(&tail[..payload_len]);
     if !plausible_sgr_mouse_prefix(&report) {
         return SgrMouseContinuation::Invalid;
@@ -1425,7 +1453,7 @@ fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContin
             .and_then(parse_sgr_mouse)
             .is_some();
         return if valid {
-            SgrMouseContinuation::Complete(index + 1)
+            SgrMouseContinuation::Complete(consumed_from_tail + index + 1)
         } else {
             SgrMouseContinuation::Invalid
         };
@@ -1440,6 +1468,11 @@ fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContin
 // Reject impossible continuations early, without changing the general mouse
 // parser. A partial last field (including zero) can still become valid.
 fn plausible_sgr_mouse_prefix(report: &[u8]) -> bool {
+    // The prefix may stop before the `[<` introducer is complete; the next
+    // read can still supply the rest of it.
+    if report == b"\x1b[" {
+        return true;
+    }
     let Some(body) = report.strip_prefix(b"\x1b[<") else {
         return false;
     };
@@ -2770,6 +2803,90 @@ mod tests {
     }
 
     #[test]
+    fn three_fragment_sgr_mouse_tail_after_lone_escape_timeout_is_discarded() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+
+        // #5251: the orphaned tail split again after its bracket. The bare `[`
+        // must not be released as a key while the report can still complete.
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        let events = framer.push(b"<35;100;30Mx");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.byte_framer.has_pending_input());
+    }
+
+    #[test]
+    fn orphaned_sgr_mouse_tail_survives_every_read_split() {
+        let tail = b"[<35;100;30M";
+        for split in 0..=tail.len() {
+            let mut framer = RawInputFramer::default();
+            assert!(framer.push(b"\x1b").is_empty());
+            assert_eq!(framer.flush_timeout().len(), 1, "split {split}");
+
+            let mut events = Vec::new();
+            for byte in &tail[..split] {
+                events.extend(framer.push(&[*byte]));
+                events.extend(framer.flush_timeout());
+                events.extend(framer.flush_timeout());
+            }
+            events.extend(framer.push(&tail[split..]));
+            events.extend(framer.flush_timeout());
+            events.extend(framer.flush_timeout());
+            events.extend(framer.push(b"x"));
+            events.extend(framer.flush_timeout());
+
+            assert_eq!(events.len(), 1, "split {split}: {events:?}");
+            assert_raw_key(
+                events.into_iter().next().unwrap(),
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+            );
+            assert!(!framer.byte_framer.has_pending_input(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn orphaned_bracket_prefix_releases_ordinary_input() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+
+        // A bracket that does not become a mouse report is still user input,
+        // not something to drop on the next read.
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        let events = framer.push(b"abc");
+        let codes: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                RawInputEvent::Key(key) => Some(key.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                KeyCode::Char('['),
+                KeyCode::Char('a'),
+                KeyCode::Char('b'),
+                KeyCode::Char('c')
+            ]
+        );
+    }
+
+    #[test]
     fn escape_followed_by_alt_char_before_flush_becomes_alt_key() {
         let mut framer = RawInputFramer::default();
 
@@ -3054,9 +3171,11 @@ mod tests {
 
         assert!(framer.push(b"\x1b]").is_empty());
         assert!(framer.flush_timeout().is_empty());
-        assert!(framer.push(b"a").is_empty());
+        // `x` and `y` are outside the OSC color-reply alphabet (hex color
+        // payloads are not), so ordinary input ends the discard.
+        assert!(framer.push(b"x").is_empty());
         assert!(framer.flush_timeout().is_empty());
-        assert_eq!(framer.push(b"b"), vec![b"b".to_vec()]);
+        assert_eq!(framer.push(b"y"), vec![b"y".to_vec()]);
     }
 
     #[test]
@@ -3381,6 +3500,54 @@ mod tests {
             framer.age_partial_host_color_reply(gap);
         }
         assert_eq!(chunks, vec![pieces.concat()]);
+    }
+
+    #[test]
+    fn palette_reply_fragments_after_discarded_header_do_not_leak() {
+        // #5302: the OSC 4 header is dropped once it idles out, and the reply
+        // fragments that follow must be discarded with it, not typed.
+        let pieces: [&[u8]; 5] = [b"\x1b]4;50;", b"rgb:afaf/", b"d7d7/", b"8787", b"\x1b\\"];
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        let mut chunks = Vec::new();
+        for piece in pieces {
+            chunks.extend(framer.push(piece));
+            chunks.extend(framer.flush_timeout());
+            chunks.extend(framer.flush_timeout());
+        }
+        chunks.extend(framer.push(b"x"));
+
+        let events = events_from_framed_chunks(chunks);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.has_pending_input());
+    }
+
+    #[test]
+    fn palette_payload_bytes_after_discarded_header_do_not_leak() {
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        let mut chunks = framer.push(b"\x1b]4;50;");
+        chunks.extend(framer.flush_timeout());
+
+        for byte in b"rgb:afaf/d7d7/8787\x1b\\" {
+            chunks.extend(framer.push(&[*byte]));
+            chunks.extend(framer.flush_timeout());
+        }
+        chunks.extend(framer.push(b"x"));
+
+        let events = events_from_framed_chunks(chunks);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.has_pending_input());
     }
 
     #[test]
