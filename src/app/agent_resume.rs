@@ -753,14 +753,17 @@ mod tests {
     // a real Claude Code session-registry fixture under an overridden
     // CLAUDE_CONFIG_DIR and use this test process's own pid as the "live"
     // holder - it is guaranteed alive and its start marker is stable for
-    // the test's whole lifetime, on every platform this module's crate
-    // tests run on (ubuntu-latest, windows-latest).
+    // the test's whole lifetime. Every test that uses it is `#[cfg(unix)]`,
+    // so the fixture is too: otherwise it is dead code in the Windows test
+    // build and the Windows clippy `-D warnings` gate fails.
 
+    #[cfg(unix)]
     struct ClaudeRegistryFixture {
         dir: std::path::PathBuf,
         _lock: crate::integration::IntegrationEnvLock,
     }
 
+    #[cfg(unix)]
     impl ClaudeRegistryFixture {
         fn new(label: &str) -> Self {
             let lock = crate::integration::integration_env_lock();
@@ -791,6 +794,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for ClaudeRegistryFixture {
         fn drop(&mut self) {
             std::env::remove_var(crate::integration::CLAUDE_CONFIG_DIR_ENV_VAR);

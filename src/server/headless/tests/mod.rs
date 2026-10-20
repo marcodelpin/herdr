@@ -4959,6 +4959,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("previous-session").unwrap(),
+            cwd: None,
         });
         server.app.save_session_now();
         // Leave both the extra pane and new resume identity unsaved. The real
@@ -4976,6 +4977,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("shutdown-session").unwrap(),
+                cwd: None,
             });
         server.host_shutdown_probe = || true;
         let death = || AppEvent::PaneDied {
