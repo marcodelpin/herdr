@@ -103,7 +103,16 @@ jobs:
           perl -0pi -e 's/\(elapsed\.as_millis\(\) \/ WORKING_SPINNER_FRAME_PERIOD\.as_millis\(\)\) as usize/0usize \/\/ MUTANT frozen frame/' src/client/shell.rs
           landed=$(grep -c 'MUTANT frozen frame' src/client/shell.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
-          cargo test --locked --bin herdr --no-run
+          # The build fetches libghostty-vt's lazy Zig packages from codeberg.org and
+          # deps.files.ghostty.org; a DNS failure there once failed this job before any
+          # test ran. Retry the BUILD only - three failures still fail the job, and the
+          # mutant verdict below is never retried.
+          for attempt in 1 2 3; do
+            cargo test --locked --bin herdr --no-run && break
+            [ "$attempt" = 3 ] && { echo "build failed 3 times; the mutant was never tested"; exit 1; }
+            echo "build failed (attempt $attempt/3); retrying"
+            sleep $((attempt * 20))
+          done
           if cargo test --locked --bin herdr client::shell::tests::working_spinner::working_icon_differs_between_composes_at_different_times; then
             echo "MUTANT SURVIVED: the differs-between-composes test passed with a frozen frame"
             exit 1
