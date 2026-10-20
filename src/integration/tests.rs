@@ -1132,7 +1132,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 11);
+    assert_eq!(claude.expected_version, 12);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1141,8 +1141,41 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(11));
+    assert_eq!(status.installed_version, Some(12));
     assert_eq!(status.state, IntegrationStatusKind::Current);
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn claude_v11_predecessor_integration_status_is_outdated() {
+    // Version 11 names two incomplete predecessors of the combined hook: the
+    // fork hook with reporter_is_foreground/agent_session_cwd but the old
+    // decoder, and upstream's UTF-8 decoding hook without the fork fields.
+    // Neither may read as current, or no reinstall is recommended.
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let claude_hooks_dir = home.join(".claude").join("hooks");
+    fs::create_dir_all(&claude_hooks_dir).unwrap();
+    let hook_path = claude_hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=11\n",
+    )
+    .unwrap();
+    std::env::set_var("HOME", &home);
+
+    let statuses = installed_integration_statuses();
+    let claude = statuses
+        .iter()
+        .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+        .unwrap();
+
+    assert_eq!(claude.path, hook_path);
+    assert_eq!(claude.installed_version, Some(11));
+    assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);
@@ -1171,7 +1204,7 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 11);
+    assert_eq!(claude.expected_version, 12);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
