@@ -1,0 +1,126 @@
+warning: herdr@0.9.5: external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work.
+   Compiling herdr v0.9.5 (/srv/scratch/pttw-r4/wt-battery)
+warning: methods `begin_shutdown`, `admission_closed`, `wait_admission_closed`, and `wait_idle` are never used
+   --> src/api/drain.rs:66:19
+    |
+ 44 | impl ApiDrain {
+    | ------------- methods in this implementation
+...
+ 66 |     pub(crate) fn begin_shutdown(&self) {
+    |                   ^^^^^^^^^^^^^^
+...
+ 94 |     pub(crate) fn admission_closed(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^
+...
+100 |     pub(crate) fn wait_admission_closed(&self, deadline: Instant) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+120 |     pub(crate) fn wait_idle(&self, deadline: Instant) -> Result<(), Vec<&'static str>> {
+    |                   ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `API_ADMISSION_CLOSE_TIMEOUT` is never used
+  --> src/api/server.rs:44:7
+   |
+44 | const API_ADMISSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `API_SHUTDOWN_DRAIN_TIMEOUT` is never used
+  --> src/api/server.rs:53:7
+   |
+53 | const API_SHUTDOWN_DRAIN_TIMEOUT: Duration =
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `drain` is never read
+  --> src/api/server.rs:61:5
+   |
+56 | pub struct ServerHandle {
+   |            ------------ field in this struct
+...
+61 |     drain: Arc<ApiDrain>,
+   |     ^^^^^
+
+warning: methods `drain_for_shutdown` and `wake_accept_loop` are never used
+   --> src/api/server.rs:84:19
+    |
+ 76 | impl ServerHandle {
+    | ----------------- methods in this implementation
+...
+ 84 |     pub(crate) fn drain_for_shutdown(&self) {
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+128 |     fn wake_accept_loop(&self, by: Instant) -> Option<LocalStream> {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: function `announce_api_shutdown` is never used
+   --> src/api/server.rs:148:4
+    |
+148 | fn announce_api_shutdown(running: &AtomicBool, drain: &ApiDrain) {
+    |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `connect_local_stream_within` is never used
+  --> src/ipc.rs:57:15
+   |
+57 | pub(crate) fn connect_local_stream_within(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `herdr` (bin "herdr") generated 7 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+────────────
+ Nextest run ID 04cddf9e-2e3e-4b79-958c-0029fc74b66c with nextest profile: default
+    Starting 32 tests across 2 binaries (3851 tests skipped)
+        PASS [   0.008s] ( 1/32) herdr::bin/herdr api::server::accept_loop_tests::shutdown_closes_admission_when_the_listener_fails
+        PASS [   0.009s] ( 2/32) herdr::bin/herdr api::server::accept_loop_tests::keeps_serving_after_connection_thread_spawn_fails
+        PASS [   0.010s] ( 3/32) herdr::bin/herdr api::drain::tests::connection_scope_restores_the_previous_drain
+        PASS [   0.009s] ( 4/32) herdr::bin/herdr api::drain::tests::admission_wait_needs_the_accept_loop_acknowledgement
+        PASS [   0.010s] ( 5/32) herdr::bin/herdr api::drain::tests::idle_wait_reports_the_stage_of_every_abandoned_connection
+        PASS [   0.011s] ( 6/32) herdr::bin/herdr api::server::accept_loop_tests::shutdown_serves_the_queued_connections_then_stops_accepting
+        PASS [   0.014s] ( 7/32) herdr::bin/herdr api::server::accept_loop_tests::accept_error_during_the_shutdown_transition_still_closes_admission
+        PASS [   0.019s] ( 8/32) herdr::bin/herdr api::drain::tests::idle_wait_wakes_when_the_last_connection_finishes
+        PASS [   0.020s] ( 9/32) herdr::bin/herdr api::server::accept_loop_tests::keeps_serving_after_repeated_errors
+        PASS [   0.021s] (10/32) herdr::bin/herdr api::server::accept_loop_tests::exits_when_shutdown_happens_while_errors_continue
+        PASS [   0.008s] (11/32) herdr::bin/herdr api::server::shutdown_drain_tests::connections_queued_before_shutdown_are_served_and_later_ones_refused
+        PASS [   0.013s] (12/32) herdr::bin/herdr api::server::shutdown_drain_tests::connected_client_that_sent_nothing_gets_an_explicit_error
+        PASS [   0.017s] (13/32) herdr::bin/herdr api::server::shutdown_drain_tests::client_still_sending_its_request_gets_an_explicit_error
+        PASS [   0.009s] (14/32) herdr::bin/herdr api::server::shutdown_drain_tests::delivery_is_confirmed_only_while_the_server_drains
+        PASS [   0.010s] (15/32) herdr::bin/herdr api::server::shutdown_drain_tests::established_subscription_does_not_hold_shutdown
+        PASS [   0.010s] (16/32) herdr::bin/herdr api::server::shutdown_drain_tests::response_sent_before_shutdown_wins_over_the_shutdown_error
+        PASS [   0.034s] (17/32) herdr::bin/herdr api::server::shutdown_drain_tests::agent_prompt_with_wait_holds_shutdown_and_is_answered
+        PASS [   0.039s] (18/32) herdr::bin/herdr api::server::shutdown_drain_tests::agent_prompt_without_wait_holds_shutdown_and_is_answered
+        PASS [   0.007s] (19/32) herdr::bin/herdr api::server::shutdown_drain_tests::wait_that_ends_because_the_client_left_writes_nothing
+        PASS [   0.034s] (20/32) herdr::bin/herdr api::server::shutdown_drain_tests::deferred_alt_screen_read_is_answered_at_shutdown
+        PASS [   0.036s] (21/32) herdr::bin/herdr api::server::shutdown_drain_tests::deferred_worktree_operation_is_answered_at_shutdown
+        PASS [   0.035s] (22/32) herdr::bin/herdr api::server::shutdown_drain_tests::queued_request_is_answered_at_shutdown
+        PASS [   0.008s] (23/32) herdr::bin/herdr ipc::tests::run_with_bound_returns_the_result_of_work_that_finishes
+        PASS [   0.008s] (24/32) herdr::bin/herdr api::server::shutdown_drain_tests::wait_that_ends_because_the_server_stops_is_told_so
+        PASS [   0.038s] (25/32) herdr::bin/herdr api::server::shutdown_drain_tests::subscription_waiting_for_its_setup_holds_shutdown_and_is_answered
+        PASS [   0.110s] (26/32) herdr::bin/herdr api::server::shutdown_drain_tests::drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted
+        PASS [   0.211s] (27/32) herdr::bin/herdr api::server::shutdown_drain_tests::confirmation_that_cannot_start_holds_the_reply_until_the_bound
+        PASS [   0.208s] (28/32) herdr::bin/herdr ipc::tests::run_with_bound_stops_waiting_for_work_that_never_finishes
+        PASS [   0.385s] (29/32) herdr::bin/herdr api::server::shutdown_drain_tests::reply_being_written_holds_shutdown_until_the_client_has_it
+        FAIL [   0.614s] (30/32) herdr::server_headless sigterm_answers_connections_that_have_not_finished_their_request
+  stdout ───
+
+    running 1 test
+    test sigterm_answers_connections_that_have_not_finished_their_request ... FAILED
+
+    failures:
+
+    failures:
+        sigterm_answers_connections_that_have_not_finished_their_request
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.58s
+
+  stderr ───
+
+    thread 'sigterm_answers_connections_that_have_not_finished_their_request' (3485465) panicked at tests/server_headless.rs:730:9:
+    connection with partial request got no reply at shutdown: Ok(0) ""
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.833s] (31/32) herdr::bin/herdr api::server::shutdown_drain_tests::reply_write_stops_at_its_deadline_even_while_the_client_keeps_reading
+        PASS [   2.418s] (32/32) herdr::server_headless sigterm_during_startup_answers_requests_already_accepted
+────────────
+     Summary [   2.421s] 32 tests run: 31 passed, 1 failed, 3851 skipped
+        FAIL [   0.614s] (30/32) herdr::server_headless sigterm_answers_connections_that_have_not_finished_their_request
+error: test run failed
