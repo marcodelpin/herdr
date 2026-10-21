@@ -59,7 +59,7 @@ jobs:
       - name: Run the new source-rule tests by name
         shell: bash
         run: |
-          filter='test(/source_rules_read_another_token_and_accept_percent|source_must_be_a_custom_token_and_round_trips|machine_is_coloured_by_the_ctx_token/)'
+          filter='test(/source_rules_read_another_token_and_never_the_own_value|source_must_be_a_custom_token_and_round_trips|machine_is_coloured_by_the_ctx_token/)'
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > upm-tests.txt
           n=$(wc -l < upm-tests.txt)
           echo "new tests matched: $n"
@@ -111,7 +111,7 @@ jobs:
           grep -c 'Some(_name) => rule.matches(value' src/config/sidebar/rules.rs
           cargo nextest run --locked --bin herdr --no-run
           rc=0
-          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/source_rules_read_another_token_and_accept_percent|machine_is_coloured_by_the_ctx_token/)' > mutant.log 2>&1 || rc=$?
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E 'test(/source_rules_read_another_token_and_never_the_own_value|machine_is_coloured_by_the_ctx_token/)' > mutant.log 2>&1 || rc=$?
           tail -20 mutant.log
           if [ "$rc" -eq 0 ]; then echo "MUTANT SURVIVED: the tests pass without the source lookup"; exit 1; fi
           grep -q 'FAIL' mutant.log || { echo "rc=$rc but no FAIL line: the tests did not run"; exit 1; }
