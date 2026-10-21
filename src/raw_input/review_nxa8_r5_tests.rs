@@ -69,6 +69,90 @@ fn unix_reader(
     chunks
 }
 
+/// What reached the pane, one entry per escape-led event; the typed bytes
+/// between them run together, so text splits do not matter but a key typed
+/// as literal text does.
+fn typed_runs(events: &[RawInputEvent]) -> Vec<Vec<u8>> {
+    let mut runs: Vec<Vec<u8>> = Vec::new();
+    for event in events {
+        let bytes = match event {
+            RawInputEvent::Key(key) => key.vt_bytes().unwrap_or_default().to_vec(),
+            RawInputEvent::Text(text) => text.as_str().as_bytes().to_vec(),
+            _ => continue,
+        };
+        match runs.last_mut() {
+            Some(run) if bytes.first() != Some(&ESC) && run.first() != Some(&ESC) => {
+                run.extend(bytes);
+            }
+            _ => runs.push(bytes),
+        }
+    }
+    runs
+}
+
+/// Same class as codex f5251-r5 finding 1 (ADR-0013 amendment 1, D4): a byte
+/// from 0x01 to 0x1f is never X10 payload. It ends an `ESC [ M` frame, in the
+/// buffer or after a released prefix. An ESC starts the next token, so the
+/// key after a broken report keeps its ESC; any other such byte is typed on
+/// the Unix reader and dropped with the frame on the pump, which replays the
+/// key record it staged for it. NUL stays payload (xterm's coordinate past
+/// its limit). Before, a frame in the buffer took six bytes whatever they
+/// were (since upstream), and the pump dropped a disproving ESC with the tail
+/// of a released prefix.
+#[test]
+fn review_r5_1b_control_byte_ends_an_x10_frame() {
+    // (pump, released prefix or none, rest, what reaches the pane)
+    let cases: [(bool, &[u8], &[u8], &[&[u8]]); 12] = [
+        (false, b"", b"\x1b[M\x1b[A", &[b"\x1b[A"]),
+        (true, b"", b"\x1b[M\x1b[A", &[b"\x1b[A"]),
+        (false, b"", b"\x1b[M!\x1b[A", &[b"\x1b[A"]),
+        (true, b"", b"\x1b[M!\x1b[A", &[b"\x1b[A"]),
+        (false, b"", b"\x1b[M\rab", &[b"\rab"]),
+        (true, b"", b"\x1b[M\rab", &[b"ab"]),
+        (false, b"", b"\x1b\x1b[M\rab", &[b"\x1b", b"\rab"]),
+        (true, b"", b"\x1b\x1b[M\rab", &[b"\x1b", b"ab"]),
+        (false, b"", b"\x1b[M \x00!x", &[b"x"]),
+        (true, b"", b"\x1b[M \x00!x", &[b"x"]),
+        (true, b"\x1b", b"[M\x1b[A", &[b"\x1b", b"\x1b[A"]),
+        (true, b"\x1b[", b"M\x1b[A", &[b"\x1b[", b"\x1b[A"]),
+    ];
+    let mut wrong = Vec::new();
+    for (pump, prefix, rest, expected) in cases {
+        let base = Instant::now();
+        let mut framer = RawInputByteFramer::with_host_input_policy(false);
+        framer.set_test_clock(base);
+        let events: Vec<RawInputEvent> = if pump {
+            framer.set_pump_policy();
+            let mut chunks = Vec::new();
+            let mut at = 0;
+            if !prefix.is_empty() {
+                // Released at the first quiet idle tick; the rest comes
+                // inside its tail hold.
+                chunks.extend(push_at(&mut framer, base, 0, prefix));
+                chunks.extend(ticks(&mut framer, base, 0, 300));
+                at = 300;
+            }
+            chunks.extend(push_at(&mut framer, base, at, rest));
+            chunks.extend(ticks(&mut framer, base, at, 3_000));
+            events_from_framed_chunks(chunks)
+        } else {
+            unix_reader(&mut framer, base, &[(0, rest)], 3_000)
+                .iter()
+                .flat_map(|chunk| parse_framed_input(chunk))
+                .collect()
+        };
+        let expected: Vec<Vec<u8>> = expected.iter().map(|run| run.to_vec()).collect();
+        if typed_runs(&events) != expected || framer.has_pending_input() {
+            wrong.push(format!(
+                "pump={pump} {} then {}: {events:?}",
+                prefix.escape_ascii(),
+                rest.escape_ascii()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// Same class as codex f5251-r5 finding 2 (ADR-0013 amendment 1, D1): a
 /// default-colour reply prefix that ends in ESC when its window closes is
 /// dropped, and its ESC is kept as the possible start of the ST. `[` then
