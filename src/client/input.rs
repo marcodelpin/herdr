@@ -177,6 +177,28 @@ fn unix_stdin_reader_loop(
             }
             continue;
         }
+        // A bounded hold must end even if no further input arrives.
+        if let Some(wait_ms) = framer.held_input_release_ms() {
+            if stdin_read_ready(&reader, wait_ms) == Some(false) {
+                let sgr_pixels =
+                    pending_mode.unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
+                let chunks = framer.flush_timeout();
+                if !framer.has_pending_input() {
+                    pending_mode = None;
+                }
+                if !send_unix_input_chunks(
+                    chunks,
+                    &event_tx,
+                    &mut pending_palette,
+                    sgr_pixels,
+                    last_geometry,
+                ) || !flush_unix_palette_input(&event_tx, &mut pending_palette)
+                {
+                    return;
+                }
+                continue;
+            }
+        }
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {
