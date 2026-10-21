@@ -114,6 +114,7 @@ impl App {
 
     /// A live handoff transferred this session and the source no longer
     /// saves it: until a write reaches the disk, it exists nowhere else.
+    #[cfg(unix)]
     pub(crate) fn owe_transferred_session(&mut self) {
         if !self.policy.persist_session {
             return;
