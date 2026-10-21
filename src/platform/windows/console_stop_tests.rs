@@ -20,8 +20,7 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, CREATE_NEW_CONSOLE};
 
@@ -145,8 +144,9 @@ fn console_break_ends_the_server_when_its_stop_handler_thread_cannot_start() {
     }
     let module = module_path!();
     let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-    let name =
-        format!("{module}::console_break_ends_the_server_when_its_stop_handler_thread_cannot_start");
+    let name = format!(
+        "{module}::console_break_ends_the_server_when_its_stop_handler_thread_cannot_start"
+    );
 
     use std::os::windows::process::CommandExt;
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
@@ -182,7 +182,9 @@ fn console_break_ends_the_server_when_its_stop_handler_thread_cannot_start() {
         !output.contains(DISPATCHED),
         "the stop handler's thread started under the commit limit, the test proves nothing:\n{output}"
     );
-    let code = status.and_then(|status| status.code()).map(|code| code as u32);
+    let code = status
+        .and_then(|status| status.code())
+        .map(|code| code as u32);
     assert_eq!(
         code,
         Some(STATUS_CONTROL_C_EXIT),
