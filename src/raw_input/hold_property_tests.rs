@@ -285,7 +285,7 @@ fn gap(rng: &mut Rng) -> u64 {
         33..=36 => rng.range(560, 999),
         37..=38 => rng.range(1_000, 1_300),
         // Past every hold, the pending-input bound included.
-        _ => rng.range(1_300, 2_600),
+        _ => rng.range(1_300, 4_000),
     }
 }
 
@@ -318,6 +318,18 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
         }]
     };
     let released_prefixes = || vec![vec![vec![ESC]], vec![b"\x1b[".to_vec()]];
+    // Spread past its bound: what arrived before the last late cut is outside
+    // the promise, what arrived after it is typed (r3-3: a late tail that is
+    // dropped is a loss, not an `Either`).
+    let spread = || {
+        let mut units = every(Rule::Either);
+        if let Some(late) = late_cut(cuts, config) {
+            for unit in &mut units[late..] {
+                unit.rule = Rule::Keep;
+            }
+        }
+        units
+    };
     match kind {
         Kind::Text | Kind::AltChord | Kind::Ambiguous => {
             let mut units = every(Rule::Keep);
@@ -330,14 +342,14 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
             };
             if bytes.get(1) == Some(&b'O') {
                 // SS3 tails after a released prefix are not recovered.
-                return every(Rule::Either);
+                return spread();
             }
             #[cfg(unix)]
             if config.disambiguation && first.at == 2 && !matches!(bytes[2], b'M' | 0x20..=0x3f) {
                 // With escape disambiguation, `ESC [` held past keyboard
                 // timing and followed by a final byte is a key binding
                 // (#4759): released as Alt+[, the byte typed. Unchanged.
-                return every(Rule::Either);
+                return spread();
             }
             if first.at <= 2 && first.gap < REPORT_SPAN && later <= BURST {
                 // Whole, or the released ESC / Alt+[ and the tail dropped.
@@ -350,7 +362,7 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
                 // after it.
                 return one(Rule::OneOf(vec![vec![bytes.to_vec()], Vec::new()]));
             }
-            every(Rule::Either)
+            spread()
         }
         Kind::Paste => {
             let marker_cut = cuts.iter().any(|cut| cut.at < BRACKETED_PASTE_START.len());
@@ -373,7 +385,7 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
                 }
                 return one(Rule::OneOf(alternatives));
             }
-            every(Rule::Either)
+            spread()
         }
         Kind::X10 => {
             let Some(first) = first else {
@@ -386,7 +398,7 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
                 alternatives.extend(released_prefixes());
                 return one(Rule::OneOf(alternatives));
             }
-            every(Rule::Either)
+            spread()
         }
         Kind::Color => {
             if first.is_some() && config.default_color_query {
@@ -423,6 +435,23 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
         Kind::LongColor => every(Rule::Either),
         Kind::Semantic => unreachable!(),
     }
+}
+
+/// The offset of the last cut after which every context of the token has
+/// closed: its prefix was released within the pending-input bound (plus a
+/// Windows tick) and the longest tail limit has passed since. The graphics
+/// filter can delay the prefix itself past that, so it has no late cut.
+fn late_cut(cuts: &[Cut], config: &Config) -> Option<usize> {
+    #[cfg(unix)]
+    if config.graphics_wait.is_some() {
+        return None;
+    }
+    let _ = config;
+    let late = AGE_LIMIT + WINDOWS_TICK_MS + COLOR_SPAN + 90;
+    cuts.iter()
+        .filter(|cut| cut.gap >= late)
+        .map(|cut| cut.at)
+        .max()
 }
 
 /// A UTF-8 character cut past the pending-input bound, or cut by a
