@@ -2696,6 +2696,8 @@ mod review_5251_r2_tests;
 mod review_nxa8_r3_tests;
 #[cfg(test)]
 mod review_nxa8_r4_tests;
+#[cfg(test)]
+mod review_nxa8_r5_tests;
 
 #[cfg(test)]
 mod tests {
