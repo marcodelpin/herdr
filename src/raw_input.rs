@@ -341,6 +341,9 @@ enum Verdict {
     /// The first `n` complete a reply (or, on the pump, an X10 report) whose
     /// prefix was released: put the prefix back so the whole parses as one.
     Rejoin(usize),
+    /// The ESC dropped as the possible start of an ST is not one: the first
+    /// byte disproved the ST, so put the ESC back to start the next token.
+    Restore,
     /// They can still complete it: wait, until the deadline.
     Hold,
 }
@@ -443,6 +446,12 @@ fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool, pump: bool) -
         }
         HoldAfter::OscHeader { split_st: true, .. } if tail.first() == Some(&b'\\') => {
             Verdict::Drop(1)
+        }
+        // Any other byte disproves the ST: the ESC dropped with the header
+        // starts the next token, unless that byte is a new ESC, which brings
+        // its own (ADR-0013 amendment 1, D1).
+        HoldAfter::OscHeader { split_st: true, .. } if tail.first() != Some(&ESC) => {
+            Verdict::Restore
         }
         HoldAfter::OscHeader { .. } => match classify_discarded_osc_tail(tail) {
             DiscardedOscTail::Pending => Verdict::Hold,
@@ -1747,6 +1756,11 @@ impl RawInputByteFramer {
                 self.tail_hold = None;
                 true
             }
+            Verdict::Restore => {
+                self.buffer.insert(0, ESC);
+                self.tail_hold = None;
+                true
+            }
             Verdict::Emit => {
                 // After a semantic key, the reply-shaped bytes before the
                 // byte that ended the reply are not typed (ADR-0013 D1).
@@ -1834,7 +1848,7 @@ impl RawInputByteFramer {
                     break;
                 }
                 let Some(terminator_len) =
-                    control_string_terminator_for_family(&self.buffer, family)
+                    control_string_terminator_for_family(&self.buffer, 0, family)
                 else {
                     break;
                 };
@@ -2064,6 +2078,13 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             ));
         }
 
+        // A string introducer starts no key: a control string an ESC aborted
+        // is dropped, never forwarded as an Alt key (#344).
+        if control_string(seq.as_bytes()).is_some() {
+            tracing::debug!(len = seq_len, "dropping unsupported control string");
+            return Some((RawInputEvent::Unsupported, seq_len));
+        }
+
         match seq {
             "\x1b[I" => return Some((RawInputEvent::OuterFocusGained, seq_len)),
             "\x1b[O" => return Some((RawInputEvent::OuterFocusLost, seq_len)),
@@ -2290,7 +2311,9 @@ fn control_string(buffer: &[u8]) -> Option<ControlString> {
         _ => return None,
     };
 
-    Some(match control_string_terminator_for_family(buffer, family) {
+    // The terminator search starts after the two-byte introducer.
+    let end = control_string_terminator_for_family(buffer, 2, family);
+    Some(match end {
         Some(len) => ControlString::Complete { len, family },
         None => ControlString::Incomplete { family },
     })
@@ -2571,17 +2594,37 @@ fn osc_string_terminator(buffer: &[u8]) -> Option<usize> {
     }
 }
 
-fn st_string_terminator(buffer: &[u8]) -> Option<usize> {
-    find_subsequence(buffer, b"\x1b\\").map(|idx| idx + 2)
+/// Where a control string in `buffer` ends, searching from `from`: through
+/// its terminator (BEL when `bel`, or ST), or before an ESC whose next byte is
+/// not `\`. That ESC cannot start the ST, so it aborts the string, as in the
+/// terminal's own parser, and starts the next token; a new ESC as the next
+/// byte ends the string with the ESC before it (ADR-0013 amendment 1, D1).
+/// `None` while the string can still go on.
+fn control_string_end(buffer: &[u8], from: usize, bel: bool) -> Option<usize> {
+    for (index, byte) in buffer.iter().enumerate().skip(from) {
+        match *byte {
+            0x07 if bel => return Some(index + 1),
+            ESC => {
+                return match buffer.get(index + 1)? {
+                    b'\\' => Some(index + 2),
+                    &ESC => Some(index + 1),
+                    _ => Some(index),
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn control_string_terminator_for_family(
     buffer: &[u8],
+    from: usize,
     family: ControlStringFamily,
 ) -> Option<usize> {
     match family {
-        ControlStringFamily::Osc => osc_string_terminator(buffer),
-        ControlStringFamily::StTerminated => st_string_terminator(buffer),
+        ControlStringFamily::Osc => control_string_end(buffer, from, true),
+        ControlStringFamily::StTerminated => control_string_end(buffer, from, false),
         ControlStringFamily::HostReplyCsi => None,
     }
 }
