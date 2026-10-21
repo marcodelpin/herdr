@@ -339,6 +339,7 @@ mod tests {
 
     #[test]
     fn source_must_be_a_custom_token_and_round_trips() {
+        assert_eq!(1, 2, "herdr-5bka positive control: this test is forced to fail");
         for bad in ["ctx", "$", "$bad name", "$ctx.x"] {
             let raw = format!("source = '{bad}'\ngt = 1");
             assert!(toml::from_str::<SidebarTokenRule>(&raw).is_err(), "{bad}");
