@@ -36,6 +36,17 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let server_stop = crate::server::shutdown::ServerStop::default();
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    // Before the API socket accepts anything, so a stop signal from here on
+    // takes the shutdown drain (herdr-ir4j).
+    let quit_signal = {
+        let _runtime = rt.enter();
+        install_server_signal_handling(&server_stop)
+    };
+
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
         api_tx.clone(),
@@ -51,11 +62,6 @@ pub fn run_server() -> io::Result<()> {
         Err(err) => return Err(err),
     };
     hold_startup_after_api_bind_for_test();
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
@@ -93,7 +99,7 @@ pub fn run_server() -> io::Result<()> {
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
 
-        server.run().await
+        server.run(quit_signal).await
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));
@@ -188,6 +194,8 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
+        // Before the API socket accepts anything (herdr-ir4j).
+        let quit_signal = install_server_signal_handling(&server_stop);
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
@@ -218,7 +226,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
-        server.run().await
+        server.run(quit_signal).await
     });
 
     rt.shutdown_timeout(Duration::from_millis(100));

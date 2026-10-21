@@ -697,8 +697,8 @@ fn sigterm_answers_connections_that_have_not_finished_their_request() {
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
-    // The signal handler is installed right after this startup line; a
-    // SIGTERM before it kills the process outright (herdr-9ds0).
+    // Waits for the event loop, so the signal finds these clients mid-request
+    // on a running server; the startup window has its own test (herdr-ir4j).
     wait_for_log_line(
         &server_log_path(&config_home),
         "app.startup",

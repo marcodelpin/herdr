@@ -5059,10 +5059,13 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
         );
         assert!(server.app.session_save_thread.is_none());
         runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), server.run())
-                .await
-                .expect("host shutdown must stop the isolated server loop")
-                .expect("server loop shuts down cleanly");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                server.run(QuitSignalWake::default()),
+            )
+            .await
+            .expect("host shutdown must stop the isolated server loop")
+            .expect("server loop shuts down cleanly");
         });
         let snapshot = crate::persist::load().expect("shutdown session should be saved");
         let panes = &snapshot.workspaces[0].tabs[0].panes;
