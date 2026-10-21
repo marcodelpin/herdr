@@ -1,0 +1,20 @@
+diff --git a/src/platform/windows/console_stop.rs b/src/platform/windows/console_stop.rs
+index 1556f7ae..9253a8a2 100644
+--- a/src/platform/windows/console_stop.rs
++++ b/src/platform/windows/console_stop.rs
+@@ -70,12 +70,13 @@ fn install(on_quit: impl Fn(ServerQuitSignal) + Send + Sync + 'static) -> io::Re
+         return Err(io::Error::last_os_error());
+     }
+     let dispatched = Events(events);
++    // MUTANT M6: register before the dispatch thread exists (ctrlc 3.5.2 order).
++    EVENTS.store(events, Ordering::Release);
++    unsafe { SetConsoleCtrlHandler(Some(console_stop_handler), 1) };
+     let spawned = crate::thread_spawn::spawn_named("herdr-console-stop", move || {
+         dispatch(dispatched, on_quit);
+     });
+     if let Err(err) = spawned {
+-        // SAFETY: never published, and the thread that would own it never ran.
+-        unsafe { CloseHandle(events) };
+         return Err(err);
+     }
+     EVENTS.store(events, Ordering::Release);
