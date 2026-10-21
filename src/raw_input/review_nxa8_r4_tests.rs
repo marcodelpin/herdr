@@ -118,3 +118,69 @@ fn review_r4_windows_red_pump_flush_right_after_push_keeps_key_prefix() {
         "{events:?}"
     );
 }
+
+/// A pump byte framer under a virtual clock, with a colour query sent.
+fn pump_framer_with_color_query() -> (RawInputByteFramer, Instant) {
+    let base = Instant::now();
+    let mut framer = RawInputByteFramer::with_host_input_policy(false);
+    framer.set_test_clock(base);
+    framer.set_pump_policy();
+    framer.host_color_query_sent();
+    (framer, base)
+}
+
+/// Pump idle ticks every 10 ms from `from` to `to`.
+fn ticks(framer: &mut RawInputByteFramer, base: Instant, from: u64, to: u64) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    let mut now = from;
+    while now + 10 <= to {
+        now += 10;
+        framer.set_test_clock(base + Duration::from_millis(now));
+        chunks.extend(framer.flush_timeout());
+    }
+    framer.set_test_clock(base + Duration::from_millis(to));
+    chunks
+}
+
+/// Found by the v3 property test (ADR-0013 D1), the generic form of codex
+/// f5251-r4 finding 1: an OSC 4 reply whose `ESC ]` was dropped at its idle
+/// timeout, its tail held, then a semantic key. The tail is the host's, not
+/// the user's: the key does not turn it into typing, before or after it.
+#[test]
+fn review_r4_1b_color_reply_tail_held_across_a_semantic_key_is_not_typed() {
+    let (mut framer, base) = pump_framer_with_color_query();
+    let mut chunks = framer.push(b"\x1b]");
+    chunks.extend(ticks(&mut framer, base, 0, 448));
+    chunks.extend(framer.push(b"4;160;rgb:a2ae/e6"));
+    chunks.extend(ticks(&mut framer, base, 448, 451));
+    chunks.extend(framer.flush_interrupted());
+    chunks.extend(framer.push(b"3"));
+    chunks.extend(ticks(&mut framer, base, 451, 501));
+    chunks.extend(framer.push(b"1/d43c\x07"));
+    chunks.extend(ticks(&mut framer, base, 501, 3_000));
+
+    assert!(chunks.is_empty(), "{chunks:?}");
+    assert!(!framer.has_pending_input());
+}
+
+/// Found by the v3 property test: a colour reply that reaches the front of
+/// the buffer only after an orphan UTF-8 continuation in front of it was
+/// dropped is not abandoned on arrival. Interrupted 582 ms later, inside its
+/// one-second idle limit, it is kept, and its tail completes it.
+#[test]
+fn review_r4_1c_color_reply_behind_dropped_orphan_bytes_is_not_abandoned() {
+    let (mut framer, base) = pump_framer_with_color_query();
+    let mut chunks = framer.push(b"\xbd\xa0\x1b]10;rgb:ac06/");
+    chunks.extend(ticks(&mut framer, base, 0, 582));
+    chunks.extend(framer.flush_interrupted());
+    chunks.extend(framer.push(b"ae01/39da\x07"));
+    chunks.extend(ticks(&mut framer, base, 582, 3_000));
+
+    let typed: Vec<u8> = chunks
+        .iter()
+        .filter(|chunk| !chunk.starts_with(b"\x1b]"))
+        .flatten()
+        .copied()
+        .collect();
+    assert!(typed.is_empty(), "{chunks:?}");
+}
