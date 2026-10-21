@@ -5348,13 +5348,23 @@ fn claude_sh_hook_bounds_claude_pid_to_u32_and_still_reports() {
             .is_ok_and(|output| output.status.success()),
         "the claude hook needs python3; without it this test would prove nothing"
     );
+    // herdr-d98u r2: python's int() refuses more than 4300 digits, so a long
+    // value must be bounded before conversion; zero padding stays a valid pid.
+    let long_pid = "1".repeat(4301);
+    let padded_long_pid = format!("{}7", "0".repeat(4400));
     for (claude_pid, expected) in [
         (Some("4242"), Some(4242_u64)),
         (Some("1"), Some(1)),
         (Some("4294967295"), Some(4_294_967_295)),
+        (Some("00000000001"), Some(1)),
+        (Some("04294967295"), Some(4_294_967_295)),
+        (Some(padded_long_pid.as_str()), Some(7)),
         (Some("4294967296"), None),
+        (Some("04294967296"), None),
         (Some("99999999999999999999"), None),
+        (Some(long_pid.as_str()), None),
         (Some("0"), None),
+        (Some("00000000000"), None),
         (Some("-5"), None),
         (Some("+7"), None),
         (Some(" 7"), None),
@@ -5403,11 +5413,21 @@ fn claude_windows_hook_bounds_claude_pid_to_u32_and_still_reports() {
     )
     .unwrap();
 
+    // herdr-d98u r2: zero padding is a valid decimal pid, as on Linux; only
+    // the significant digits are bounded, so any input length is safe.
+    let long_pid = "1".repeat(4301);
+    let padded_long_pid = format!("{}7", "0".repeat(4400));
     for (index, (claude_pid, expected)) in [
         ("4242", Some("4242")),
         ("4294967295", Some("4294967295")),
+        ("00000000001", Some("1")),
+        ("04294967295", Some("4294967295")),
+        (padded_long_pid.as_str(), Some("7")),
         ("4294967296", None),
+        ("04294967296", None),
+        (long_pid.as_str(), None),
         ("0", None),
+        ("00000000000", None),
         ("-5", None),
         ("+7", None),
         (" 7", None),
@@ -5503,6 +5523,13 @@ fn claude_hook_with_expected_version_but_other_content_is_outdated() {
     let edited = CLAUDE_HOOK_ASSET.replacen("CLAUDE_PID", "CLAUDE_PID_X", 1);
     assert_ne!(edited, CLAUDE_HOOK_ASSET);
     assert_eq!(status(&edited).state, IntegrationStatusKind::Outdated);
+
+    // a same-length edit that disables reporting is a different hook as well,
+    // so a length-only comparison cannot pass (herdr-wf1f r2)
+    let same_length = CLAUDE_HOOK_ASSET.replacen("SessionStart", "SessionStort", 1);
+    assert_ne!(same_length, CLAUDE_HOOK_ASSET);
+    assert_eq!(same_length.len(), CLAUDE_HOOK_ASSET.len());
+    assert_eq!(status(&same_length).state, IntegrationStatusKind::Outdated);
 
     // line endings alone do not make a different hook
     let crlf = CLAUDE_HOOK_ASSET

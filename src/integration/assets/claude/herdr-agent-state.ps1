@@ -52,9 +52,13 @@ try {
     }
     # herdr's --agent-pid is a u32 pid: forward only plain decimal digits in
     # 1..=4294967295 and omit anything else, so the report itself still lands.
+    # Zero padding is allowed; only the significant digits are bounded.
     $agentPid = [uint64]0
-    if ($env:CLAUDE_PID -cmatch '\A[0-9]{1,10}\z' -and [uint64]::TryParse($env:CLAUDE_PID, [ref]$agentPid) -and $agentPid -ge 1 -and $agentPid -le 4294967295) {
-        $args += @("--agent-pid", "$agentPid")
+    if ($env:CLAUDE_PID -cmatch '\A[0-9]+\z') {
+        $significantPid = $env:CLAUDE_PID.TrimStart([char]'0')
+        if ($significantPid.Length -ge 1 -and $significantPid.Length -le 10 -and [uint64]::TryParse($significantPid, [ref]$agentPid) -and $agentPid -le 4294967295) {
+            $args += @("--agent-pid", "$agentPid")
+        }
     }
     if ($payload.cwd -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.cwd)) {
         $args += @("--agent-session-cwd", "$($payload.cwd)")
