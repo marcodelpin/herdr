@@ -24,7 +24,8 @@ impl SessionWriter {
     }
 
     /// From now on until a write reaches the disk, the session holds a
-    /// transferred one that exists nowhere else.
+    /// transferred one that exists nowhere else. Live handoff is Unix-only.
+    #[cfg(any(unix, test))]
     pub(crate) fn owe_transferred_session(&mut self) {
         self.owes_transferred_session = true;
     }
