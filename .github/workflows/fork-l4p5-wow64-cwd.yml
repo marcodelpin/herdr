@@ -2,7 +2,7 @@
 # child_launch_directory went red on windows-latest image 20261018.275 (OS build 26100.33650)
 # while it stayed green on 20261007.264 (build 26100.33438). Several Windows jobs run so both
 # images get sampled; each prints the image, runs the cwd tests 25 times in a row (a flake shows
-# as a count, not as one lucky pass), then the whole crate test suite. bd herdr-l4p5.
+# as a count, not as one lucky pass), then the whole crate test suite three times. bd herdr-l4p5.
 name: Fork l4p5 wow64 cwd
 
 on:
@@ -72,6 +72,18 @@ jobs:
           echo "L4P5STRESS failed=$fails of 25"
           [ "$fails" = 0 ]
 
-      - name: Run the crate tests
+      # The red only ever showed inside the full suite (load), so the full suite runs three
+      # times; every failing test is named per pass, and the job fails if any pass failed.
+      - name: Run the crate tests three times
         if: ${{ !cancelled() }}
-        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+        shell: bash
+        run: |
+          bad=0
+          for pass in 1 2 3; do
+            rc=0
+            cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --final-status-level fail --failure-output final --success-output never > suite-$pass.log 2>&1 || rc=$?
+            grep -E 'Summary|^ +FAIL' suite-$pass.log | sed "s/^/L4P5SUITE pass=$pass /"
+            [ "$rc" = 0 ] || { bad=$((bad + 1)); tail -80 suite-$pass.log; }
+          done
+          echo "L4P5SUITE failed_passes=$bad of 3"
+          [ "$bad" = 0 ]
