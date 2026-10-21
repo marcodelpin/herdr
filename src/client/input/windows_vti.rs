@@ -4667,4 +4667,109 @@ mod tests {
             );
         }
     }
+
+    /// What reached the pane, one entry per event: the key code, or the
+    /// text, paste or event kind.
+    fn event_summary(events: &[crate::protocol::ClientInputEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                crate::protocol::ClientInputEvent::Key { code, .. } => format!("{code:?}"),
+                crate::protocol::ClientInputEvent::TextCommit(text) => format!("text:{text:?}"),
+                crate::protocol::ClientInputEvent::Paste { text } => format!("paste:{text:?}"),
+                crate::protocol::ClientInputEvent::Mouse { .. } => "mouse".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// codex f5251-r5 finding 1 (ADR-0013 D4): a serialized scan-code-zero
+    /// ESC released at an idle tick, serialized raw `[M` 290 ms later, then
+    /// nested Win32 key records the pump stages as a possible X10 payload.
+    /// A payload byte no X10 report carries (the Enter's CR) or a report
+    /// that does not parse disproves the frame: it is dropped, and the pump
+    /// replays the keys it staged, once and in order. Never `[M` typed and
+    /// never a key twice.
+    #[test]
+    fn review_r5_1_disproved_x10_frame_delivers_staged_keys_once() {
+        let enter = (13, 28, 13, 0);
+        let shift_c = (67, 46, 67, 16);
+        let space = (32, 57, 32, 0);
+        for (payload, expected) in [
+            (vec![enter], vec!["Enter"]),
+            (vec![shift_c, enter], vec!["Char('C')", "Enter"]),
+            (
+                vec![space, space, space],
+                vec!["Char(' ')", "Char(' ')", "Char(' ')"],
+            ),
+        ] {
+            let mut translator = WindowsInputTranslator::default();
+            let mut events = Vec::new();
+            for record in win32_input_mode_encoded_raw_bytes(b"\x1b") {
+                events.extend(translator.translate(record));
+            }
+            events.extend(translator.idle());
+            advance(&mut translator, 290);
+            for record in win32_input_mode_encoded_raw_bytes(b"[M") {
+                events.extend(translator.translate(record));
+            }
+            for (vk, scan, unicode, mods) in payload.iter().copied() {
+                advance(&mut translator, 1);
+                let record = WindowsKeyRecord {
+                    key_down: true,
+                    repeat_count: 1,
+                    virtual_key_code: vk,
+                    virtual_scan_code: scan,
+                    unicode,
+                    control_key_state: mods,
+                };
+                for record in win32_input_mode_encoded_record(record) {
+                    events.extend(translator.translate(record));
+                }
+            }
+            for _ in 0..150 {
+                events.extend(translator.idle());
+            }
+
+            let mut want = vec!["Esc".to_string()];
+            want.extend(expected.iter().map(|code| code.to_string()));
+            assert_eq!(event_summary(&events), want, "{payload:?}: {events:?}");
+        }
+    }
+
+    /// codex f5251-r5 finding 2 (ADR-0013 D1): an OSC 4 header dropped at
+    /// its idle tick, its unterminated reply-shaped tail held across a
+    /// native Enter, then a Delete key or a bracketed paste as raw records.
+    /// An ESC is the start of the reply's ST only while `\` can still follow
+    /// it: `[` disproves that, so the ESC starts the next token, which
+    /// reaches the pane whole.
+    #[test]
+    fn review_r5_2_key_after_interrupted_color_tail_keeps_its_escape() {
+        for (tail, expected) in [
+            ("\x1b[3~", vec!["Enter", "Delete"]),
+            ("\x1b[200~abc\x1b[201~", vec!["Enter", "paste:\"abc\""]),
+        ] {
+            let mut translator = WindowsInputTranslator::default();
+            let mut events = Vec::new();
+            for record in "\x1b]4;50;".chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+            events.extend(translator.idle());
+            advance(&mut translator, 10);
+            for record in "rgb:aaaa/bbbb/cccc".chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+            advance(&mut translator, 1);
+            events.extend(translator.translate(key_vk_with_unicode(0x0d, '\r', 0)));
+            advance(&mut translator, 1);
+            for record in tail.chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+            for _ in 0..150 {
+                events.extend(translator.idle());
+            }
+
+            assert_eq!(event_summary(&events), expected, "{tail:?}: {events:?}");
+        }
+    }
 }

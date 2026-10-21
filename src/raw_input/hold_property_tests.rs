@@ -2054,3 +2054,50 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
     assert!(streams > 50, "{streams} graphics streams");
     assert_eq!(pump_only, SEEDS.len() * CASES_PER_SEED);
 }
+
+/// codex f5251-r5 finding 3 (ADR-0013 D2, D6): the oracle enforces the
+/// minimum quiet time before a lossy disposal, not only the maximum age.
+/// Windows `ESC [ 3` at 0 ms, a timeout flush right after it, `~` at 1 ms:
+/// the prefix is not quiet, so it stays and Delete reaches the pane. A
+/// framer without the quiet guard drops `ESC [ 3` at the flush and `~` on
+/// arrival, and the oracle must reject that loss, not accept it as
+/// `OneOf([Delete], [])`.
+#[test]
+fn oracle_rejects_loss_before_the_pump_quiet_window() {
+    let config = Config {
+        driver: Driver::WindowsPump,
+        mouse_capture: false,
+        color_query: false,
+        default_color_query: false,
+        disambiguation: false,
+        graphics_wait: None,
+    };
+    let bytes = b"\x1b[3~";
+    let read = |gap: u64, bytes: &[u8]| Read {
+        gap,
+        bytes: bytes.to_vec(),
+        color_queries: 0,
+        wait_for_flush: false,
+        semantic: false,
+    };
+    let case = Case {
+        config,
+        reads: vec![read(0, &bytes[..3]), read(1, &bytes[3..])],
+        expected: cut_token_rule(Kind::Key, bytes, &[Cut { at: 3, gap: 1 }], &config, 0),
+        paste_end: vec![None; bytes.len()],
+        kinds: vec![Kind::Key; bytes.len()],
+        input: bytes.to_vec(),
+        token_starts: vec![0],
+    };
+    // A harness seed whose first push is followed by a timeout flush.
+    let seed = (0..).find(|seed| Rng(*seed).chance(1, 4)).unwrap();
+    let mut harness = Harness::new(&case, seed);
+    harness.run_windows_pump().unwrap();
+    let expected = harness.resolve();
+    assert_eq!(harness.out, vec![bytes.to_vec()]);
+    assert!(check_output(&expected, &harness.out).is_ok());
+    assert!(
+        check_output(&expected, &[]).is_err(),
+        "the loss before the quiet window passes: {expected:?}"
+    );
+}
