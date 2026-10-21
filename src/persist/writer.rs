@@ -324,6 +324,7 @@ mod tests {
         SessionWriter {
             path: directory.join("session.json"),
             protect_unloaded,
+            owes_transferred_session: false,
         }
     }
 
@@ -355,6 +356,30 @@ mod tests {
     }
 
     #[test]
+    fn a_transferred_session_is_owed_until_a_write_reaches_the_disk() {
+        let mut writer = writer(false);
+        writer.owe_transferred_session();
+        let blocker = writer.path.with_file_name("session.json.tmp");
+        std::fs::create_dir_all(blocker.join("blocker")).unwrap();
+        assert!(writer.try_save(&snapshot(), None).is_err());
+        assert!(
+            writer.owes_transferred_session(),
+            "a failed write must not discharge the transferred session"
+        );
+        std::fs::remove_dir_all(&blocker).unwrap();
+        writer.try_save(&snapshot(), None).unwrap();
+        assert!(!writer.owes_transferred_session());
+
+        writer.owe_transferred_session();
+        writer.try_clear().unwrap();
+        assert!(
+            !writer.owes_transferred_session(),
+            "a cleared session leaves no workspace to lose"
+        );
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn snapshot_survives_exit_bursts_clears_and_writer_restarts() {
         let mut writer = writer(false);
         let original = snapshot();
@@ -369,6 +394,7 @@ mod tests {
             writer = SessionWriter {
                 path: writer.path.clone(),
                 protect_unloaded: false,
+                owes_transferred_session: false,
             };
         }
         writer.clear();
@@ -452,6 +478,7 @@ mod tests {
         writer = SessionWriter {
             path: writer.path.clone(),
             protect_unloaded: false,
+            owes_transferred_session: false,
         };
         changed.workspaces[0].custom_name = Some("after restart".into());
         writer.save(&changed, None);
