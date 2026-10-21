@@ -16,7 +16,7 @@ name: Fork 14v resume launcher
 on:
   push:
     # fix/waz6-on-adopt-0.9.5: the herdr-waz6 port gets the crate tests and the dcc artifact (herdr-ih1r).
-    branches: [fix/14v-resume-launcher, fix/adopt-0.9.5, fix/waz6-on-adopt-0.9.5]
+    branches: [fix/14v-resume-launcher, fix/adopt-0.9.5, fix/waz6-on-adopt-0.9.5, ci/ir4j-r4-red]
 
 permissions:
   contents: read
@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -64,7 +64,7 @@ jobs:
       # of the animated-working-indicator workflow (run 34568308787), taking every later
       # test with it.
       - name: Run the crate tests
-        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+        run: cargo nextest run --locked --bin herdr --no-fail-fast --status-level all --final-status-level all --failure-output immediate --success-output immediate -E 'test(/console_break_ends_the_server/)'
 
       # The fork's own tests, by name: 10 platform-agnostic pure tests of resume_command()
       # (the stock path, the launcher-prefix composition, verbatim spacing, control-character

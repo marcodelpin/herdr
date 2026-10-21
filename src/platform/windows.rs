@@ -15,6 +15,8 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+#[cfg(test)]
+mod console_stop_tests;
 mod notifications;
 pub(crate) use notifications::{
     foreground_desktop_notification_host, maybe_activate_desktop_notification,
