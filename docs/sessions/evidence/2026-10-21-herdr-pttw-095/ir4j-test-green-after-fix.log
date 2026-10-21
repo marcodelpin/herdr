@@ -1,0 +1,53 @@
+warning: herdr@0.9.5: external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work.
+   Compiling herdr v0.9.5 (/srv/commesse/50-59_Shared_Resources/55_External_DevTools/herdr-AGENT/worktrees/herdr-pttw-095)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 50s
+────────────
+ Nextest run ID 937f5e9c-b73d-4ff3-b6bd-886c9c38c3ca with nextest profile: default
+    Starting 45 tests across 2 binaries (3838 tests skipped)
+        PASS [   0.013s] ( 1/45) herdr::bin/herdr api::drain::tests::admission_wait_needs_the_accept_loop_acknowledgement
+        PASS [   0.015s] ( 2/45) herdr::bin/herdr api::drain::tests::connection_scope_restores_the_previous_drain
+        PASS [   0.015s] ( 3/45) herdr::bin/herdr api::server::accept_loop_tests::keeps_serving_after_repeated_errors
+        PASS [   0.016s] ( 4/45) herdr::bin/herdr api::server::accept_loop_tests::exits_when_shutdown_happens_while_errors_continue
+        PASS [   0.017s] ( 5/45) herdr::bin/herdr api::drain::tests::idle_wait_reports_the_stage_of_every_abandoned_connection
+        PASS [   0.022s] ( 6/45) herdr::bin/herdr api::drain::tests::idle_wait_wakes_when_the_last_connection_finishes
+        PASS [   0.009s] ( 7/45) herdr::bin/herdr api::server::accept_loop_tests::shutdown_closes_admission_when_the_listener_fails
+        PASS [   0.024s] ( 8/45) herdr::bin/herdr api::server::accept_loop_tests::accept_error_during_the_shutdown_transition_still_closes_admission
+        PASS [   0.017s] ( 9/45) herdr::bin/herdr api::server::accept_loop_tests::shutdown_serves_the_queued_connections_then_stops_accepting
+        PASS [   0.011s] (10/45) herdr::bin/herdr api::server::shutdown_drain_tests::connected_client_that_sent_nothing_gets_an_explicit_error
+        PASS [   0.034s] (11/45) herdr::bin/herdr api::server::accept_loop_tests::keeps_serving_after_connection_thread_spawn_fails
+        PASS [   0.011s] (12/45) herdr::bin/herdr api::server::shutdown_drain_tests::connections_queued_before_shutdown_are_served_and_later_ones_refused
+        PASS [   0.022s] (13/45) herdr::bin/herdr api::server::shutdown_drain_tests::client_still_sending_its_request_gets_an_explicit_error
+        PASS [   0.011s] (14/45) herdr::bin/herdr api::server::shutdown_drain_tests::delivery_is_confirmed_only_while_the_server_drains
+        PASS [   0.012s] (15/45) herdr::bin/herdr api::server::shutdown_drain_tests::established_subscription_does_not_hold_shutdown
+        PASS [   0.037s] (16/45) herdr::bin/herdr api::server::shutdown_drain_tests::agent_prompt_without_wait_holds_shutdown_and_is_answered
+        PASS [   0.042s] (17/45) herdr::bin/herdr api::server::shutdown_drain_tests::agent_prompt_with_wait_holds_shutdown_and_is_answered
+        PASS [   0.012s] (18/45) herdr::bin/herdr api::server::shutdown_drain_tests::response_sent_before_shutdown_wins_over_the_shutdown_error
+        PASS [   0.040s] (19/45) herdr::bin/herdr api::server::shutdown_drain_tests::deferred_alt_screen_read_is_answered_at_shutdown
+        PASS [   0.039s] (20/45) herdr::bin/herdr api::server::shutdown_drain_tests::deferred_worktree_operation_is_answered_at_shutdown
+        PASS [   0.037s] (21/45) herdr::bin/herdr api::server::shutdown_drain_tests::queued_request_is_answered_at_shutdown
+        PASS [   0.010s] (22/45) herdr::bin/herdr api::server::shutdown_drain_tests::wait_that_ends_because_the_server_stops_is_told_so
+        PASS [   0.010s] (23/45) herdr::bin/herdr api::server::shutdown_drain_tests::wait_that_ends_because_the_client_left_writes_nothing
+        PASS [   0.012s] (24/45) herdr::bin/herdr ipc::tests::run_with_bound_returns_the_result_of_work_that_finishes
+        PASS [   0.015s] (25/45) herdr::bin/herdr app::tests::server_stop_request_sets_should_quit_flag
+        PASS [   0.037s] (26/45) herdr::bin/herdr api::server::shutdown_drain_tests::subscription_waiting_for_its_setup_holds_shutdown_and_is_answered
+        PASS [   0.009s] (27/45) herdr::bin/herdr server::handoff::tests::a_handoff_carries_an_announced_host_shutdown
+        PASS [   0.015s] (28/45) herdr::bin/herdr server::handoff::tests::a_manifest_written_before_the_host_shutdown_field_still_loads
+        PASS [   0.018s] (29/45) herdr::bin/herdr server::handoff::tests::an_older_server_imports_a_manifest_with_an_announced_host_shutdown
+        PASS [   0.021s] (30/45) herdr::bin/herdr server::headless::tests::event_fairness::external_api_batches_preserve_fifo_and_leave_work_for_the_next_turn
+        PASS [   0.114s] (31/45) herdr::bin/herdr api::server::shutdown_drain_tests::drain_for_shutdown_wakes_the_accept_loop_and_answers_what_it_accepted
+        PASS [   0.035s] (32/45) herdr::bin/herdr server::headless::tests::event_fairness::external_api_batch_stops_immediately_when_shutdown_is_requested
+        PASS [   0.017s] (33/45) herdr::bin/herdr server::headless::tests::event_fairness::external_server_events_yield_with_backlog_and_preserve_fifo
+        PASS [   0.016s] (34/45) herdr::bin/herdr server::headless::tests::event_fairness::scheduled_work_runs_between_external_api_batches
+        PASS [   0.015s] (35/45) herdr::bin/herdr server::headless::tests::host_shutdown_preserves_panes_from_queued_and_selected_death_events
+        PASS [   0.125s] (36/45) herdr::bin/herdr platform::unix_common::tests::server_signal_monitor_survives_hangup_and_reports_terminate
+        PASS [   0.214s] (37/45) herdr::bin/herdr api::server::shutdown_drain_tests::confirmation_that_cannot_start_holds_the_reply_until_the_bound
+        PASS [   0.213s] (38/45) herdr::bin/herdr ipc::tests::run_with_bound_stops_waiting_for_work_that_never_finishes
+        PASS [   0.394s] (39/45) herdr::bin/herdr api::server::shutdown_drain_tests::reply_being_written_holds_shutdown_until_the_client_has_it
+        PASS [   0.328s] (40/45) herdr::bin/herdr server::headless::tests::event_fairness::server_loop_drains_api_backlog_and_runs_scheduled_work
+        PASS [   0.624s] (41/45) herdr::server_headless server_stop_request_logs_its_caller
+        PASS [   0.843s] (42/45) herdr::server_headless sigterm_answers_connections_that_have_not_finished_their_request
+        PASS [   0.895s] (43/45) herdr::server_headless server_survives_hangup_and_logs_why_it_stops
+        PASS [   0.844s] (44/45) herdr::bin/herdr api::server::shutdown_drain_tests::reply_write_stops_at_its_deadline_even_while_the_client_keeps_reading
+        PASS [   2.545s] (45/45) herdr::server_headless sigterm_during_startup_answers_requests_already_accepted
+────────────
+     Summary [   2.547s] 45 tests run: 45 passed, 3838 skipped
