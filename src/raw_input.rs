@@ -398,8 +398,30 @@ impl HoldAfter {
             _ => return None,
         };
         let report = tail.strip_prefix(marker)?;
-        (report.len() < 3 && report.iter().all(|byte| *byte >= 0x20)).then_some(tail.len())
+        (report.len() < 3 && !report.iter().copied().any(disproves_x10_payload))
+            .then_some(tail.len())
     }
+}
+
+/// Whether `byte` cannot be X10 payload: every report byte is 32 plus a
+/// value. NUL can be, as xterm sends it for a coordinate past its limit
+/// (ADR-0013 amendment 1, D4).
+fn disproves_x10_payload(byte: u8) -> bool {
+    matches!(byte, 0x01..=0x1f)
+}
+
+/// How much of an `ESC [ M` frame at the front of `buffer` to drop when a
+/// byte X10 payload cannot carry ends it before its six bytes: the frame
+/// before that byte, and on the `pump` the byte too unless it is ESC, since
+/// the pump replays the key record it staged for it (ADR-0013 amendment 1,
+/// D4). An ESC starts the next token.
+fn disproved_x10_frame_len(buffer: &[u8], pump: bool) -> Option<usize> {
+    let payload = buffer.strip_prefix(b"\x1b[M")?;
+    let index = payload
+        .iter()
+        .take(3)
+        .position(|byte| disproves_x10_payload(*byte))?;
+    Some(3 + index + usize::from(pump && payload[index] != ESC))
 }
 
 impl HoldAfter {
@@ -508,14 +530,16 @@ fn classify_report_continuation(
         b'M' => {
             const X10_LEN: usize = 6;
             let payload = &report[3..report.len().min(X10_LEN)];
-            let disproved = payload.iter().position(|byte| *byte < 0x20);
+            let disproved = payload.iter().position(|byte| disproves_x10_payload(*byte));
             if released && pump {
                 // The frame is the report's or the key records the pump
-                // staged for it. A byte that disproves it drops the frame
-                // through that byte, so the pump replays the staged keys and
-                // the framer never also types them (ADR-0013 amendment 1, D4).
+                // staged for it. A byte that disproves it ends the frame: an
+                // ESC starts the next token, any other byte is dropped with
+                // the frame, so the pump replays the staged keys and the
+                // framer never also types them (ADR-0013 amendment 1, D4).
                 if let Some(index) = disproved {
-                    return Verdict::Drop(3 + index + 1 - prefix.len());
+                    let end = 3 + index + usize::from(payload[index] != ESC);
+                    return Verdict::Drop(end - prefix.len());
                 }
                 return if report.len() < X10_LEN {
                     Verdict::Hold
@@ -1870,6 +1894,16 @@ impl RawInputByteFramer {
                 continue;
             }
 
+            // A byte X10 payload cannot carry ends an `ESC [ M` frame: it is
+            // dropped as an incomplete report, and the byte starts the next
+            // token, or on the pump goes with the frame unless it is ESC
+            // (ADR-0013 amendment 1, D4).
+            if let Some(len) = disproved_x10_frame_len(&self.buffer, self.pump_policy()) {
+                tracing::debug!(len, "dropping X10 frame a control byte ended");
+                self.buffer.drain(..len);
+                continue;
+            }
+
             let Some((event, consumed)) = extract_one_event(&self.buffer) else {
                 break;
             };
@@ -2365,9 +2399,11 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
         }
     }
 
-    if buffer.len() >= 7
-        && buffer.starts_with(b"\x1b\x1b[M")
-        && parse_default_mouse(&buffer[1..7]).is_some()
+    // ESC before an X10 report, or before a frame a control byte ends, is
+    // its own key (ADR-0013 amendment 1, D4).
+    if buffer.starts_with(b"\x1b\x1b[M")
+        && ((buffer.len() >= 7 && parse_default_mouse(&buffer[1..7]).is_some())
+            || disproved_x10_frame_len(&buffer[1..], false).is_some())
     {
         return Some(1);
     }
@@ -2579,6 +2615,7 @@ fn plausible_sgr_mouse_prefix(report: &[u8]) -> bool {
     true
 }
 
+#[cfg(any(windows, test))]
 fn osc_string_terminator(buffer: &[u8]) -> Option<usize> {
     let st = find_subsequence(buffer, b"\x1b\\").map(|idx| idx + 2);
     let bel = buffer
