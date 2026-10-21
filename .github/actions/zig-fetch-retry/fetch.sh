@@ -5,11 +5,18 @@
 # crates/ghostty-vt/build.rs runs `zig build` inside vendor/libghostty-vt, and that build
 # downloads its lazy packages (codeberg.org, deps.files.ghostty.org) on first use. A runner
 # DNS failure there (build.zig.zon:14:20 NameServerFailure) used to kill the job before
-# any test ran, and the red run read like a code verdict. This script runs the same
-# `zig build` configuration with `--fetch`, so the packages land in the Zig global cache
-# that build.rs then reads, and retries that fetch a bounded number of times with a
-# growing backoff. It never builds, tests or judges anything: the verdict steps that
-# follow it run exactly once.
+# any test ran, and the red run read like a code verdict.
+#
+# `zig build --fetch` cannot do this job: it fetches only eager dependencies, and every
+# package here is lazy (measured with zig 0.14.1 on a lazy file:// dependency, and on
+# CI where the 0.16.0 `--fetch` finished in 1s on a cold runner). So this script runs
+# the same `zig build` that build.rs runs (same arguments, a throwaway --prefix): the
+# packages land in the Zig global cache and the compiled library in the vendored
+# .zig-cache, both of which the later build.rs run reuses. An attempt is retried ONLY
+# when its error is located in a build.zig.zon, which is where zig reports a failed
+# package download (DNS, connect, HTTP status); a compile error, a hash mismatch or any
+# other failure fails the step at once. No cargo build and no test runs here: the
+# verdict steps that follow run exactly once.
 #
 # Environment:
 #   ZIG_FETCH_ATTEMPTS         total attempts (default 4)
@@ -58,9 +65,13 @@ case "$(printf '%s' "${LIBGHOSTTY_VT_SIMD:-true}" | tr '[:upper:]' '[:lower:]')"
 esac
 version_string=$(tr -d '[:space:]' < "$vendored/VERSION")
 
-# The build.rs argument list minus --prefix (the fetch installs nothing), so the fetch
-# resolves the same lazy packages the build will ask for.
-args=(build --fetch
+# The build.rs argument list; only --prefix differs (a throwaway directory), so this
+# build asks for exactly the lazy packages the build.rs run will need.
+prefix=$(mktemp -d)
+log=$(mktemp)
+trap 'rm -rf "$log" "$prefix"' EXIT
+args=(build
+  --prefix "$prefix"
   -Demit-lib-vt
   "-Doptimize=${LIBGHOSTTY_VT_OPTIMIZE:-ReleaseFast}"
   "-Dsimd=$simd"
@@ -71,23 +82,25 @@ if [ -n "${LIBGHOSTTY_VT_ZIG_SYSTEM_DIR:-}" ]; then
   args+=(--system "$LIBGHOSTTY_VT_ZIG_SYSTEM_DIR")
 fi
 
-log=$(mktemp)
-trap 'rm -f "$log"' EXIT
-
-echo "zig-fetch-retry: prefetching libghostty-vt packages for $zig_target (up to $attempts attempts)"
+echo "zig-fetch-retry: fetching libghostty-vt packages for $zig_target via zig build (up to $attempts attempts)"
 attempt=1
 while :; do
   (cd "$vendored" && "$zig" "${args[@]}") >"$log" 2>&1
   rc=$?
   cat "$log"
   if [ "$rc" -eq 0 ]; then
-    echo "zig-fetch-retry: fetch succeeded on attempt $attempt/$attempts"
+    echo "zig-fetch-retry: packages fetched on attempt $attempt/$attempts"
     exit 0
   fi
-  cause=$(grep -m1 'error:' "$log" | tr -d '\r')
-  [ -n "$cause" ] || cause="zig exited $rc with no error line"
+  # zig reports a failed package download at the dependency's entry in a build.zig.zon.
+  cause=$(grep -E 'build\.zig\.zon:[0-9]+:[0-9]+: error:' "$log" | grep -v 'hash mismatch' | head -n 1 | tr -d '\r')
+  if [ -z "$cause" ]; then
+    other=$(grep -m1 'error:' "$log" | tr -d '\r')
+    echo "::error::zig-fetch-retry: zig build failed (rc=$rc) for a reason other than a package fetch; not retried. ${other:-no error line}"
+    exit 1
+  fi
   if [ "$attempt" -ge "$attempts" ]; then
-    echo "::error::zig-fetch-retry: fetch failed on all $attempts attempts; no test ran. Last cause: $cause"
+    echo "::error::zig-fetch-retry: package fetch failed on all $attempts attempts; no test ran. Last cause: $cause"
     exit 1
   fi
   wait_s=$((attempt * backoff))
