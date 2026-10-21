@@ -828,7 +828,14 @@ impl WindowsInputTranslator {
         events
     }
 
+    /// One idle tick of the pump: the console wait (10 ms) passed with no
+    /// record, so the framer's clock moves on by that much (ADR-0013 D2).
     fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
+        self.pump
+            .framer
+            .advance_test_clock(std::time::Duration::from_millis(
+                crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS as u64,
+            ));
         let mut events = Vec::new();
         for item in self.mapper.idle() {
             events.extend(self.pump.process(item));
@@ -4535,6 +4542,105 @@ mod tests {
                 crate::protocol::ClientKeyCode::Esc,
                 crate::protocol::ClientKeyCode::Enter
             ],
+            "{events:?}"
+        );
+    }
+
+    /// Moves the pump's clock `ms` on with no record and no idle tick: the
+    /// next record arrives that much later.
+    fn advance(translator: &mut WindowsInputTranslator, ms: u64) {
+        translator
+            .pump
+            .framer
+            .advance_test_clock(std::time::Duration::from_millis(ms));
+    }
+
+    /// codex f5251-r4 finding 1 (ADR-0013 D1): a native Enter inside the
+    /// one-second default-colour window comes between the two halves of the
+    /// reply. Enter goes out once; the reply completes its colour event or
+    /// is dropped, and none of it is typed (no `bbbb/cccc`, no Ctrl+G).
+    #[test]
+    fn review_r4_1_default_color_reply_interrupted_by_enter_is_not_typed() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        let mut events = Vec::new();
+        advance(&mut translator, 10);
+        for record in "\x1b]10;rgb:aaaa/".chars().map(key_char) {
+            events.extend(translator.translate(record));
+        }
+        advance(&mut translator, 10);
+        events.extend(translator.translate(key_vk_with_unicode(0x0d, '\r', 0)));
+        advance(&mut translator, 10);
+        for record in "bbbb/cccc\x07".chars().map(key_char) {
+            events.extend(translator.translate(record));
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+
+        assert_eq!(
+            key_codes(&events),
+            vec![crate::protocol::ClientKeyCode::Enter],
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                crate::protocol::ClientInputEvent::Key { .. }
+                    | crate::protocol::ClientInputEvent::HostDefaultColor { .. }
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// codex f5251-r4 finding 2 (ADR-0013 D4): a serialized scan-code-zero
+    /// ESC released at an idle tick, then serialized `[` and `M`, then the
+    /// X10 payload `C d 2` as nested Win32 key records within the burst. The
+    /// pane gets the Escape and at most the mouse report; never `[MCd2`.
+    #[test]
+    fn review_r4_2_split_x10_with_nested_key_record_payload_is_not_typed() {
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b") {
+            events.extend(translator.translate(record));
+        }
+        events.extend(translator.idle());
+        advance(&mut translator, 290);
+        for record in win32_input_mode_encoded_raw_bytes(b"[M") {
+            events.extend(translator.translate(record));
+        }
+        for (vk, scan, unicode, mods) in [(67, 46, 67, 16), (68, 32, 100, 0), (50, 3, 50, 0)] {
+            advance(&mut translator, 1);
+            let record = WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: vk,
+                virtual_scan_code: scan,
+                unicode,
+                control_key_state: mods,
+            };
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+
+        assert_eq!(
+            key_codes(&events),
+            vec![crate::protocol::ClientKeyCode::Esc],
+            "{events:?}"
+        );
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                crate::protocol::ClientInputEvent::Key { .. }
+                    | crate::protocol::ClientInputEvent::Mouse { .. }
+            )),
             "{events:?}"
         );
     }

@@ -99,7 +99,7 @@ fn review_r2_2_color_header_after_released_escape_keeps_paste_and_typing() {
 fn review_r2_3_held_osc_candidate_text_is_released_on_interruption() {
     let mut framer = RawInputFramer::default();
     assert!(framer.push(b"\x1b]4;50;").is_empty());
-    assert!(framer.flush_timeout().is_empty());
+    assert!(framer.idle_tick().is_empty());
     assert!(framer.push(b"a").is_empty());
 
     let events = framer.flush_interrupted();

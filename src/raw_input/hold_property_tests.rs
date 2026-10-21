@@ -1,13 +1,22 @@
-//! Property test for the raw-input hold (ADR-0012, herdr-nxa8; ADR-0010,
-//! herdr-f2a1; upstream #5251).
+//! Property test for the raw-input hold (ADR-0013 and ADR-0012, herdr-nxa8;
+//! ADR-0010, herdr-f2a1; upstream #5251).
 //!
 //! Generates input streams that mix typed text, Escape-led keys, Alt chords,
-//! bracketed pastes, SGR and X10 mouse reports and OSC 10/11/4 colour replies
-//! (some longer than any reply the framer accepts), cuts each token into up
-//! to six reads at random times, and on Windows interleaves semantic key
-//! records, also between the reads of one token. It drives the byte framer
-//! the way the Unix stdin reader (with the direct-graphics filter's response
-//! wait) or the Windows pump does, under a virtual clock.
+//! bracketed pastes, SGR and X10 mouse reports, OSC 10/11/4 colour replies
+//! (some longer than any reply the framer accepts) and, while the Unix
+//! reader awaits a direct-graphics response, kitty graphics APC commands
+//! (complete responses, and streams that arrive in many small reads). It
+//! cuts each token into up to six reads at random times, and on the Windows
+//! pump interleaves semantic key records, also between the reads of one
+//! token. It drives the byte framer the way the Unix stdin reader does
+//! (through the production `ReaderSchedule`, behind a model of the
+//! direct-graphics filter) or the way the Windows pump does (pump policy,
+//! idle ticks, immediate flushes after key records), under a virtual clock.
+//!
+//! The generator stream is the same on every OS (ADR-0013 D5): each seed
+//! runs a `Mixed` stream (Unix reader and pump cases) and a `PumpOnly`
+//! stream. Windows skips only the cases that need the Unix-only escape
+//! disambiguation.
 //!
 //! The oracle is independent of the framer:
 //! - what reached the pane is decoded the way production decodes it (the
@@ -15,17 +24,21 @@
 //!   per chunk), so a suffix production does not consume is a loss;
 //! - expectations are per event, so a key that arrives as literal text does
 //!   not match the key;
-//! - the age of every pending byte is measured from the harness's own record
-//!   of when it reached the framer, against the ADR's named bounds.
+//! - the harness records when every input byte was delivered, reached the
+//!   framer and left it; rules that depend on time are resolved from that
+//!   record after the run (ADR-0013 D6), and the age of every pending byte
+//!   is measured from it against the ADRs' named bounds.
 //!
-//! Invariants (ADR-0012):
+//! Invariants (ADR-0013):
 //! - I1 every byte that is not part of a report reaches the pane exactly
 //!   once, in order, in the event production decodes it into;
 //! - I2 a report the context says to drop does not reach the pane, and a key
 //!   reaches it as that key or (split after a released prefix) not at all;
 //! - I3 no pending byte except an unterminated paste is older than the
 //!   pending-input bound, and the stream drains;
-//! - I4 a semantic key never overtakes an earlier byte.
+//! - I4' a semantic key never overtakes a byte that can reach the pane: after
+//!   `flush_interrupted` only colour-reply bytes or an unterminated paste are
+//!   pending.
 
 use super::*;
 use std::time::Instant;
@@ -37,8 +50,8 @@ const CASES_PER_SEED: usize = 3_000;
 /// observed stream. Never valid in UTF-8, so no generated input contains it.
 const SEMANTIC: u8 = 0xff;
 
-// The ADR-0012 bounds table, restated so the oracle does not read the
-// framer's own deadlines (`oracle_bounds_match_the_adr` ties them together).
+// The ADR bounds table, restated so the oracle does not read the framer's
+// own deadlines (`oracle_bounds_match_the_adr` ties them together).
 /// `REPORT_TAIL_LIMIT`: a split report or key tail is recognised within this.
 const REPORT_SPAN: u64 = 500;
 /// `COLOR_REPLY_TAIL_LIMIT`: the same for a colour reply while a query is
@@ -54,6 +67,8 @@ const AGE_LIMIT: u64 = 1_500;
 const REPORT_BYTES: usize = 128;
 /// Windows pump idle tick.
 const WINDOWS_TICK_MS: u64 = 10;
+/// The Windows default-colour reply window the harness opens at 0 ms.
+const DEFAULT_COLOR_WINDOW: u64 = 1_000;
 
 /// splitmix64.
 struct Rng(u64);
@@ -98,6 +113,33 @@ enum Rule {
     Either,
     /// The pane receives exactly one of these event sequences.
     OneOf(Vec<Vec<Vec<u8>>>),
+    /// Decided after the run from when the bytes arrived (ADR-0013 D6).
+    Deferred {
+        when: Cond,
+        then: Box<Rule>,
+        otherwise: Box<Rule>,
+    },
+}
+
+/// A fact about the run's timing, over input byte offsets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cond {
+    /// Bytes `first..=last` reached the framer as one burst, starting while
+    /// the context of the released prefix ending at `prefix` was still open.
+    ReleasedTailBurst {
+        prefix: usize,
+        first: usize,
+        last: usize,
+        limit: u64,
+    },
+    /// Bytes `first..=last` were all delivered inside the graphics wait.
+    InsideGraphicsWait { first: usize, last: usize },
+    /// Bytes `first..=last` all reached the framer inside the default-colour
+    /// reply window.
+    InsideDefaultColorWindow { first: usize, last: usize },
+    /// Byte `first` reached the framer after the default-colour window had
+    /// closed and its expiry was processed.
+    AfterDefaultColorWindow { first: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -119,31 +161,39 @@ enum Kind {
     Color,
     /// A colour reply longer than the report budget.
     LongColor,
+    /// A kitty graphics APC command while a response is awaited.
+    Graphics,
     Semantic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Driver {
-    #[cfg(unix)]
     UnixReader,
     WindowsPump,
+}
+
+/// Which generator stream a case comes from (ADR-0013 D5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stream {
+    /// Unix reader and pump cases (the former Unix stream).
+    Mixed,
+    /// Pump cases only (the former Windows stream; CI cases 404 and 779).
+    PumpOnly,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Config {
     driver: Driver,
     /// Selects the Unix reader's idle waits; the Windows pump ignores it.
-    #[cfg(unix)]
     mouse_capture: bool,
     color_query: bool,
     /// The Windows default-colour query (1 s reply window) is outstanding
     /// at the start.
     default_color_query: bool,
-    #[cfg(unix)]
+    /// Unix escape disambiguation (#3480); needs a Unix framer.
     disambiguation: bool,
     /// The Unix reader awaits a direct-graphics response in this window
-    /// (ms): the graphics filter keeps a trailing `ESC` / `ESC _`.
-    #[cfg(unix)]
+    /// (ms): the graphics filter holds what may be a response.
     graphics_wait: Option<(u64, u64)>,
 }
 
@@ -168,6 +218,12 @@ struct Case {
     /// For each input byte, the index one past the end of the bracketed
     /// paste it belongs to: the one pending input without an age bound.
     paste_end: Vec<Option<usize>>,
+    /// For each input byte, the kind of token it belongs to.
+    kinds: Vec<Kind>,
+    /// The input bytes, in order (semantic records excluded).
+    input: Vec<u8>,
+    /// The input offset of each token's first byte, ascending.
+    token_starts: Vec<usize>,
 }
 
 const TEMPLATES: [&[u8]; 4] = [b"<35;x", b"<1;2;3x", b"]10;x", b"]4;1;x"];
@@ -230,7 +286,20 @@ fn color_reply(rng: &mut Rng, long: bool) -> Vec<u8> {
     reply
 }
 
-fn token(rng: &mut Rng, driver: Driver) -> (Kind, Vec<u8>) {
+/// A kitty graphics APC command: a complete response, or (`stream`) a long
+/// command whose payload arrives in many small reads.
+fn graphics_command(rng: &mut Rng, stream: bool) -> Vec<u8> {
+    let mut command = b"\x1b_G".to_vec();
+    if stream {
+        command.extend(std::iter::repeat_n(b'0', rng.range(200, 2_000) as usize));
+    } else {
+        command.extend_from_slice(format!("i={};OK", rng.range(1, 99)).as_bytes());
+    }
+    command.extend_from_slice(b"\x1b\\");
+    command
+}
+
+fn token(rng: &mut Rng, config: &Config) -> (Kind, Vec<u8>) {
     let roll = rng.below(100);
     match roll {
         0..=23 => (Kind::Text, typed_text(rng)),
@@ -270,7 +339,11 @@ fn token(rng: &mut Rng, driver: Driver) -> (Kind, Vec<u8>) {
         }
         80..=89 => (Kind::Color, color_reply(rng, false)),
         90..=91 => (Kind::LongColor, color_reply(rng, true)),
-        _ if driver == Driver::WindowsPump => (Kind::Semantic, Vec::new()),
+        _ if config.driver == Driver::WindowsPump => (Kind::Semantic, Vec::new()),
+        92..=95 if config.graphics_wait.is_some() => {
+            let stream = rng.chance(1, 2);
+            (Kind::Graphics, graphics_command(rng, stream))
+        }
         _ => (Kind::Text, typed_text(rng)),
     }
 }
@@ -297,20 +370,37 @@ struct Cut {
     gap: u64,
 }
 
-/// What a token that was cut but not interrupted may become (ADR-0012 D3).
-fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Vec<Unit> {
+fn per_byte(bytes: &[u8], rule: Rule) -> Vec<Unit> {
+    bytes
+        .iter()
+        .map(|byte| Unit {
+            bytes: vec![*byte],
+            rule: rule.clone(),
+        })
+        .collect()
+}
+
+fn deferred(when: Cond, then: Rule, otherwise: Rule) -> Rule {
+    Rule::Deferred {
+        when,
+        then: Box::new(then),
+        otherwise: Box::new(otherwise),
+    }
+}
+
+/// What a token that was cut but not interrupted may become (ADR-0012 D3,
+/// ADR-0013 D4, D6). `start` is the input offset of its first byte.
+fn cut_token_rule(
+    kind: Kind,
+    bytes: &[u8],
+    cuts: &[Cut],
+    config: &Config,
+    start: usize,
+) -> Vec<Unit> {
     let span: u64 = cuts.iter().map(|cut| cut.gap).sum();
     let first = cuts.first().copied();
     let later: u64 = cuts.iter().skip(1).map(|cut| cut.gap).sum();
-    let every = |rule: Rule| -> Vec<Unit> {
-        bytes
-            .iter()
-            .map(|byte| Unit {
-                bytes: vec![*byte],
-                rule: rule.clone(),
-            })
-            .collect()
-    };
+    let every = |rule: Rule| per_byte(bytes, rule);
     let one = |rule: Rule| {
         vec![Unit {
             bytes: bytes.to_vec(),
@@ -344,7 +434,6 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
                 // SS3 tails after a released prefix are not recovered.
                 return spread();
             }
-            #[cfg(unix)]
             if config.disambiguation && first.at == 2 && !matches!(bytes[2], b'M' | 0x20..=0x3f) {
                 // With escape disambiguation, `ESC [` held past keyboard
                 // timing and followed by a final byte is a key binding
@@ -393,7 +482,14 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
             };
             // X10 prefixes dropped at their timeout are not recovered.
             let inside = cuts.iter().any(|cut| cut.at >= 3);
-            if !inside && first.gap < REPORT_SPAN && later <= BURST {
+            // On the pump an X10 tail after a released prefix is the report
+            // at any spread within its bound (ADR-0013 D4).
+            let tail_bound = if config.driver == Driver::WindowsPump {
+                REPORT_SPAN - 1
+            } else {
+                BURST
+            };
+            if !inside && first.gap < REPORT_SPAN && later <= tail_bound {
                 let mut alternatives = vec![Vec::new()];
                 alternatives.extend(released_prefixes());
                 return one(Rule::OneOf(alternatives));
@@ -401,40 +497,121 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
             spread()
         }
         Kind::Color => {
+            let generic = || -> Vec<Unit> {
+                if first.is_none() || (config.color_query && span < COLOR_SPAN) {
+                    // A reply split right after its ESC or `ESC ]` can be no
+                    // other way: that prefix may go out at its idle timeout
+                    // and only the tail is dropped (ADR-0010 Consequences).
+                    let released = cuts
+                        .iter()
+                        .map(|cut| cut.at)
+                        .filter(|at| *at <= 2)
+                        .max()
+                        .unwrap_or(0);
+                    return bytes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, byte)| Unit {
+                            bytes: vec![*byte],
+                            rule: if index < released {
+                                Rule::Either
+                            } else {
+                                Rule::Drop
+                            },
+                        })
+                        .collect();
+                }
+                every(Rule::Either)
+            };
             if first.is_some() && config.default_color_query {
-                // A reply split across the end of the Windows default-colour
-                // window and its 100 ms recovery types its tail (ADR-0012
-                // Residuals; unchanged by this ADR).
-                return every(Rule::Either);
-            }
-            if first.is_none() || (config.color_query && span < COLOR_SPAN) {
-                // A reply split right after its ESC or `ESC ]` can be no
-                // other way: that prefix may go out at its idle timeout and
-                // only the tail is dropped (ADR-0010 Consequences).
-                let released = cuts
-                    .iter()
-                    .map(|cut| cut.at)
-                    .filter(|at| *at <= 2)
-                    .max()
-                    .unwrap_or(0);
-                return bytes
-                    .iter()
-                    .enumerate()
-                    .map(|(index, byte)| Unit {
-                        bytes: vec![*byte],
-                        rule: if index < released {
-                            Rule::Either
-                        } else {
-                            Rule::Drop
-                        },
+                // Inside the Windows default-colour window the reply
+                // completes, an interruption included (ADR-0013 D1). Begun
+                // after the window, it takes the generic rule. Straddling
+                // the window end and its recovery grace is the declared
+                // residual (ADR-0012 Residuals).
+                let (first_byte, last_byte) = (start, start + bytes.len() - 1);
+                return generic()
+                    .into_iter()
+                    .map(|unit| Unit {
+                        bytes: unit.bytes,
+                        rule: deferred(
+                            Cond::InsideDefaultColorWindow {
+                                first: first_byte,
+                                last: last_byte,
+                            },
+                            Rule::Drop,
+                            deferred(
+                                Cond::AfterDefaultColorWindow { first: first_byte },
+                                unit.rule,
+                                Rule::Either,
+                            ),
+                        ),
                     })
                     .collect();
             }
-            every(Rule::Either)
+            generic()
         }
         Kind::LongColor => every(Rule::Either),
+        Kind::Graphics => every(deferred(
+            Cond::InsideGraphicsWait {
+                first: start,
+                last: start + bytes.len() - 1,
+            },
+            Rule::Drop,
+            Rule::Either,
+        )),
         Kind::Semantic => unreachable!(),
     }
+}
+
+/// What a Key, SGR or X10 token cut by a semantic record at `at` may become
+/// (ADR-0013 D6). The record ends every report and key context: the part
+/// after it arrives with no context and is typed. Before it, an idle release
+/// at some cut `b` may have sent out the prefix (ESC, `ESC [`, `ESC O`) or
+/// dropped it (three bytes or more); what was held after `b` is emitted as
+/// input when the record comes (#4048), except an unfinished X10 tail on the
+/// pump, which is dropped (ADR-0013 D4): at the record, or at its deadline
+/// at a later cut `j`, the bytes after `j` then arriving with no context.
+fn interrupted_report_rule(
+    kind: Kind,
+    bytes: &[u8],
+    cuts: &[Cut],
+    at: usize,
+    config: &Config,
+) -> Vec<Unit> {
+    let mut boundaries: Vec<usize> = cuts
+        .iter()
+        .map(|cut| cut.at)
+        .filter(|cut| *cut < at)
+        .chain(std::iter::once(at))
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut alternatives = Vec::new();
+    for &b in &boundaries {
+        let prefix: Vec<Vec<u8>> = if b <= 2 {
+            vec![bytes[..b].to_vec()]
+        } else {
+            Vec::new()
+        };
+        let mut typed = prefix.clone();
+        typed.extend(bytes[b..at].iter().map(|byte| vec![*byte]));
+        alternatives.push(typed);
+        if kind == Kind::X10 && config.driver == Driver::WindowsPump && b <= 2 {
+            for &j in boundaries.iter().filter(|j| **j > b && **j < bytes.len()) {
+                let mut dropped = prefix.clone();
+                dropped.extend(bytes[j..at].iter().map(|byte| vec![*byte]));
+                alternatives.push(dropped);
+            }
+        }
+    }
+    alternatives.dedup();
+    let mut units = vec![Unit {
+        bytes: bytes[..at].to_vec(),
+        rule: Rule::OneOf(alternatives),
+    }];
+    units.extend(per_byte(&bytes[at..], Rule::Keep));
+    units
 }
 
 /// The offset of the last cut after which every context of the token has
@@ -442,11 +619,9 @@ fn cut_token_rule(kind: Kind, bytes: &[u8], cuts: &[Cut], config: &Config) -> Ve
 /// Windows tick) and the longest tail limit has passed since. The graphics
 /// filter can delay the prefix itself past that, so it has no late cut.
 fn late_cut(cuts: &[Cut], config: &Config) -> Option<usize> {
-    #[cfg(unix)]
     if config.graphics_wait.is_some() {
         return None;
     }
-    let _ = config;
     let late = AGE_LIMIT + WINDOWS_TICK_MS + COLOR_SPAN + 90;
     cuts.iter()
         .filter(|cut| cut.gap >= late)
@@ -485,74 +660,145 @@ fn utf8_len(lead: u8) -> usize {
 }
 
 /// After a released Escape or Alt+[ the framer drops the tail of a split
-/// key that arrives in one read (ADR-0012 Residuals): typed bytes that,
-/// after that prefix, form a CSI key may be dropped.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReleasedPrefixScan {
-    None,
-    AfterEscape,
-    InCsi,
-}
-
-impl ReleasedPrefixScan {
-    fn apply(&mut self, unit: &mut Unit) {
-        let byte = unit.bytes[0];
-        let either = match *self {
-            Self::None => false,
-            Self::AfterEscape if byte == b'[' => {
-                *self = Self::InCsi;
-                true
+/// key that arrives as one burst inside the released prefix's context
+/// (ADR-0012 D3). Typed bytes that, after that prefix, form a CSI key may be
+/// dropped only then: whether they did is decided from their arrival times
+/// after the run (ADR-0013 D6, codex f5251-r4 finding 4).
+fn mark_released_prefix_tails(case: &mut Case) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scan {
+        None,
+        AfterPrefix,
+        InCsi,
+    }
+    let limit = if case.config.color_query {
+        COLOR_SPAN
+    } else {
+        REPORT_SPAN
+    };
+    let mut scan = Scan::None;
+    let mut prefix = 0;
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    let mut offset = 0;
+    for index in 0..case.expected.len() {
+        let unit = &case.expected[index];
+        if unit.bytes == [SEMANTIC] && unit.rule == Rule::KeepEvent {
+            scan = Scan::None;
+            candidates.clear();
+            continue;
+        }
+        let len = unit.bytes.len();
+        let kind = case.kinds[offset];
+        let token_ends_here =
+            offset + len == case.kinds.len() || case.token_start(offset + len) == offset + len;
+        if kind == Kind::Graphics {
+            // The graphics filter may take it out before the framer sees it.
+            offset += len;
+            continue;
+        }
+        if kind != Kind::Text {
+            candidates.clear();
+            scan = Scan::None;
+            if kind == Kind::Ambiguous && token_ends_here {
+                let token = case.token_start(offset)..offset + len;
+                let bytes: Vec<u8> = case.expected_bytes(token.clone());
+                match bytes.as_slice() {
+                    [ESC] => {
+                        scan = Scan::AfterPrefix;
+                        prefix = offset + len - 1;
+                    }
+                    [ESC, b'['] => {
+                        scan = Scan::InCsi;
+                        prefix = offset + len - 1;
+                    }
+                    _ => {}
+                }
             }
-            Self::InCsi if (0x20..=0x3f).contains(&byte) => true,
-            Self::InCsi if (0x40..=0x7e).contains(&byte) => {
-                *self = Self::None;
-                true
+            offset += len;
+            continue;
+        }
+        let byte = unit.bytes[0];
+        match scan {
+            Scan::AfterPrefix if byte == b'[' => {
+                scan = Scan::InCsi;
+                candidates.push((index, offset));
+            }
+            Scan::InCsi if (0x20..=0x3f).contains(&byte) => candidates.push((index, offset)),
+            Scan::InCsi if (0x40..=0x7e).contains(&byte) => {
+                candidates.push((index, offset));
+                let first = candidates[0].1;
+                for (unit_index, _) in candidates.drain(..) {
+                    let unit = &mut case.expected[unit_index];
+                    if unit.rule == Rule::Keep {
+                        unit.rule = deferred(
+                            Cond::ReleasedTailBurst {
+                                prefix,
+                                first,
+                                last: offset,
+                                limit,
+                            },
+                            Rule::Either,
+                            Rule::Keep,
+                        );
+                    }
+                }
+                scan = Scan::None;
             }
             _ => {
-                *self = Self::None;
-                false
+                scan = Scan::None;
+                candidates.clear();
             }
-        };
-        if either && unit.rule == Rule::Keep {
-            unit.rule = Rule::Either;
         }
+        offset += len;
     }
 }
 
-fn generate(rng: &mut Rng) -> Case {
-    #[cfg(unix)]
-    let driver = if rng.chance(1, 2) {
-        Driver::UnixReader
-    } else {
-        Driver::WindowsPump
+impl Case {
+    /// The input offset where the token holding byte `offset` starts.
+    fn token_start(&self, offset: usize) -> usize {
+        self.token_starts
+            .partition_point(|start| *start <= offset)
+            .checked_sub(1)
+            .map_or(0, |index| self.token_starts[index])
+    }
+
+    /// The input bytes in `range`.
+    fn expected_bytes(&self, range: std::ops::Range<usize>) -> Vec<u8> {
+        self.input[range].to_vec()
+    }
+}
+
+fn generate(rng: &mut Rng, stream: Stream) -> Case {
+    // The draws match the former per-OS streams, so `PumpOnly` reproduces
+    // the native Windows cases (ADR-0013 D5).
+    let driver = match stream {
+        Stream::Mixed if rng.chance(1, 2) => Driver::UnixReader,
+        Stream::Mixed | Stream::PumpOnly => Driver::WindowsPump,
     };
-    #[cfg(not(unix))]
-    let driver = Driver::WindowsPump;
     let default_color_query = driver == Driver::WindowsPump && rng.chance(1, 4);
-    #[cfg(unix)]
     let graphics_wait = (driver == Driver::UnixReader && rng.chance(1, 4)).then(|| {
         let start = rng.range(0, 3_000);
         (start, start + rng.range(100, 4_000))
     });
+    let mouse_capture = stream == Stream::Mixed && rng.chance(1, 2);
     let config = Config {
         driver,
-        #[cfg(unix)]
-        mouse_capture: rng.chance(1, 2),
+        mouse_capture,
         color_query: default_color_query || rng.chance(1, 2),
         default_color_query,
-        #[cfg(unix)]
         disambiguation: driver == Driver::UnixReader && rng.chance(1, 4),
-        #[cfg(unix)]
         graphics_wait,
     };
 
     let mut reads: Vec<Read> = Vec::new();
     let mut expected: Vec<Unit> = Vec::new();
     let mut paste_end = Vec::new();
+    let mut kinds = Vec::new();
+    let mut input = Vec::new();
+    let mut token_starts = Vec::new();
     let mut previous_ambiguous = false;
-    let mut scan = ReleasedPrefixScan::None;
     for _ in 0..rng.range(3, 14) {
-        let (kind, bytes) = token(rng, driver);
+        let (kind, bytes) = token(rng, &config);
         if kind == Kind::Semantic {
             reads.push(Read {
                 gap: gap(rng),
@@ -566,27 +812,52 @@ fn generate(rng: &mut Rng) -> Case {
                 rule: Rule::KeepEvent,
             });
             previous_ambiguous = false;
-            scan = ReleasedPrefixScan::None;
             continue;
         }
 
-        // Cut into up to six pieces at distinct offsets.
-        let mut offsets: Vec<usize> = (0..rng.below(6))
-            .filter(|_| bytes.len() > 1)
-            .map(|_| rng.range(1, bytes.len() as u64 - 1) as usize)
+        let (pieces, gaps) = if kind == Kind::Graphics && bytes.len() > 64 {
+            // A stream: many small reads, each sooner than any idle wait.
+            let mut pieces = Vec::new();
+            let mut gaps = Vec::new();
+            let mut start = 0;
+            while start < bytes.len() {
+                let end = (start + rng.range(1, 24) as usize).min(bytes.len());
+                pieces.push(bytes[start..end].to_vec());
+                gaps.push(if start == 0 {
+                    gap(rng)
+                } else {
+                    rng.range(1, 9)
+                });
+                start = end;
+            }
+            (pieces, gaps)
+        } else {
+            // Cut into up to six pieces at distinct offsets.
+            let mut offsets: Vec<usize> = (0..rng.below(6))
+                .filter(|_| bytes.len() > 1)
+                .map(|_| rng.range(1, bytes.len() as u64 - 1) as usize)
+                .collect();
+            offsets.sort_unstable();
+            offsets.dedup();
+            let mut gaps = Vec::new();
+            let mut pieces = Vec::new();
+            let mut start = 0;
+            for cut in offsets.iter().copied().chain(std::iter::once(bytes.len())) {
+                pieces.push(bytes[start..cut].to_vec());
+                gaps.push(gap(rng));
+                start = cut;
+            }
+            (pieces, gaps)
+        };
+        let piece_ends: Vec<usize> = pieces
+            .iter()
+            .scan(0, |end, piece| {
+                *end += piece.len();
+                Some(*end)
+            })
             .collect();
-        offsets.sort_unstable();
-        offsets.dedup();
-        let mut gaps = Vec::new();
-        let mut pieces = Vec::new();
-        let mut start = 0;
-        for cut in offsets.iter().copied().chain(std::iter::once(bytes.len())) {
-            pieces.push(bytes[start..cut].to_vec());
-            gaps.push(gap(rng));
-            start = cut;
-        }
         // A cut delivered in the same read as the bytes before it is no cut.
-        let cuts: Vec<Cut> = offsets
+        let cuts: Vec<Cut> = piece_ends[..piece_ends.len() - 1]
             .iter()
             .copied()
             .zip(gaps[1..].iter().copied())
@@ -604,41 +875,34 @@ fn generate(rng: &mut Rng) -> Case {
         // After Escape, Alt+[ or Alt+O, the user types a byte that is not
         // ESC-led only once the key reached the pane: before that it would be
         // another key (`ESC a` is Alt+a), which is not what the oracle models.
+        // A graphics command the filter takes out is invisible to the framer.
         let wait_for_flush = previous_ambiguous && bytes.first() != Some(&ESC);
-        previous_ambiguous = kind == Kind::Ambiguous;
+        previous_ambiguous =
+            kind == Kind::Ambiguous || (kind == Kind::Graphics && previous_ambiguous);
 
-        let mut units = match interrupt_at {
-            None => cut_token_rule(kind, &bytes, &cuts, &config),
-            Some(at) => {
-                // An interruption ends every hold: what was held is input
-                // (typed bytes) or a fragment that cannot be input (ADR-0012
-                // D1). A report cut by a record is outside the promise.
-                let mut units: Vec<Unit> = bytes
-                    .iter()
-                    .map(|byte| Unit {
-                        bytes: vec![*byte],
-                        rule: match kind {
-                            Kind::Text | Kind::AltChord | Kind::Ambiguous => Rule::Keep,
-                            _ => Rule::Either,
-                        },
-                    })
-                    .collect();
-                mark_late_utf8(&mut units, &bytes, &cuts, Some(at));
-                units
-            }
-        };
-        if kind == Kind::Text {
-            for unit in &mut units {
-                scan.apply(unit);
-            }
-        } else {
-            scan = match bytes.as_slice() {
-                [ESC] if kind == Kind::Ambiguous => ReleasedPrefixScan::AfterEscape,
-                [ESC, b'['] if kind == Kind::Ambiguous => ReleasedPrefixScan::InCsi,
-                _ => ReleasedPrefixScan::None,
-            };
-        }
         let token_start = paste_end.len();
+        let mut units = match interrupt_at {
+            None => cut_token_rule(kind, &bytes, &cuts, &config, token_start),
+            Some(at) => match kind {
+                Kind::Text | Kind::AltChord | Kind::Ambiguous => {
+                    let mut units = per_byte(&bytes, Rule::Keep);
+                    mark_late_utf8(&mut units, &bytes, &cuts, Some(at));
+                    units
+                }
+                Kind::Key | Kind::Sgr | Kind::X10 => {
+                    interrupted_report_rule(kind, &bytes, &cuts, at, &config)
+                }
+                // A reply prefix longer than ESC stays pending through the
+                // record (ADR-0013 D1) and takes its uninterrupted rule. A
+                // lone ESC goes out before the record here: the pump's
+                // host-reply exception for it is not modelled.
+                Kind::Color if at >= 2 => cut_token_rule(kind, &bytes, &cuts, &config, token_start),
+                _ => per_byte(&bytes, Rule::Either),
+            },
+        };
+        token_starts.push(token_start);
+        input.extend_from_slice(&bytes);
+        kinds.extend(std::iter::repeat_n(kind, bytes.len()));
         paste_end.extend(
             std::iter::repeat_n(token_start + bytes.len(), bytes.len())
                 .map(|end| (kind == Kind::Paste).then_some(end)),
@@ -707,12 +971,17 @@ fn generate(rng: &mut Rng) -> Case {
         }
         expected.append(&mut units);
     }
-    Case {
+    let mut case = Case {
         config,
         reads,
         expected,
         paste_end,
-    }
+        kinds,
+        input,
+        token_starts,
+    };
+    mark_released_prefix_tails(&mut case);
+    case
 }
 
 /// The bytes of a typed event (key, text, paste); None for anything else.
@@ -731,7 +1000,6 @@ fn typed_event_bytes(event: &RawInputEvent) -> Option<Vec<u8>> {
 /// server decodes every event of a chunk, the Windows pump one per chunk.
 fn decode(driver: Driver, chunks: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     match driver {
-        #[cfg(unix)]
         Driver::UnixReader => chunks
             .iter()
             .flat_map(|chunk| parse_framed_input(chunk))
@@ -746,34 +1014,68 @@ fn decode(driver: Driver, chunks: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 /// The direct-graphics filter of the Unix reader
 /// (`client::direct_graphics::InputFilter`) while a response is awaited: a
-/// trailing prefix of `ESC _ G` is kept, and released once none is awaited.
-#[cfg(unix)]
+/// complete kitty APC command is taken out of the input (a response it
+/// matches is consumed; one it does not is a complete control string the
+/// framer drops), an incomplete one is kept (up to 4096 bytes), and so is a
+/// trailing prefix of `ESC _ G`. Once none is awaited, what it kept is
+/// released. Each byte carries its input offset.
 struct GraphicsFilter {
     window: Option<(u64, u64)>,
-    pending: Vec<u8>,
+    pending: Vec<(u8, usize)>,
 }
 
-#[cfg(unix)]
+const GRAPHICS_PREFIX: &[u8] = b"\x1b_G";
+const GRAPHICS_LIMIT: usize = 4_096;
+
 impl GraphicsFilter {
     fn interested(&self, now: u64) -> bool {
         self.window
             .is_some_and(|(start, end)| (start..end).contains(&now))
     }
 
-    fn push(&mut self, bytes: &[u8], now: u64) -> Vec<u8> {
-        self.pending.extend_from_slice(bytes);
-        if !self.interested(now) {
-            return std::mem::take(&mut self.pending);
-        }
-        let keep = (1..3)
-            .rev()
-            .find(|len| self.pending.ends_with(&b"\x1b_G"[..*len]))
-            .unwrap_or(0);
-        let emit = self.pending.len() - keep;
-        self.pending.drain(..emit).collect()
+    fn bytes(&self) -> Vec<u8> {
+        self.pending.iter().map(|(byte, _)| *byte).collect()
     }
 
-    fn flush_if_inactive(&mut self, now: u64) -> Option<Vec<u8>> {
+    /// The runs of bytes it lets through, possibly none.
+    fn push(&mut self, bytes: &[(u8, usize)], now: u64) -> Vec<Vec<(u8, usize)>> {
+        self.pending.extend_from_slice(bytes);
+        if !self.interested(now) {
+            return vec![std::mem::take(&mut self.pending)];
+        }
+        let mut output = Vec::new();
+        loop {
+            let pending = self.bytes();
+            let Some(start) = pending
+                .windows(GRAPHICS_PREFIX.len())
+                .position(|window| window == GRAPHICS_PREFIX)
+            else {
+                let keep = (1..GRAPHICS_PREFIX.len())
+                    .rev()
+                    .find(|len| pending.ends_with(&GRAPHICS_PREFIX[..*len]))
+                    .unwrap_or(0);
+                let emit = pending.len() - keep;
+                if emit > 0 {
+                    output.push(self.pending.drain(..emit).collect());
+                }
+                break;
+            };
+            if start > 0 {
+                output.push(self.pending.drain(..start).collect());
+                continue;
+            }
+            let Some(end) = pending.windows(2).position(|window| window == b"\x1b\\") else {
+                if pending.len() > GRAPHICS_LIMIT {
+                    output.push(std::mem::take(&mut self.pending));
+                }
+                break;
+            };
+            self.pending.drain(..end + 2);
+        }
+        output
+    }
+
+    fn flush_if_inactive(&mut self, now: u64) -> Option<Vec<(u8, usize)>> {
         (!self.pending.is_empty() && !self.interested(now))
             .then(|| std::mem::take(&mut self.pending))
     }
@@ -787,14 +1089,26 @@ struct Harness<'a> {
     now: u64,
     last_delivery: u64,
     framer: RawInputByteFramer,
+    schedule: ReaderSchedule,
     /// Typed events, in the order they reached the pane.
     out: Vec<Vec<u8>>,
-    /// When each run of bytes reached the framer: (end offset, ms).
-    pushed: Vec<(usize, u64)>,
-    pushed_len: usize,
-    #[cfg(unix)]
+    /// The input offset of each read's first byte.
+    read_starts: Vec<usize>,
+    /// For each byte the framer received, in order: its input offset and
+    /// when it arrived.
+    framed: Vec<(usize, u64)>,
+    /// How many of the framed bytes have left the framer.
+    left: usize,
+    /// Per input byte: delivered by the reader, reached the framer, left it.
+    delivered_at: Vec<Option<u64>>,
+    framed_at: Vec<Option<u64>>,
+    left_at: Vec<Option<u64>>,
     filter: GraphicsFilter,
     rng: Rng,
+    /// When the Windows default-colour reply window closed: at its end, or
+    /// earlier when a semantic key came while a lone ESC was pending (the
+    /// pump's host-reply Escape rule).
+    default_window_end: u64,
 }
 
 impl<'a> Harness<'a> {
@@ -802,6 +1116,9 @@ impl<'a> Harness<'a> {
         let base = Instant::now();
         let mut framer = RawInputByteFramer::with_host_input_policy(false);
         framer.set_test_clock(base);
+        if case.config.driver == Driver::WindowsPump {
+            framer.set_pump_policy();
+        }
         #[cfg(unix)]
         if case.config.disambiguation {
             framer.set_host_escape_disambiguation_active(true);
@@ -811,6 +1128,16 @@ impl<'a> Harness<'a> {
         } else if case.config.color_query {
             framer.host_color_query_sent();
         }
+        let read_starts = case
+            .reads
+            .iter()
+            .scan(0, |offset, read| {
+                let start = *offset;
+                *offset += read.bytes.len();
+                Some(start)
+            })
+            .collect();
+        let len = case.input.len();
         Self {
             case,
             next: 0,
@@ -818,35 +1145,44 @@ impl<'a> Harness<'a> {
             now: 0,
             last_delivery: 0,
             framer,
+            schedule: ReaderSchedule::default(),
             out: Vec::new(),
-            pushed: Vec::new(),
-            pushed_len: 0,
-            #[cfg(unix)]
+            read_starts,
+            framed: Vec::new(),
+            left: 0,
+            delivered_at: vec![None; len],
+            framed_at: vec![None; len],
+            left_at: vec![None; len],
             filter: GraphicsFilter {
                 window: case.config.graphics_wait,
                 pending: Vec::new(),
             },
             rng: Rng(seed),
+            default_window_end: DEFAULT_COLOR_WINDOW,
         }
+    }
+
+    /// The input offsets of the bytes the framer still holds.
+    fn pending_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        let pending = self.framer.buffer.len().min(self.framed.len());
+        self.framed[self.framed.len() - pending..]
+            .iter()
+            .map(|(offset, _)| *offset)
     }
 
     /// I3, measured from the harness's own record: the age of the oldest
     /// byte the framer still holds, unless it is part of a bracketed paste
     /// whose end has not arrived. `slack` allows the reader's round-up.
     fn check_age(&self, what: &str, slack: u64) -> Result<(), String> {
-        let pending = self.framer.buffer.len().min(self.pushed_len);
+        let pending = self.framer.buffer.len().min(self.framed.len());
         if pending == 0 {
             return Ok(());
         }
-        let oldest = self.pushed_len - pending;
-        if self.case.paste_end[oldest].is_some_and(|end| end > self.pushed_len) {
+        let (oldest, arrived) = self.framed[self.framed.len() - pending];
+        let received = self.framed.last().map_or(0, |(offset, _)| offset + 1);
+        if self.case.paste_end[oldest].is_some_and(|end| end > received) {
             return Ok(());
         }
-        let arrived = self
-            .pushed
-            .iter()
-            .find(|(end, _)| *end > oldest)
-            .map_or(self.now, |(_, at)| *at);
         let age = self.now - arrived;
         if age + 1 > AGE_LIMIT + slack {
             return Err(format!(
@@ -865,44 +1201,42 @@ impl<'a> Harness<'a> {
         // The Unix reader rounds its waits up by 1 ms; the Windows pump
         // looks only on its idle tick.
         let slack = match self.case.config.driver {
-            #[cfg(unix)]
             Driver::UnixReader => 2,
             Driver::WindowsPump => WINDOWS_TICK_MS,
         };
         self.check_age("waking", slack)
     }
 
-    fn emit(&mut self, chunks: Vec<Vec<u8>>) {
+    /// Records bytes about to reach the framer.
+    fn frame(&mut self, bytes: &[(u8, usize)]) {
+        for (_, offset) in bytes {
+            self.framed.push((*offset, self.now));
+            self.framed_at[*offset] = Some(self.now);
+        }
+    }
+
+    /// After a framer call: records what left it, checks I3 and emits.
+    fn settle(&mut self, what: &str, chunks: Vec<Vec<u8>>) -> Result<(), String> {
+        let pending = self.framer.buffer.len().min(self.framed.len());
+        let gone = self.framed.len() - pending;
+        for index in self.left..gone {
+            let offset = self.framed[index].0;
+            self.left_at[offset] = Some(self.now);
+        }
+        self.left = self.left.max(gone);
+        self.check_age(what, 0)?;
         let events = decode(self.case.config.driver, chunks);
         self.out.extend(events);
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), String> {
         let chunks = self.framer.flush_timeout();
-        self.check_age("after flush_timeout", 0)?;
-        self.emit(chunks);
-        Ok(())
+        self.settle("after flush_timeout", chunks)
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if !bytes.is_empty() {
-            self.pushed_len += bytes.len();
-            self.pushed.push((self.pushed_len, self.now));
-        }
-        let chunks = self.framer.push(bytes);
-        self.check_age("after push", 0)?;
-        self.emit(chunks);
-        Ok(())
-    }
-
-    #[cfg(unix)]
     fn filter_pending(&self) -> bool {
         !self.filter.pending.is_empty()
-    }
-
-    #[cfg(not(unix))]
-    fn filter_pending(&self) -> bool {
-        false
     }
 
     /// When the next read arrives, or None if there is none or the user is
@@ -919,43 +1253,57 @@ impl<'a> Harness<'a> {
         self.arrival().is_some_and(|at| at <= due)
     }
 
-    /// Delivers the next read. Returns its bytes after the graphics filter,
-    /// or None for a semantic record.
-    fn deliver(&mut self) -> Result<Option<Vec<u8>>, String> {
+    /// Delivers the next read: the semantic record is handled here, a read
+    /// of bytes is returned with each byte's input offset.
+    fn deliver(&mut self) -> Result<Option<Vec<(u8, usize)>>, String> {
         let case = self.case;
         let read = &case.reads[self.next];
         let at = self.arrival().ok_or("delivering a blocked read")?;
         self.advance_to(at)?;
+        let start = self.read_starts[self.next];
         self.next += 1;
         self.last_delivery = self.now;
         if read.semantic {
+            let lone_escape = self.framer.buffer.last() == Some(&ESC);
+            let window_open = self.framer.host_default_color_query_deadline.is_some();
             let chunks = self.framer.flush_interrupted();
-            // I4: nothing is left to follow the record.
-            let pending = self.framer.buffer.len();
-            if pending > 0 && !self.framer.has_pending_bracketed_paste() {
+            if window_open && self.framer.host_default_color_query_deadline.is_none() {
+                if !lone_escape && self.now < DEFAULT_COLOR_WINDOW {
+                    return Err(format!(
+                        "the default-colour window closed early at {} ms with no ESC pending",
+                        self.now
+                    ));
+                }
+                self.default_window_end = self.default_window_end.min(self.now);
+            }
+            // I4': only bytes that cannot reach the pane as input are left
+            // to follow the record, judged from the harness's own record.
+            let stranded: Vec<usize> = self
+                .pending_offsets()
+                .filter(|offset| !matches!(case.kinds[*offset], Kind::Color | Kind::LongColor))
+                .collect();
+            if !stranded.is_empty() && !self.framer.has_pending_bracketed_paste() {
                 return Err(format!(
-                    "I4: {pending} bytes pending behind a semantic key at {} ms",
+                    "I4': input bytes {stranded:?} pending behind a semantic key at {} ms",
                     self.now
                 ));
             }
-            self.check_age("after flush_interrupted", 0)?;
-            self.emit(chunks);
+            self.settle("after flush_interrupted", chunks)?;
             self.out.push(vec![SEMANTIC]);
             return Ok(None);
         }
         for _ in 0..read.color_queries {
             self.framer.host_color_query_sent();
         }
-        #[cfg(unix)]
-        let bytes = if self.case.config.driver == Driver::UnixReader {
-            let now = self.now;
-            self.filter.push(&read.bytes, now)
-        } else {
-            read.bytes.clone()
-        };
-        #[cfg(not(unix))]
-        let bytes = read.bytes.clone();
-        self.push(&bytes)?;
+        let bytes: Vec<(u8, usize)> = read
+            .bytes
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| (*byte, start + index))
+            .collect();
+        for (_, offset) in &bytes {
+            self.delivered_at[*offset] = Some(self.now);
+        }
         Ok(Some(bytes))
     }
 
@@ -976,39 +1324,31 @@ impl<'a> Harness<'a> {
         }
     }
 
-    /// The Unix stdin reader loop of `client/input.rs`, with `read()` and
-    /// `stdin_read_ready` answered from the schedule: one wait per turn
-    /// (`reader_idle_wait`) over the idle flush, the framer's release time
-    /// and the graphics filter's poll.
-    #[cfg(unix)]
+    /// The Unix stdin reader loop of `client/input.rs`: the same
+    /// `ReaderSchedule` calls, with `read()` and `stdin_read_ready` answered
+    /// from the schedule and the graphics filter modelled.
     fn run_unix_reader(&mut self) -> Result<(), String> {
-        let mut idle_flush_at: Option<u64> = None;
-        for _ in 0..100_000 {
-            let idle = idle_flush_at
-                .filter(|_| self.framer.has_pending_input())
-                .map(|at| at.saturating_sub(self.now) as i32);
-            let framer_wait = match (idle, self.framer.held_input_release_ms()) {
-                (Some(idle), Some(release)) => Some(idle.min(release)),
-                (idle, release) => idle.or(release),
-            };
-            if let Some((wait, framer_due)) = reader_idle_wait(framer_wait, self.filter_pending()) {
+        let mouse_capture = self.case.config.mouse_capture;
+        for _ in 0..1_000_000 {
+            if let Some((wait, framer_due)) =
+                self.schedule.wait(&self.framer, self.filter_pending())
+            {
                 let due = self.now + wait.max(0) as u64;
                 if !self.arrives_by(due) {
                     self.advance_to(due)?;
                     let now = self.now;
-                    if let Some(data) = self.filter.flush_if_inactive(now) {
-                        self.push(&data)?;
-                        idle_flush_at = Some(
-                            self.now
-                                + self
-                                    .framer
-                                    .idle_flush_timeout_ms(self.case.config.mouse_capture)
-                                    as u64,
-                        );
-                    } else if framer_due {
-                        idle_flush_at = None;
-                        self.flush()?;
+                    let released = self.filter.flush_if_inactive(now);
+                    if let Some(released) = &released {
+                        self.frame(released);
                     }
+                    let released = released.map(|run| run.iter().map(|(byte, _)| *byte).collect());
+                    let chunks = self.schedule.on_idle(
+                        &mut self.framer,
+                        released,
+                        framer_due,
+                        mouse_capture,
+                    );
+                    self.settle("after an idle wake", chunks)?;
                     continue;
                 }
             }
@@ -1018,23 +1358,29 @@ impl<'a> Harness<'a> {
             if self.arrival().is_none() {
                 return Err(self.stranded());
             }
-            self.deliver()?;
-            idle_flush_at = Some(
-                self.now
-                    + self
-                        .framer
-                        .idle_flush_timeout_ms(self.case.config.mouse_capture)
-                        as u64,
-            );
+            let Some(bytes) = self.deliver()? else {
+                return Err("a semantic record on the Unix reader".to_string());
+            };
+            let now = self.now;
+            let runs = self.filter.push(&bytes, now);
+            let mut filtered = Vec::new();
+            for run in runs {
+                self.frame(&run);
+                filtered.push(run.iter().map(|(byte, _)| *byte).collect());
+            }
+            let chunks = self
+                .schedule
+                .on_read(&mut self.framer, filtered, mouse_capture);
+            self.settle("after a read", chunks)?;
         }
         Err("reader loop did not terminate".to_string())
     }
 
     /// The Windows pump: `push` per read (sometimes followed by an immediate
-    /// `flush_timeout`, as a non-key record does), `flush_timeout` on every
-    /// idle tick, `flush_interrupted` before a semantic key. Idle ticks that
-    /// cannot change anything are skipped: after three quiet ticks the next
-    /// one runs when the framer's state can next change with time.
+    /// `flush_timeout`, as a key record with no event does), `flush_timeout`
+    /// on every idle tick, `flush_interrupted` before a semantic key. Idle
+    /// ticks that cannot change anything are skipped: after three quiet ticks
+    /// the next one runs when the framer's state can next change with time.
     fn run_windows_pump(&mut self) -> Result<(), String> {
         for _ in 0..100_000 {
             let mut quiet = 0;
@@ -1076,11 +1422,74 @@ impl<'a> Harness<'a> {
             if self.arrival().is_none() {
                 return Err(self.stranded());
             }
-            if self.deliver()?.is_some() && self.rng.chance(1, 4) {
-                self.flush()?;
+            if let Some(bytes) = self.deliver()? {
+                self.frame(&bytes);
+                let raw: Vec<u8> = bytes.iter().map(|(byte, _)| *byte).collect();
+                let chunks = self.framer.push(&raw);
+                self.settle("after push", chunks)?;
+                if self.rng.chance(1, 4) {
+                    self.flush()?;
+                }
             }
         }
         Err("pump loop did not terminate".to_string())
+    }
+
+    /// Whether `when` held in this run.
+    fn holds(&self, when: &Cond) -> bool {
+        let framed = |offset: usize| self.framed_at[offset];
+        match *when {
+            Cond::ReleasedTailBurst {
+                prefix,
+                first,
+                last,
+                limit,
+            } => match (self.left_at[prefix], framed(first), framed(last)) {
+                (Some(released), Some(first), Some(last)) => {
+                    last - first <= BURST && first < released + limit
+                }
+                _ => false,
+            },
+            Cond::InsideGraphicsWait { first, last } => {
+                let Some((start, end)) = self.case.config.graphics_wait else {
+                    return false;
+                };
+                match (self.delivered_at[first], self.delivered_at[last]) {
+                    (Some(first), Some(last)) => start <= first && last < end,
+                    _ => false,
+                }
+            }
+            Cond::InsideDefaultColorWindow { first, last } => {
+                framed(first).is_some()
+                    && framed(last).is_some_and(|at| at < self.default_window_end)
+            }
+            Cond::AfterDefaultColorWindow { first } => {
+                framed(first).is_some_and(|at| at >= self.default_window_end + 2 * WINDOWS_TICK_MS)
+            }
+        }
+    }
+
+    /// The expectations with every deferred rule decided from this run.
+    fn resolve(&self) -> Vec<Unit> {
+        self.case
+            .expected
+            .iter()
+            .map(|unit| {
+                let mut rule = unit.rule.clone();
+                while let Rule::Deferred {
+                    when,
+                    then,
+                    otherwise,
+                } = rule
+                {
+                    rule = if self.holds(&when) { *then } else { *otherwise };
+                }
+                Unit {
+                    bytes: unit.bytes.clone(),
+                    rule,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1152,6 +1561,9 @@ fn check_output(expected: &[Unit], out: &[Vec<u8>]) -> Result<(), String> {
                         }
                     }
                 }
+                Rule::Deferred { .. } => {
+                    return Err(format!("expected unit {index} was never resolved"));
+                }
             }
         }
         reach = next;
@@ -1170,7 +1582,18 @@ fn check_output(expected: &[Unit], out: &[Vec<u8>]) -> Result<(), String> {
     }
 }
 
-fn describe(case: &Case) -> String {
+fn describe_rule(rule: &Rule, bytes: &str) -> String {
+    match rule {
+        Rule::Keep => bytes.to_string(),
+        Rule::KeepEvent => format!("[{bytes}]"),
+        Rule::Drop => format!("-({bytes})"),
+        Rule::Either => format!("?{bytes}"),
+        Rule::OneOf(_) => format!("{{{bytes}}}"),
+        Rule::Deferred { .. } => format!("<{bytes}>"),
+    }
+}
+
+fn describe(case: &Case, expected: &[Unit]) -> String {
     let reads: Vec<String> = case
         .reads
         .iter()
@@ -1188,19 +1611,9 @@ fn describe(case: &Case) -> String {
             }
         })
         .collect();
-    let expected: String = case
-        .expected
+    let expected: String = expected
         .iter()
-        .map(|unit| {
-            let bytes = unit.bytes.escape_ascii().to_string();
-            match &unit.rule {
-                Rule::Keep => bytes,
-                Rule::KeepEvent => format!("[{bytes}]"),
-                Rule::Drop => format!("-({bytes})"),
-                Rule::Either => format!("?{bytes}"),
-                Rule::OneOf(_) => format!("{{{bytes}}}"),
-            }
-        })
+        .map(|unit| describe_rule(&unit.rule, &unit.bytes.escape_ascii().to_string()))
         .collect();
     format!(
         "{:?}\n  reads: {reads:?}\n  expected: {expected}",
@@ -1210,41 +1623,60 @@ fn describe(case: &Case) -> String {
 
 fn run_case(case: &Case, seed: u64) -> Result<(), String> {
     let mut harness = Harness::new(case, seed);
-    match case.config.driver {
-        #[cfg(unix)]
+    let run = match case.config.driver {
         Driver::UnixReader => harness.run_unix_reader(),
         Driver::WindowsPump => harness.run_windows_pump(),
-    }
-    .and_then(|()| check_output(&case.expected, &harness.out))
-    .map_err(|err| {
-        let out: Vec<String> = harness
-            .out
-            .iter()
-            .map(|event| event.escape_ascii().to_string())
-            .collect();
-        format!("{err}\n  out: {out:?}")
-    })
+    };
+    let expected = harness.resolve();
+    run.and_then(|()| check_output(&expected, &harness.out))
+        .map_err(|err| {
+            let out: Vec<String> = harness
+                .out
+                .iter()
+                .map(|event| event.escape_ascii().to_string())
+                .collect();
+            format!("{err}\n  out: {out:?}\n  {}", describe(case, &expected))
+        })
+}
+
+/// Whether this OS can run `case`: escape disambiguation needs a Unix framer.
+fn runs_here(case: &Case) -> bool {
+    cfg!(unix) || !case.config.disambiguation
 }
 
 #[test]
 fn held_input_property_every_byte_once_in_order_and_bounded() {
+    let only = std::env::var("HERDR_HOLD_PROPERTY_ONLY").ok();
     let mut failures = Vec::new();
     let mut cases = 0;
+    let mut pump_cases = 0;
     for seed in SEEDS {
-        let mut rng = Rng(seed);
-        for index in 0..CASES_PER_SEED {
-            let case = generate(&mut rng);
-            cases += 1;
-            if let Err(err) = run_case(&case, seed ^ index as u64) {
-                failures.push(format!(
-                    "seed {seed:#x} case {index}: {err}\n  {}",
-                    describe(&case)
-                ));
+        for stream in [Stream::Mixed, Stream::PumpOnly] {
+            let mut rng = Rng(seed);
+            for index in 0..CASES_PER_SEED {
+                let case = generate(&mut rng, stream);
+                if !runs_here(&case) {
+                    continue;
+                }
+                let name = format!("{seed:#x}:{stream:?}:{index}");
+                if only.as_ref().is_some_and(|only| *only != name) {
+                    continue;
+                }
+                cases += 1;
+                pump_cases += usize::from(case.config.driver == Driver::WindowsPump);
+                if let Err(err) = run_case(&case, seed ^ index as u64) {
+                    failures.push(format!("case {name}: {err}"));
+                }
             }
         }
     }
-    assert_eq!(cases, SEEDS.len() * CASES_PER_SEED);
-    assert!(cases >= 10_000);
+    if let Ok(path) = std::env::var("HERDR_HOLD_PROPERTY_DUMP") {
+        let _ = std::fs::write(path, failures.join("\n"));
+    }
+    if only.is_none() {
+        assert!(cases >= 20_000, "{cases} cases");
+        assert!(pump_cases >= 12_000, "{pump_cases} pump cases");
+    }
     assert!(
         failures.is_empty(),
         "{} of {cases} cases failed; first ones:\n{}",
@@ -1465,4 +1897,160 @@ fn property_found_orphan_utf8_continuation_drops_only_itself() {
     at(&mut framer, base, 1_710);
     chunks.extend(framer.flush_timeout());
     assert_eq!(typed(chunks), b"/".to_vec());
+}
+
+/// The native Windows CI red on e0e6d7e6: seed 0x0012_0002 case 404 and seed
+/// 0x0012_0004 case 779 of the Windows stream, which `Stream::PumpOnly`
+/// reproduces on every OS (ADR-0013 D5).
+#[test]
+fn held_input_property_native_windows_cases_404_and_779() {
+    for (seed, index) in [(0x0012_0002_u64, 404_usize), (0x0012_0004, 779)] {
+        let mut rng = Rng(seed);
+        let mut case = generate(&mut rng, Stream::PumpOnly);
+        for _ in 0..index {
+            case = generate(&mut rng, Stream::PumpOnly);
+        }
+        assert_eq!(case.config.driver, Driver::WindowsPump);
+        if let Err(err) = run_case(&case, seed ^ index as u64) {
+            panic!("seed {seed:#x} case {index}: {err}");
+        }
+    }
+}
+
+/// A case of typed reads after a released Escape, through the Unix reader.
+fn escape_then_typed(reads: &[(u64, &[u8])]) -> Case {
+    let mut input = vec![ESC];
+    let mut case_reads = vec![Read {
+        gap: 0,
+        bytes: vec![ESC],
+        color_queries: 0,
+        wait_for_flush: false,
+        semantic: false,
+    }];
+    for (index, (gap, bytes)) in reads.iter().enumerate() {
+        input.extend_from_slice(bytes);
+        case_reads.push(Read {
+            gap: *gap,
+            bytes: bytes.to_vec(),
+            color_queries: 0,
+            wait_for_flush: index == 0,
+            semantic: false,
+        });
+    }
+    let mut kinds = vec![Kind::Ambiguous];
+    kinds.extend(std::iter::repeat_n(Kind::Text, input.len() - 1));
+    let mut case = Case {
+        config: Config {
+            driver: Driver::UnixReader,
+            mouse_capture: false,
+            color_query: false,
+            default_color_query: false,
+            disambiguation: false,
+            graphics_wait: None,
+        },
+        reads: case_reads,
+        expected: per_byte(&input, Rule::Keep),
+        paste_end: vec![None; input.len()],
+        kinds,
+        token_starts: vec![0, 1],
+        input,
+    };
+    mark_released_prefix_tails(&mut case);
+    case
+}
+
+/// codex f5251-r4 finding 4 (ADR-0013 D6): typing ambiguity is judged on
+/// arrival times. Escape released at 10 ms, `[` typed at 200 ms and `D` at
+/// 280 ms: 80 ms apart, not one burst, so both must reach the pane, and an
+/// implementation that drops them fails. As one read, they may be dropped.
+#[test]
+fn oracle_released_prefix_tail_is_judged_on_arrival_times() {
+    let case = escape_then_typed(&[(200, b"["), (80, b"D")]);
+    assert!(case.expected[1..]
+        .iter()
+        .all(|unit| matches!(unit.rule, Rule::Deferred { .. })));
+    let mut harness = Harness::new(&case, 0);
+    harness.run_unix_reader().unwrap();
+    let expected = harness.resolve();
+    assert_eq!(expected[1].rule, Rule::Keep);
+    assert_eq!(expected[2].rule, Rule::Keep);
+    assert!(check_output(&expected, &harness.out).is_ok());
+    assert!(check_output(&expected, &events(&[b"\x1b"])).is_err());
+
+    let burst = escape_then_typed(&[(200, b"[D")]);
+    let mut harness = Harness::new(&burst, 0);
+    harness.run_unix_reader().unwrap();
+    let expected = harness.resolve();
+    assert_eq!(expected[1].rule, Rule::Either);
+    assert!(check_output(&expected, &events(&[b"\x1b"])).is_ok());
+}
+
+/// codex f5251-r4 finding 4: a report cut by a semantic record is not
+/// blanket `Either`. An SGR report whose prefix stayed held through the
+/// record may be typed (#4048) but not lost, and the bytes after the record
+/// are typed.
+#[test]
+fn oracle_interrupted_report_is_not_blanket_either() {
+    let bytes = b"\x1b[<0;1;1M";
+    let cuts = [Cut { at: 4, gap: 20 }];
+    let config = Config {
+        driver: Driver::WindowsPump,
+        mouse_capture: false,
+        color_query: false,
+        default_color_query: false,
+        disambiguation: false,
+        graphics_wait: None,
+    };
+    let units = interrupted_report_rule(Kind::Sgr, bytes, &cuts, 4, &config);
+    assert!(units.iter().all(|unit| unit.rule != Rule::Either));
+    let mut expected = units[..1].to_vec();
+    expected.push(unit(&[SEMANTIC], Rule::KeepEvent));
+    expected.extend_from_slice(&units[1..]);
+    // Dropped before the record, then the rest typed: allowed.
+    let after: Vec<&[u8]> = bytes[4..].iter().map(std::slice::from_ref).collect();
+    let mut out = vec![vec![SEMANTIC]];
+    out.extend(after.iter().map(|byte| byte.to_vec()));
+    assert!(check_output(&expected, &out).is_ok());
+    // The bytes after the record lost: rejected.
+    assert!(check_output(&expected, &events(&[&[SEMANTIC]])).is_err());
+}
+
+/// codex f5251-r4 findings 3 and 4: the generators reach the paths the
+/// harness used to miss, a complete kitty APC introducer, a graphics stream
+/// of many small reads (reads that bring the framer nothing), and both
+/// generator streams.
+#[test]
+fn property_generators_cover_graphics_streams_and_both_streams() {
+    let mut graphics = 0;
+    let mut streams = 0;
+    let mut pump_only = 0;
+    for seed in SEEDS {
+        for stream in [Stream::Mixed, Stream::PumpOnly] {
+            let mut rng = Rng(seed);
+            for _ in 0..CASES_PER_SEED {
+                let case = generate(&mut rng, stream);
+                let starts = case
+                    .input
+                    .windows(GRAPHICS_PREFIX.len())
+                    .filter(|window| *window == GRAPHICS_PREFIX)
+                    .count();
+                graphics += starts;
+                streams += usize::from(
+                    starts > 0
+                        && case
+                            .reads
+                            .iter()
+                            .filter(|read| read.bytes.len() < 25)
+                            .count()
+                            > 20,
+                );
+                pump_only += usize::from(
+                    stream == Stream::PumpOnly && case.config.driver == Driver::WindowsPump,
+                );
+            }
+        }
+    }
+    assert!(graphics > 100, "{graphics} graphics commands");
+    assert!(streams > 50, "{streams} graphics streams");
+    assert_eq!(pump_only, SEEDS.len() * CASES_PER_SEED);
 }
