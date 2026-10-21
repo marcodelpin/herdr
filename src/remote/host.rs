@@ -145,13 +145,11 @@ fn ensure_remote_server_running_with(host: &dyn RemoteHost) -> io::Result<()> {
 
     let effective = host.effective_endpoint();
     let target = endpoint_target(&effective, &host.unit_endpoint());
-    // The unit is only asked about when the bridge targets its sockets: another session never
-    // depends on systemd at all.
-    let unit = match target {
-        EndpointTarget::Other => UnitState::Absent,
-        EndpointTarget::Unit | EndpointTarget::Mixed => host.unit_state(),
-    };
-    let plan = server_start_plan(unit, target)?;
+    // Where herdr.service is installed the bridge never starts a server itself, whatever endpoint
+    // it targets (bd herdr-waz6), so systemd is asked first; the endpoint then only chooses
+    // between starting the unit and a refusal. A misread endpoint can cost a refusal, never an
+    // unmanaged server beside the unit.
+    let plan = server_start_plan(host.unit_state(), target)?;
     start_remote_server(
         plan,
         || host.start_unit(),
@@ -165,7 +163,7 @@ fn ensure_remote_server_running_with(host: &dyn RemoteHost) -> io::Result<()> {
 enum EndpointTarget {
     /// Both sockets are the unit's: the bridge wants the unit's server.
     Unit,
-    /// Neither socket is the unit's: a separate server the unit never competes with.
+    /// Neither socket is the unit's: another session, or a socket override.
     Other,
     /// One socket is the unit's and the other is not (e.g. `HERDR_SESSION=work` plus a client
     /// socket override pointing at the default session).
@@ -202,7 +200,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 enum ServerStartPlan {
     /// The host has the `herdr.service` systemd --user unit: start THAT unit.
     SystemdUnit,
-    /// No unit, or the bridge targets another session/socket: spawn a detached `herdr server`.
+    /// No unit is installed on this host: spawn a detached `herdr server`.
     DirectSpawn,
 }
 
@@ -211,20 +209,26 @@ const UNIT_START_WAIT: Duration = Duration::from_secs(30);
 const DIRECT_START_WAIT: Duration = Duration::from_secs(5);
 const UNIT_REMEDY: &str = "check `systemctl --user status herdr.service` and `journalctl --user -u herdr.service`; if the unit hit its start limit, run `systemctl --user reset-failed herdr.service` (or wait out StartLimitIntervalSec) and retry";
 
-/// The unit runs the DEFAULT session on the default sockets, so it stands in for the bridge's
-/// server exactly when the bridge targets those sockets, whatever spelling selected them
-/// (`--session default`, `HERDR_SOCKET_PATH` naming the default socket, or nothing). A server
-/// spawned over ssh lives in the ssh session's cgroup, outside the unit; the unit's socket-holder
-/// wait then refuses to start and retried every ~16 s (dcc 2026-10-02..05, 11,346 restarts).
+/// A server spawned over ssh lives in the ssh session's cgroup, outside the unit; the unit's
+/// socket-holder wait then refuses to start and retried every ~16 s (dcc 2026-10-02..05, 11,346
+/// restarts). So on a host with the unit the bridge never spawns: it starts the unit when it
+/// targets the unit's DEFAULT-session sockets, whatever spelling selected them (`--session
+/// default`, `HERDR_SOCKET_PATH` naming the default socket, or nothing), and refuses any other
+/// endpoint. Deciding "is this the unit's endpoint?" by comparing paths cannot be made exhaustive
+/// (codex hwaz6-r2 found four spellings), so a wrong answer must only ever cost a refusal. The
+/// direct spawn stays for hosts with no unit.
 fn server_start_plan(unit: UnitState, target: EndpointTarget) -> io::Result<ServerStartPlan> {
-    match (target, unit) {
-        (EndpointTarget::Other, _) | (_, UnitState::Absent) => Ok(ServerStartPlan::DirectSpawn),
-        (EndpointTarget::Unit, UnitState::Installed) => Ok(ServerStartPlan::SystemdUnit),
-        (_, UnitState::Masked) => Err(io::Error::other(format!(
-            "no herdr server is running and {HERDR_UNIT} is masked; not starting an unmanaged server beside the unit. Unmask it (`systemctl --user unmask {HERDR_UNIT}`) or attach to a non-default session"
+    match (unit, target) {
+        (UnitState::Absent, _) => Ok(ServerStartPlan::DirectSpawn),
+        (UnitState::Installed, EndpointTarget::Unit) => Ok(ServerStartPlan::SystemdUnit),
+        (UnitState::Masked, _) => Err(io::Error::other(format!(
+            "no herdr server is running and {HERDR_UNIT} is masked; not starting an unmanaged server beside the unit. Unmask it (`systemctl --user unmask {HERDR_UNIT}`) and retry"
         ))),
-        (EndpointTarget::Mixed, UnitState::Installed) => Err(io::Error::other(format!(
-            "no herdr server is running and the requested sockets mix {HERDR_UNIT}'s default socket with another session's; not starting an unmanaged server on the unit's socket. Point HERDR_SOCKET_PATH/HERDR_CLIENT_SOCKET_PATH and the session at one endpoint"
+        (UnitState::Installed, EndpointTarget::Mixed) => Err(io::Error::other(format!(
+            "no herdr server is running and the requested sockets mix {HERDR_UNIT}'s default socket with another session's; not starting an unmanaged server beside the unit. Attach to the default session with no HERDR_SOCKET_PATH or HERDR_CLIENT_SOCKET_PATH override"
+        ))),
+        (UnitState::Installed, EndpointTarget::Other) => Err(io::Error::other(format!(
+            "no herdr server is running for the requested session or socket, and {HERDR_UNIT} is installed on this host; not starting an unmanaged server beside the unit. Attach to the default session with no socket override, or start that server on the host yourself"
         ))),
     }
 }
@@ -334,6 +338,14 @@ fn unit_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
         dirs.push(data_home.join("systemd/user"));
     }
     dirs.extend(data_dirs.iter().map(|dir| dir.join("systemd/user")));
+    // systemd searches the vendor data dirs whatever XDG_DATA_DIRS says (`systemd-analyze --user
+    // unit-paths` with XDG_DATA_DIRS=/opt/x still lists both; codex hwaz6-r2).
+    for vendor in ["/usr/local/share/systemd/user", "/usr/share/systemd/user"] {
+        let vendor = PathBuf::from(vendor);
+        if !dirs.contains(&vendor) {
+            dirs.push(vendor);
+        }
+    }
     dirs.push("/usr/local/lib/systemd/user".into());
     dirs.push("/usr/lib/systemd/user".into());
     dirs.push("/lib/systemd/user".into());
@@ -524,18 +536,47 @@ mod tests {
     }
 
     #[test]
-    fn entry_spawns_directly_for_another_session_without_asking_systemd() {
+    fn entry_refuses_another_session_when_the_unit_is_installed() {
         let host = FakeHost::new(work_endpoint(), UnitState::Installed);
-        ensure_remote_server_running_with(&host).unwrap();
+        let err = ensure_remote_server_running_with(&host).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("not starting an unmanaged server"),
+            "{message}"
+        );
+        assert!(message.contains("default session"), "{message}");
         assert_eq!(
             (
                 host.unit_queries.get(),
                 host.unit_starts.get(),
                 host.spawns.get()
             ),
-            (0, 0, 1)
+            (1, 0, 0)
         );
-        assert_eq!(host.waits.borrow()[0].0, work_endpoint().client_socket);
+        assert!(host.waits.borrow().is_empty());
+    }
+
+    #[test]
+    fn entry_refuses_another_session_when_the_unit_is_masked() {
+        let host = FakeHost::new(work_endpoint(), UnitState::Masked);
+        let err = ensure_remote_server_running_with(&host).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("systemctl --user unmask herdr.service"),
+            "{err}"
+        );
+        assert_eq!((host.unit_starts.get(), host.spawns.get()), (0, 0));
+    }
+
+    #[test]
+    fn entry_spawns_directly_for_another_session_when_no_unit_is_installed() {
+        let host = FakeHost::new(work_endpoint(), UnitState::Absent);
+        ensure_remote_server_running_with(&host).unwrap();
+        assert_eq!((host.unit_starts.get(), host.spawns.get()), (0, 1));
+        assert_eq!(
+            host.waits.borrow().as_slice(),
+            &[(work_endpoint().client_socket, DIRECT_START_WAIT)]
+        );
     }
 
     #[test]
@@ -544,10 +585,12 @@ mod tests {
         mixed.client_socket = default_endpoint().client_socket;
         let host = FakeHost::new(mixed, UnitState::Installed);
         let err = ensure_remote_server_running_with(&host).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("not starting an unmanaged server"),
-            "{err}"
+            message.contains("not starting an unmanaged server"),
+            "{message}"
         );
+        assert!(message.contains("sockets mix"), "{message}");
         assert_eq!((host.unit_starts.get(), host.spawns.get()), (0, 0));
     }
 
@@ -739,14 +782,18 @@ mod tests {
             ServerStartPlan::DirectSpawn
         );
         assert_eq!(
-            server_start_plan(Installed, Other).unwrap(),
+            server_start_plan(Absent, Other).unwrap(),
             ServerStartPlan::DirectSpawn
         );
         assert_eq!(
             server_start_plan(Absent, Mixed).unwrap(),
             ServerStartPlan::DirectSpawn
         );
-        assert!(server_start_plan(Masked, Unit).is_err());
+        // Where the unit is installed nothing but the unit itself ever starts a server.
+        for target in [Unit, Other, Mixed] {
+            assert!(server_start_plan(Masked, target).is_err(), "{target:?}");
+        }
+        assert!(server_start_plan(Installed, Other).is_err());
         assert!(server_start_plan(Installed, Mixed).is_err());
     }
 
@@ -784,7 +831,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // herdr_unit_state answers Absent off Linux, so this scan only means something there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unit_state_scans_the_dirs_when_systemd_cannot_be_asked() {
         let root = temp_root("scan");
@@ -814,6 +862,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Linux search paths, spelled with `/`: on Windows `join` would insert `\`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn unit_dirs_cover_every_user_search_path() {
         let env = |name: &str| -> Option<std::ffi::OsString> {
@@ -853,6 +903,32 @@ mod tests {
         let dirs = unit_dirs(&xdg);
         assert!(dirs.contains(&PathBuf::from("/cfg/systemd/user")));
         assert!(dirs.contains(&PathBuf::from("/data/systemd/user")));
+        // XDG_DATA_DIRS that leaves out the vendor dirs: systemd still searches them, once each.
+        let custom_data = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "HOME" => Some("/home/u".into()),
+                "XDG_DATA_DIRS" => Some("/opt/share".into()),
+                _ => None,
+            }
+        };
+        let dirs = unit_dirs(&custom_data);
+        for vendor in ["/usr/local/share/systemd/user", "/usr/share/systemd/user"] {
+            assert_eq!(
+                dirs.iter().filter(|dir| *dir == Path::new(vendor)).count(),
+                1,
+                "{vendor} in {dirs:?}"
+            );
+        }
+        assert!(dirs.contains(&PathBuf::from("/opt/share/systemd/user")));
+        let defaults = unit_dirs(&|name: &str| (name == "HOME").then(|| "/home/u".into()));
+        assert_eq!(
+            defaults
+                .iter()
+                .filter(|dir| *dir == Path::new("/usr/share/systemd/user"))
+                .count(),
+            1,
+            "{defaults:?}"
+        );
     }
 
     #[test]
