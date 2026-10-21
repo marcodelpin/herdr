@@ -1,5 +1,48 @@
 use super::*;
 
+/// How long past the commitment wait's own timeout a stop keeps waiting for
+/// it: the read returns at its timeout, the margin covers scheduling.
+#[cfg(unix)]
+const HANDOFF_COMMIT_WAIT_MARGIN: Duration = Duration::from_secs(1);
+
+/// A startup error after the API socket was bound. Handled only after the
+/// API server drained, so no accepted connection is left without a reply
+/// (herdr-ir4j, ADR-0014 rule 3).
+struct StartupFailure {
+    err: io::Error,
+    /// The socket another server already serves, reported as "already
+    /// running" with exit status 1.
+    already_running: Option<(&'static str, PathBuf)>,
+}
+
+impl From<io::Error> for StartupFailure {
+    fn from(err: io::Error) -> Self {
+        Self {
+            err,
+            already_running: None,
+        }
+    }
+}
+
+/// Leaves a startup that failed after the API bind: drains the API server
+/// first, drops its handle (which unlinks the socket path) only afterwards.
+fn leave_failed_startup(
+    startup_stop: &StartupStop,
+    api_server: Option<api::ServerHandle>,
+    failure: StartupFailure,
+) -> io::Error {
+    warn!(err = %failure.err, "server startup failed");
+    startup_stop.fail_startup();
+    drop(api_server);
+    if let Some((socket, path)) = failure.already_running {
+        eprintln!("error: herdr server is already running");
+        eprintln!("{socket} socket: {}", path.display());
+        crate::logging::shutdown("server");
+        std::process::exit(1);
+    }
+    failure.err
+}
+
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     crate::platform::ignore_server_hangup();
@@ -16,7 +59,30 @@ pub fn run_server() -> io::Result<()> {
     }
     crate::platform::raise_server_nofile_limit();
 
-    if handoff_import {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    // The stop thread first, the signal handler second, both before anything
+    // can accept a connection. No stop thread, no server: the default
+    // disposition stays and nothing is bound (ADR-0014 rule 1).
+    let startup_stop = match StartupStop::start() {
+        Ok(startup_stop) => startup_stop,
+        Err(err) => {
+            tracing::error!(%err, "cannot start the startup stop thread; refusing to start the server");
+            return Err(io::Error::new(
+                err.kind(),
+                format!("cannot start the startup stop thread: {err}"),
+            ));
+        }
+    };
+    let server_stop = crate::server::shutdown::ServerStop::default();
+    {
+        let _runtime = rt.enter();
+        install_server_signal_handling(&server_stop, &startup_stop);
+    }
+
+    let result = if handoff_import {
         let socket_path = args
             .get(3)
             .map(PathBuf::from)
@@ -24,9 +90,66 @@ pub fn run_server() -> io::Result<()> {
         let token = args
             .get(4)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
-    }
+        run_handoff_import_server(&rt, &startup_stop, server_stop, &socket_path, token)
+    } else {
+        run_ordinary_server(&rt, &startup_stop, server_stop)
+    };
 
+    rt.shutdown_timeout(Duration::from_millis(100));
+    crate::logging::shutdown("server");
+    result
+}
+
+/// Probes and binds the API socket. The probe runs while a stop still ends
+/// the process at once; from the bind on, a stop drains this server.
+fn bind_api_server(
+    startup_stop: &StartupStop,
+    api_tx: &api::ApiRequestSender,
+    event_hub: &api::EventHub,
+    server_stop: &crate::server::shutdown::ServerStop,
+) -> io::Result<api::ServerHandle> {
+    // Logged first: probing a socket path that another listener holds can
+    // wait, and a stalled start names it.
+    info!(path = %api::socket_path().display(), "preparing the api socket");
+    let probed = api::prepare_api_socket_path();
+    startup_stop.api_socket_probed();
+    probed?;
+    let api_server = api::start_server_with_stop_control(
+        api_tx.clone(),
+        event_hub.clone(),
+        server_stop.clone(),
+    )?;
+    startup_stop.api_bound(api_server.shutdown_control());
+    Ok(api_server)
+}
+
+fn already_running_api(err: io::Error) -> StartupFailure {
+    if err.kind() == io::ErrorKind::AddrInUse {
+        StartupFailure {
+            err,
+            already_running: Some(("api", api::socket_path())),
+        }
+    } else {
+        err.into()
+    }
+}
+
+fn already_running_client(err: io::Error) -> StartupFailure {
+    if err.kind() == io::ErrorKind::AddrInUse {
+        StartupFailure {
+            err,
+            already_running: Some(("client", client_socket_path())),
+        }
+    } else {
+        err.into()
+    }
+}
+
+fn run_ordinary_server(
+    rt: &tokio::runtime::Runtime,
+    startup_stop: &StartupStop,
+    server_stop: crate::server::shutdown::ServerStop,
+) -> io::Result<()> {
     let loaded_config = config::Config::load();
     #[cfg(windows)]
     if loaded_config.config.server.allow_unelevated_clients {
@@ -34,73 +157,77 @@ pub fn run_server() -> io::Result<()> {
     }
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let server_stop = crate::server::shutdown::ServerStop::default();
 
-    // Start the JSON API socket server. Logged first: probing a socket path
-    // that another listener holds can wait, and a stalled start names it.
-    info!(path = %api::socket_path().display(), "preparing the api socket");
-    let _api_server = match api::start_server_with_stop_control(
-        api_tx.clone(),
-        event_hub.clone(),
-        server_stop.clone(),
-    ) {
+    // Start the JSON API socket server.
+    let api_server = match bind_api_server(startup_stop, &api_tx, &event_hub, &server_stop) {
         Ok(server) => server,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
-            eprintln!("api socket: {}", api::socket_path().display());
-            std::process::exit(1);
+        Err(err) => {
+            return Err(leave_failed_startup(
+                startup_stop,
+                None,
+                already_running_api(err),
+            ))
         }
-        Err(err) => return Err(err),
     };
     hold_startup_after_api_bind_for_test();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
-
-    let result = rt.block_on(async {
-        // Create the App (with AppState, event channels, etc.).
-        let mut app = app::App::try_new(
+    let built = {
+        let _runtime = rt.enter();
+        build_ordinary_server(
             &loaded_config.config,
-            app::AppPolicy::PRODUCTION,
-            config::config_diagnostic_summary(&loaded_config.diagnostics),
+            &loaded_config.diagnostics,
+            api_tx,
             api_rx,
             event_hub,
-        )?;
-        seed_startup_workspace_if_empty(&mut app);
-
-        // Create the headless server.
-        let mut server = match HeadlessServer::new(
-            app,
-            &loaded_config.diagnostics,
-            Some(api_tx.clone()),
-            Some(_api_server),
             server_stop,
-        ) {
-            Ok(server) => server,
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: herdr server is already running");
-                eprintln!("client socket: {}", client_socket_path().display());
-                std::process::exit(1);
-            }
-            Err(err) => return Err(err),
-        };
+        )
+    };
+    let mut server = match built {
+        Ok(server) => server,
+        Err(failure) => {
+            return Err(leave_failed_startup(
+                startup_stop,
+                Some(api_server),
+                failure,
+            ))
+        }
+    };
+    server.api_server = Some(api_server);
+    startup_stop.hand_over_to_event_loop(server.server_event_tx.clone());
+    rt.block_on(server.run())
+}
 
-        info!(
-            api_socket = %api::socket_path().display(),
-            client_socket = %client_socket_path().display(),
-            "herdr server started"
-        );
-        print_ready_message(&api::socket_path(), &client_socket_path());
-        server.app.run_plugin_startup_hooks();
+fn build_ordinary_server(
+    config: &config::Config,
+    diagnostics: &[String],
+    api_tx: api::ApiRequestSender,
+    api_rx: tokio::sync::mpsc::UnboundedReceiver<api::ApiRequestMessage>,
+    event_hub: api::EventHub,
+    server_stop: crate::server::shutdown::ServerStop,
+) -> Result<HeadlessServer, StartupFailure> {
+    // Create the App (with AppState, event channels, etc.).
+    let mut app = app::App::try_new(
+        config,
+        app::AppPolicy::PRODUCTION,
+        config::config_diagnostic_summary(diagnostics),
+        api_rx,
+        event_hub,
+    )?;
+    seed_startup_workspace_if_empty(&mut app);
 
-        server.run().await
-    });
+    // Create the headless server. The API server handle stays with bootstrap
+    // until the event loop takes the stop over (ADR-0014 rule 3).
+    let mut server = HeadlessServer::new(app, diagnostics, Some(api_tx), None, server_stop)
+        .map_err(already_running_client)?;
 
-    rt.shutdown_timeout(Duration::from_millis(100));
-    crate::logging::shutdown("server");
-    result
+    info!(
+        api_socket = %api::socket_path().display(),
+        client_socket = %client_socket_path().display(),
+        "herdr server started"
+    );
+    print_ready_message(&api::socket_path(), &client_socket_path());
+    server.app.run_plugin_startup_hooks();
+    Ok(server)
 }
 
 /// Test hook: holds startup right after the API socket binds, so an
@@ -156,17 +283,27 @@ fn take_startup_cwd() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+fn run_handoff_import_server(
+    rt: &tokio::runtime::Runtime,
+    startup_stop: &StartupStop,
+    server_stop: crate::server::shutdown::ServerStop,
+    socket_path: &Path,
+    token: &str,
+) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let server_stop = crate::server::shutdown::ServerStop::default();
 
     let mut imports = HashMap::new();
-    for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
+    for (pane, fd) in received
+        .manifest
+        .panes
+        .drain(..)
+        .zip(received.fds.drain(..))
+    {
         let pane_id = pane.pane_id;
         imports.insert(
             pane_id,
@@ -177,68 +314,114 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         );
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(io::Error::other)?;
-
-    let result = rt.block_on(async {
-        let app = app::App::new_from_handoff(
+    // Until `ready` is written the source keeps ownership: a stop here ends
+    // the import at once and the source rolls back (ADR-0014 rule 2).
+    let app = {
+        let _runtime = rt.enter();
+        app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub.clone(),
             &received.manifest.snapshot,
             &mut imports,
-        )?;
-        crate::server::handoff::report_restored(&mut received.stream)?;
-        if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
-            return Err(io::Error::other(
-                "test handoff import failure after restored",
-            ));
-        }
-        wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
+        )?
+    };
+    crate::server::handoff::report_restored(&mut received.stream)?;
+    if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
+        return Err(io::Error::other(
+            "test handoff import failure after restored",
+        ));
+    }
+    wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server_with_stop_control(
-            api_tx.clone(),
-            event_hub.clone(),
-            server_stop.clone(),
-        )?;
-        let mut server = HeadlessServer::new(
-            app,
+    let api_server = match bind_api_server(startup_stop, &api_tx, &event_hub, &server_stop) {
+        Ok(server) => server,
+        Err(err) => return Err(leave_failed_startup(startup_stop, None, err.into())),
+    };
+    let built = {
+        let _runtime = rt.enter();
+        build_handoff_import_server(
+            startup_stop,
             &loaded_config.diagnostics,
-            Some(api_tx.clone()),
-            Some(api_server),
+            app,
+            &mut received,
+            api_tx,
             server_stop,
-        )?;
-        // Carried across before any client attaches, so the first title sent is
-        // the override rather than the configured one it replaced.
-        server.api_window_title = received.manifest.api_window_title.take();
-        // A restart announced before the handoff still commits after it.
-        server
-            .host_shutdown_intent
-            .set(received.manifest.host_shutdown_intent);
-        crate::server::handoff::report_ready(&mut received.stream)?;
-        crate::server::handoff::wait_committed(&mut received.stream)?;
-        server.app.assume_handoff_ownership();
-        server.app.unpause_handoff_readers();
-        server.pending_handoff_repaint_nudge = true;
-        if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
-            warn!(err = %err, "failed to report handoff ownership; continuing as owner");
+        )
+    };
+    let mut server = match built {
+        Ok(server) => server,
+        Err(failure) => {
+            return Err(leave_failed_startup(
+                startup_stop,
+                Some(api_server),
+                failure,
+            ))
         }
-        info!("handoff import server started");
-        print_ready_message(&api::socket_path(), &client_socket_path());
-        server.app.run_plugin_startup_hooks();
-        server.run().await
-    });
+    };
+    server.api_server = Some(api_server);
+    startup_stop.hand_over_to_event_loop(server.server_event_tx.clone());
+    rt.block_on(server.run())
+}
 
-    rt.shutdown_timeout(Duration::from_millis(100));
-    crate::logging::shutdown("server");
-    result
+#[cfg(unix)]
+fn build_handoff_import_server(
+    startup_stop: &StartupStop,
+    diagnostics: &[String],
+    app: app::App,
+    received: &mut crate::server::handoff::ReceivedHandoff,
+    api_tx: api::ApiRequestSender,
+    server_stop: crate::server::shutdown::ServerStop,
+) -> Result<HeadlessServer, StartupFailure> {
+    let mut server = HeadlessServer::new(app, diagnostics, Some(api_tx), None, server_stop)?;
+    // Carried across before any client attaches, so the first title sent is
+    // the override rather than the configured one it replaced.
+    server.api_window_title = received.manifest.api_window_title.take();
+    // A restart announced before the handoff still commits after it.
+    server
+        .host_shutdown_intent
+        .set(received.manifest.host_shutdown_intent);
+
+    // A stop already recorded aborts the import before `ready`, so the source
+    // keeps ownership. From `ready` on the source may commit at any moment:
+    // the commitment wait is joined, within its own timeout, never abandoned.
+    let commit_wait_ends =
+        Instant::now() + crate::server::handoff::COMMIT_TIMEOUT + HANDOFF_COMMIT_WAIT_MARGIN;
+    if !startup_stop.begin_commit_wait(commit_wait_ends) {
+        return Err(
+            io::Error::other("stop signal received before the handoff import was ready").into(),
+        );
+    }
+    crate::server::handoff::report_ready(&mut received.stream)?;
+    crate::server::handoff::wait_committed(&mut received.stream)?;
+    startup_stop.committed();
+    server.app.assume_handoff_ownership();
+    server.app.unpause_handoff_readers();
+    server.pending_handoff_repaint_nudge = true;
+    if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
+        warn!(err = %err, "failed to report handoff ownership; continuing as owner");
+    }
+    // The source no longer saves this session: write it before any step that
+    // can wait on another process, so a stop or a crash from here on cannot
+    // lose what was transferred (ADR-0014 rule 2).
+    server.app.save_session_now();
+    startup_stop.saved();
+
+    info!("handoff import server started");
+    print_ready_message(&api::socket_path(), &client_socket_path());
+    server.app.run_plugin_startup_hooks();
+    Ok(server)
 }
 
 #[cfg(not(unix))]
-fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()> {
+fn run_handoff_import_server(
+    _rt: &tokio::runtime::Runtime,
+    _startup_stop: &StartupStop,
+    _server_stop: crate::server::shutdown::ServerStop,
+    _socket_path: &Path,
+    _token: &str,
+) -> io::Result<()> {
     Err(io::Error::other("live handoff is only supported on Unix"))
 }
 

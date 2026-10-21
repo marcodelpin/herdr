@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command};
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
@@ -290,12 +290,54 @@ pub(crate) fn report_ready(stream: &mut UnixStream) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let committed = read_line_unbuffered(&mut *stream)?;
+    let committed = read_line_through_signals(stream, Instant::now() + READY_TIMEOUT)?;
     if committed.trim_end() != "committed" {
         return Err(io::Error::other("handoff source did not commit"));
     }
     Ok(())
+}
+
+/// Reads one line by `deadline`, through any signal that arrives meanwhile.
+/// A socket read with a timeout is never restarted after a signal handler
+/// (EINTR even under SA_RESTART), so a stop signal would otherwise abort the
+/// import's commitment wait; the import must wait it out instead, because the
+/// source may already have committed (herdr-ir4j).
+#[cfg(unix)]
+fn read_line_through_signals(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handoff stream read timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "handoff stream closed while reading line",
+                ))
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+        }
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff line exceeded maximum size",
+            ));
+        }
+    }
 }
 
 #[cfg(unix)]

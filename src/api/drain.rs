@@ -37,6 +37,10 @@ pub(crate) struct ApiDrain {
     state: Mutex<DrainState>,
     changed: Condvar,
     draining: AtomicBool,
+    /// Held for the whole of one shutdown drain; holds the deadline the first
+    /// drain fixed. A stop that arrives during startup drains from its own
+    /// thread, and the event loop may drain again once it runs (herdr-ir4j).
+    shutdown: Mutex<Option<Instant>>,
     #[cfg(test)]
     before_shutdown: Mutex<Option<BeforeShutdownHook>>,
 }
@@ -78,6 +82,13 @@ impl ApiDrain {
         let _state = self.lock();
         self.draining.store(true, Ordering::Release);
         self.changed.notify_all();
+    }
+
+    /// Serializes shutdown drains of this server; see [`ShutdownTurn`].
+    pub(crate) fn serialize_shutdown(&self) -> ShutdownTurn<'_> {
+        ShutdownTurn {
+            deadline: self.shutdown.lock().unwrap_or_else(PoisonError::into_inner),
+        }
     }
 
     pub(crate) fn is_draining(&self) -> bool {
@@ -149,6 +160,18 @@ impl ApiDrain {
     #[cfg(test)]
     pub(crate) fn in_flight_stages(&self) -> Vec<&'static str> {
         self.lock().in_flight.values().copied().collect()
+    }
+}
+
+/// One shutdown drain's exclusive turn. The first turn fixes the deadline;
+/// every later one ends by that same deadline.
+pub(crate) struct ShutdownTurn<'a> {
+    deadline: MutexGuard<'a, Option<Instant>>,
+}
+
+impl ShutdownTurn<'_> {
+    pub(crate) fn deadline(&mut self, requested: Instant) -> Instant {
+        *self.deadline.get_or_insert(requested)
     }
 }
 
@@ -257,6 +280,33 @@ mod tests {
 
         drain.acknowledge_admission_closed();
         assert!(drain.wait_admission_closed(Instant::now()));
+    }
+
+    #[test]
+    fn a_later_shutdown_drain_waits_its_turn_and_keeps_the_first_deadline() {
+        let drain = Arc::new(ApiDrain::default());
+        let first_deadline = Instant::now() + Duration::from_secs(7);
+        let mut first = drain.serialize_shutdown();
+        assert_eq!(first.deadline(first_deadline), first_deadline);
+
+        let (took_turn_tx, took_turn_rx) = std::sync::mpsc::channel();
+        let later = {
+            let drain = Arc::clone(&drain);
+            std::thread::spawn(move || {
+                let mut turn = drain.serialize_shutdown();
+                took_turn_tx.send(()).unwrap();
+                turn.deadline(Instant::now() + Duration::from_secs(60))
+            })
+        };
+        assert!(
+            took_turn_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a second drain must not run while the first does"
+        );
+
+        drop(first);
+        assert_eq!(later.join().unwrap(), first_deadline);
     }
 
     #[test]
