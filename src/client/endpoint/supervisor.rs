@@ -268,9 +268,10 @@ fn connect_once(
     endpoint_id: ClientEndpointId,
     generation: u64,
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
-    let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
+    let mut ssh_bridge = None;
+    let mut stream = match target {
         ConnectTarget::Local(path) => {
-            let stream = crate::ipc::connect_local_stream(path).map_err(|error| {
+            crate::ipc::connect_local_stream(path).map_err(|error| {
                 // An absent Local socket is transient, unlike a missing SSH install.
                 if error.kind() == std::io::ErrorKind::NotFound {
                     std::io::Error::new(
@@ -280,8 +281,7 @@ fn connect_once(
                 } else {
                     error
                 }
-            })?;
-            (stream, Box::new(()))
+            })?
         }
         ConnectTarget::Ssh(profile) => {
             let connected = crate::remote::connect_saved_ssh(
@@ -289,7 +289,8 @@ fn connect_once(
                 &profile.target,
                 &profile.session,
             )?;
-            (connected.stream, Box::new(connected.bridge))
+            ssh_bridge = Some(connected.bridge);
+            connected.stream
         }
     };
     let handshake = super::super::do_handshake(
@@ -305,7 +306,19 @@ fn connect_once(
         false,
         matches!(target, ConnectTarget::Local(_)),
     )
-    .map_err(handshake_error)?;
+    .map_err(handshake_error)
+    .map_err(|error| {
+        prefer_bridge_failure(
+            ssh_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.reported_failure()),
+            error,
+        )
+    })?;
+    let lifetime: Box<dyn Send> = match ssh_bridge {
+        Some(bridge) => Box::new(bridge),
+        None => Box::new(()),
+    };
     if handshake.encoding != RenderEncoding::SemanticFrame {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -333,6 +346,16 @@ fn connect_once(
         writer,
         negotiation,
     })
+}
+
+/// bd herdr-waz6: when the remote bridge exits before the handshake, the handshake only sees "server
+/// closed connection"; the bridge's own report (e.g. why it would not start an unmanaged server
+/// beside herdr.service) is the error the endpoint status must show.
+fn prefer_bridge_failure(
+    reported: Option<std::io::Error>,
+    handshake_error: std::io::Error,
+) -> std::io::Error {
+    reported.unwrap_or(handshake_error)
 }
 
 fn failure_needs_attention(error: &std::io::Error) -> bool {
@@ -546,5 +569,36 @@ mod tests {
             supervisors.endpoints[&endpoint_id].next_attempt,
             Some(now + Duration::from_secs(30))
         );
+    }
+
+    #[test]
+    fn bridge_failure_replaces_the_bare_handshake_error() {
+        let shown = prefer_bridge_failure(
+            Some(std::io::Error::other(
+                "no herdr server is running and `systemctl --user start herdr.service` failed",
+            )),
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "server closed connection",
+            ),
+        );
+        assert!(
+            shown
+                .to_string()
+                .contains("systemctl --user start herdr.service"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn handshake_error_stands_when_the_bridge_reported_nothing() {
+        let shown = prefer_bridge_failure(
+            None,
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "server closed connection",
+            ),
+        );
+        assert_eq!(shown.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

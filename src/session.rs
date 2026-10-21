@@ -491,6 +491,12 @@ fn normalize_name(name: &str) -> Result<Option<String>, String> {
     Ok(Some(name.to_string()))
 }
 
+/// The env-var lock this module's tests hold; other modules' tests that set the same vars share it.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    tests::env_lock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,7 +504,7 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     use std::sync::{Mutex, OnceLock};
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
