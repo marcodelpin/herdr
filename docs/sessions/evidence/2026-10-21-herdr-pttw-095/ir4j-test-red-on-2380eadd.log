@@ -1,0 +1,31 @@
+   Compiling ghostty-vt v0.0.0 (/srv/scratch/pttw-r4/wt-base/crates/ghostty-vt)
+   Compiling herdr v0.9.5 (/srv/scratch/pttw-r4/wt-base)
+   Compiling portable-pty v0.9.0 (/srv/scratch/pttw-r4/wt-base/vendor/portable-pty)
+warning: herdr@0.9.5: external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 26s
+────────────
+ Nextest run ID 8a72122f-9d65-4541-9478-fe3e03d7ac60 with nextest profile: default
+    Starting 1 test across 1 binary (20 tests skipped)
+        FAIL [   0.360s] (1/1) herdr::server_headless sigterm_during_startup_answers_requests_already_accepted
+  stdout ───
+
+    running 1 test
+    test sigterm_during_startup_answers_requests_already_accepted ... FAILED
+
+    failures:
+
+    failures:
+        sigterm_during_startup_answers_requests_already_accepted
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.35s
+
+  stderr ───
+
+    thread 'sigterm_during_startup_answers_requests_already_accepted' (3102579) panicked at tests/server_headless.rs:795:9:
+    request 0 accepted during startup got no reply: Ok(0) ""
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.362s] 1 test run: 0 passed, 1 failed, 20 skipped
+        FAIL [   0.360s] (1/1) herdr::server_headless sigterm_during_startup_answers_requests_already_accepted
+error: test run failed

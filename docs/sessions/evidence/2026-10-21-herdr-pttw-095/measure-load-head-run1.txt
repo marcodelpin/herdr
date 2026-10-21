@@ -1,0 +1,16 @@
+# bin=/srv/scratch/pttw-r4/bin/herdr-head-df0bc3c3 mode=load trials=12 clients=32 delay=0.3s
+trial 00 rc=0 sent=2703 {'reply': 2186, 'error:server_unavailable': 517} refused={'after_term:ECONNREFUSED': 1, 'after_term:ENOENT': 5238} bad_ids_in_server_log=0 kept=-
+trial 01 rc=0 sent=2423 {'reply': 2090, 'error:server_unavailable': 333} refused={'after_term:ENOENT': 5262} bad_ids_in_server_log=0 kept=-
+trial 02 rc=0 sent=2570 {'reply': 1946, 'error:server_unavailable': 624} refused={'after_term:ENOENT': 5343} bad_ids_in_server_log=0 kept=-
+trial 03 rc=0 sent=1977 {'reply': 1343, 'error:server_unavailable': 634} refused={'after_term:ENOENT': 5527} bad_ids_in_server_log=0 kept=-
+trial 04 rc=0 sent=1856 {'reply': 1575, 'error:server_unavailable': 281} refused={'after_term:ENOENT': 6026} bad_ids_in_server_log=0 kept=-
+trial 05 rc=0 sent=2003 {'reply': 1606, 'error:server_unavailable': 397} refused={'after_term:ENOENT': 5501} bad_ids_in_server_log=0 kept=-
+trial 06 rc=0 sent=2423 {'reply': 2064, 'error:server_unavailable': 359} refused={'after_term:ENOENT': 5162} bad_ids_in_server_log=0 kept=-
+trial 07 rc=0 sent=1835 {'reply': 1416, 'error:server_unavailable': 419} refused={'after_term:ENOENT': 5488} bad_ids_in_server_log=0 kept=-
+trial 08 rc=0 sent=1221 {'reply': 890, 'error:server_unavailable': 331} refused={'after_term:ENOENT': 5462} bad_ids_in_server_log=0 kept=-
+trial 09 rc=0 sent=1204 {'reply': 873, 'error:server_unavailable': 331} refused={'after_term:ENOENT': 5108} bad_ids_in_server_log=0 kept=-
+trial 10 rc=0 sent=1523 {'reply': 1137, 'error:server_unavailable': 386} refused={'after_term:ENOENT': 5126} bad_ids_in_server_log=0 kept=-
+trial 11 rc=0 sent=1962 {'reply': 1722, 'error:server_unavailable': 240} refused={'after_term:ENOENT': 5815} bad_ids_in_server_log=0 kept=-
+TOTAL sent=23700 {'reply': 18848, 'error:server_unavailable': 4852}
+REFUSED_AT_CONNECT {'after_term:ECONNREFUSED': 1, 'after_term:ENOENT': 65058}
+TRIALS_WITH_LOSS_OR_BAD_EXIT 0/12
