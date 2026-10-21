@@ -4497,4 +4497,66 @@ mod tests {
             "{events:?}"
         );
     }
+
+    fn key_codes(events: &[crate::protocol::ClientInputEvent]) -> Vec<crate::protocol::ClientKeyCode> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                crate::protocol::ClientInputEvent::Key { code, .. } => Some(code.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// r3-1 (codex f5251-r3): with the one-second default-colour query active
+    /// and an OSC header dropped, `a`, Ctrl+[ and a native Enter within a few
+    /// milliseconds reach the pane as `a`, Escape, Enter.
+    #[test]
+    fn review_r3_1_ctrl_bracket_after_held_text_precedes_native_enter() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        for record in "\x1b]4;50;".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+        }
+        assert!(translator.idle().is_empty());
+        let mut events = translator.translate(key_char('a'));
+        events.extend(translator.translate(key_vk_with_utf16_mods(0xdb, 0x1b, 0x0008)));
+        events.extend(translator.translate(key_vk_with_unicode(0x0d, '\r', 0)));
+
+        assert_eq!(
+            key_codes(&events),
+            vec![
+                crate::protocol::ClientKeyCode::Char('a'),
+                crate::protocol::ClientKeyCode::Esc,
+                crate::protocol::ClientKeyCode::Enter
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-nxa8 / #5251 on the Windows pump: a VT Escape released at an
+    /// idle tick, then the rest of a Delete key or an X10 mouse report. The
+    /// tail is dropped; only the Escape reaches the pane.
+    #[test]
+    fn review_nxa8_tail_after_idle_released_escape_is_not_typed() {
+        for tail in ["[3~", "[MCd2"] {
+            let mut translator = WindowsInputTranslator::default();
+            assert!(translator.translate(key_char('\x1b')).is_empty());
+            let mut events = translator.idle();
+            for record in tail.chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+            for _ in 0..3 {
+                events.extend(translator.idle());
+            }
+            assert_eq!(
+                key_codes(&events),
+                vec![crate::protocol::ClientKeyCode::Esc],
+                "{tail:?}: {events:?}"
+            );
+        }
+    }
 }

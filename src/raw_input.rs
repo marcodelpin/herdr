@@ -114,7 +114,7 @@ impl RawInputFramer {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn host_default_color_query_sent(&mut self, escape_grace: Duration) {
         self.byte_framer.host_default_color_query_sent(escape_grace);
     }
@@ -123,7 +123,7 @@ impl RawInputFramer {
         events_from_framed_chunks(self.byte_framer.push(data))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn holds_host_default_color_escape(&self) -> bool {
         self.byte_framer.buffer.as_slice() == [ESC]
             && self.byte_framer.host_color_replies_awaited > 0
@@ -131,11 +131,6 @@ impl RawInputFramer {
                 .byte_framer
                 .host_default_color_query_deadline
                 .is_some_and(|deadline| self.byte_framer.now() < deadline)
-    }
-
-    #[cfg(all(test, not(windows)))]
-    pub(crate) fn holds_host_default_color_escape(&self) -> bool {
-        false
     }
 
     pub(crate) fn has_pending_bracketed_paste(&self) -> bool {
@@ -205,13 +200,13 @@ pub(crate) struct RawInputByteFramer {
     #[cfg(test)]
     test_clock: Option<Instant>,
     host_color_replies_awaited: u16,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_default_color_query_issued: bool,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_default_color_query_deadline: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_color_tail_deadline: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_color_tail_split_st: bool,
     host_cell_size_replies_awaited: u16,
     host_appearance_reply_awaited: bool,
@@ -448,7 +443,7 @@ impl RawInputByteFramer {
         self.host_color_query_sent_with_replies(HOST_COLOR_QUERY_REPLIES);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn host_default_color_query_sent(&mut self, reply_window: Duration) {
         self.host_color_query_sent_with_replies(2);
         self.host_default_color_query_issued = true;
@@ -465,7 +460,7 @@ impl RawInputByteFramer {
     /// limit or grown past any real reply, so it can no longer hold input.
     fn host_color_reply_abandoned(&self) -> bool {
         // The Windows default color query keeps its own reply deadline.
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_deadline.is_some() {
             return false;
         }
@@ -523,7 +518,7 @@ impl RawInputByteFramer {
             return;
         }
         // The Windows default color query keeps its own reply deadline.
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_deadline.is_some() {
             return;
         }
@@ -667,7 +662,7 @@ impl RawInputByteFramer {
         // A lone ESC held one flush for a host reply is served by this flush.
         if self.buffer.as_slice() == [ESC] {
             self.held_pending_host_reply_esc = true;
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             {
                 self.host_default_color_query_deadline = None;
             }
@@ -718,11 +713,11 @@ impl RawInputByteFramer {
         let mut chunks = self.drain_available_chunks();
         self.expire_unanswered_host_queries();
 
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         let host_color_query_expired = self
             .host_default_color_query_deadline
             .is_some_and(|deadline| self.now() >= deadline);
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if host_color_query_expired {
             self.host_default_color_query_deadline = None;
             self.host_color_replies_awaited = 0;
@@ -738,7 +733,7 @@ impl RawInputByteFramer {
             if family == ControlStringFamily::HostReplyCsi {
                 return chunks;
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             if self.host_color_tail_deadline.is_some() {
                 return chunks;
             }
@@ -806,7 +801,7 @@ impl RawInputByteFramer {
             return chunks;
         }
 
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_issued
             && is_incomplete_host_default_color_prefix(&self.buffer)
         {
@@ -933,7 +928,7 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.as_slice() == [ESC] {
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             if self.host_color_replies_awaited > 0
                 && self.host_default_color_query_deadline.is_some()
             {
@@ -950,7 +945,7 @@ impl RawInputByteFramer {
             let color_reply = self.host_color_replies_awaited > 0 && self.awaiting_host_reply();
             // No continuation arrived; give up the window so Escape is not delayed again.
             self.host_color_replies_awaited = 0;
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             {
                 self.host_default_color_query_deadline = None;
             }
@@ -1048,7 +1043,7 @@ impl RawInputByteFramer {
             }
 
             if let Some(family) = self.discard_until {
-                #[cfg(windows)]
+                #[cfg(any(windows, test))]
                 if let Some(deadline) = self.host_color_tail_deadline {
                     if self.host_color_tail_split_st
                         && self.buffer.len() > 1
@@ -1164,7 +1159,7 @@ impl RawInputByteFramer {
         chunks
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn end_host_color_tail_recovery(&mut self) {
         self.discard_until = None;
         self.discarded_tail_bytes = 0;
@@ -1190,10 +1185,10 @@ fn starts_with_kitty_key_report(bytes: &[u8]) -> bool {
     rest.first().is_some_and(u8::is_ascii_digit) && rest.get(params) == Some(&b'u')
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const HOST_COLOR_TAIL_RECOVERY_GRACE: Duration = Duration::from_millis(100);
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn plausible_host_color_tail_byte(byte: u8) -> bool {
     plausible_color_reply_payload_byte(byte) || byte == ESC
 }
@@ -1436,7 +1431,7 @@ fn starts_with_incomplete_default_color_response(buffer: &[u8]) -> bool {
         )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn is_incomplete_host_default_color_prefix(buffer: &[u8]) -> bool {
     buffer.starts_with(b"\x1b]")
         && matches!(
@@ -1930,6 +1925,8 @@ mod hold_property_tests;
 mod review_5251_r1_tests;
 #[cfg(test)]
 mod review_5251_r2_tests;
+#[cfg(test)]
+mod review_nxa8_r3_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3755,7 +3752,7 @@ mod tests {
         assert!(framer.flush_timeout().is_empty());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     #[test]
     fn windows_host_color_prefix_respects_query_deadline() {
         let mut framer = RawInputFramer::for_host_input();
@@ -3793,7 +3790,7 @@ mod tests {
         ));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     #[test]
     fn windows_expired_host_color_reply_tail_does_not_reach_pane() {
         let mut framer = RawInputFramer::for_host_input();
