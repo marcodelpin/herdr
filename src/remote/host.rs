@@ -45,7 +45,8 @@ fn ensure_remote_server_running() -> io::Result<()> {
 /// The host facts and actions the bridge needs to bring a server up. `SystemHost` is production;
 /// tests drive `ensure_remote_server_running_with` through a fake (bd herdr-waz6).
 trait RemoteHost {
-    fn server_listening(&self) -> bool;
+    /// A failed probe is an error, not "nobody listening": the bridge must not start a server on it.
+    fn server_listening(&self) -> io::Result<bool>;
     fn running_endpoint_generation(&self) -> io::Result<Option<u32>>;
     /// The sockets this bridge will use, after `--session`, `HERDR_SESSION` and socket overrides.
     fn effective_endpoint(&self) -> Endpoint;
@@ -84,7 +85,7 @@ const SYSTEM_HOST: SystemHost = SystemHost {
 };
 
 impl RemoteHost for SystemHost {
-    fn server_listening(&self) -> bool {
+    fn server_listening(&self) -> io::Result<bool> {
         crate::server::autodetect::is_server_listening()
     }
 
@@ -132,7 +133,7 @@ impl RemoteHost for SystemHost {
 }
 
 fn ensure_remote_server_running_with(host: &dyn RemoteHost) -> io::Result<()> {
-    if host.server_listening() {
+    if host.server_listening()? {
         if host.running_endpoint_generation()?
             == Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION)
         {
@@ -493,8 +494,8 @@ mod tests {
     }
 
     impl RemoteHost for FakeHost {
-        fn server_listening(&self) -> bool {
-            self.listening
+        fn server_listening(&self) -> io::Result<bool> {
+            Ok(self.listening)
         }
         fn running_endpoint_generation(&self) -> io::Result<Option<u32>> {
             Ok(self.generation)
@@ -691,8 +692,9 @@ mod tests {
 
     /// Runs the CLI session parsing for `args` and returns where the bridge's sockets land.
     fn target_for_cli(args: &[&str], env: &[(&str, &str)]) -> EndpointTarget {
-        // Same env vars as the session and update tests: hold both of their locks.
-        let _session_guard = crate::session::test_env_lock()
+        // Same env vars as the session and update tests: hold both of their locks (the session
+        // tests hold the shared config env lock).
+        let _session_guard = crate::config::test_config_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         #[cfg(unix)]

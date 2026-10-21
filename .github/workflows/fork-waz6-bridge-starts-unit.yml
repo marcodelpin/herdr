@@ -18,11 +18,15 @@
 # data dirs whatever XDG_DATA_DIRS says, as systemd does.
 # The crate tests run here, the acceptance surface. Each mutant removes one guard and must turn the
 # named tests red. bd herdr-waz6.
+# 0.9.5 port (bd herdr-ih1r), branch fix/waz6-on-adopt-0.9.5 on d1f563df, the build dcc runs: the
+# same three commits, with is_server_listening now returning io::Result (an error is not "nobody
+# listening", so the bridge fails instead of starting a server) and the session tests' env lock
+# now being the shared config env lock.
 name: Fork waz6 bridge never spawns beside the unit
 
 on:
   push:
-    branches: [fix/waz6-unit-only-bridge]
+    branches: [fix/waz6-on-adopt-0.9.5, fix/adopt-0.9.5]
 
 permissions:
   contents: read
