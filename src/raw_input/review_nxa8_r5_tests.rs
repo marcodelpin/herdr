@@ -176,3 +176,48 @@ fn review_r5_2c_escape_aborts_a_truncated_control_string() {
         lost.join("\n")
     );
 }
+
+/// The same rule after an idle release dropped an OSC header that ended in
+/// ESC (ADR-0013 amendment 1, D1): that ESC was only the possible start of
+/// the ST. `\` completes the ST and is dropped; `[` disproves it, so the ESC
+/// starts the next token and `ESC [3~` reaches the pane as Delete, not as
+/// `[3~`. On the Unix reader and on the pump.
+#[test]
+fn review_r5_2d_escape_ending_a_dropped_osc_header_starts_the_next_key() {
+    use crossterm::event::KeyCode;
+    let header: &[u8] = b"\x1b]4;1;rgb:aaaa/bbbb/cccc\x1b";
+    for pump in [false, true] {
+        // After the idle release dropped the header, inside its tail hold.
+        let at = if pump { 30 } else { 600 };
+        for (tail, expected) in [
+            (b"[3~".as_slice(), KeyCode::Delete),
+            (b"\\x".as_slice(), KeyCode::Char('x')),
+        ] {
+            let base = Instant::now();
+            let mut framer = RawInputByteFramer::with_host_input_policy(false);
+            framer.set_test_clock(base);
+            let (chunks, events): (Vec<Vec<u8>>, Vec<RawInputEvent>) = if pump {
+                framer.set_pump_policy();
+                let mut chunks = push_at(&mut framer, base, 0, header);
+                chunks.extend(ticks(&mut framer, base, 0, at));
+                chunks.extend(push_at(&mut framer, base, at, tail));
+                chunks.extend(ticks(&mut framer, base, at, 3_000));
+                (chunks.clone(), events_from_framed_chunks(chunks))
+            } else {
+                let chunks = unix_reader(&mut framer, base, &[(0, header), (at, tail)], 3_000);
+                let events = chunks
+                    .iter()
+                    .flat_map(|chunk| parse_framed_input(chunk))
+                    .collect();
+                (chunks, events)
+            };
+            assert!(
+                matches!(&events[..], [RawInputEvent::Key(key)]
+                    if key.code == expected && key.modifiers.is_empty()),
+                "pump={pump} {}: {chunks:?}: {events:?}",
+                tail.escape_ascii()
+            );
+            assert!(!framer.has_pending_input());
+        }
+    }
+}
