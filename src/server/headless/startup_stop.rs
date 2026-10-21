@@ -18,7 +18,10 @@
 //!   source may already have committed; the API is drained at once and the
 //!   commitment wait, which has its own bound, is joined;
 //! - `Saving` (handoff: `committed` read): the transferred session is being
-//!   written; the stop waits for it, bounded;
+//!   written, retried until the save bound when a write fails; the stop waits
+//!   for it. A handoff whose session never reached the disk is remembered: a
+//!   stop that gives startup up then exits with status 1 and says so, never
+//!   as a success;
 //! - `Failed` (a startup error after the bind): the failing thread drains and
 //!   leaves; the stop thread keeps its deadline;
 //! - `EventLoop`: a signal wakes the loop, which ends the process the
@@ -83,6 +86,9 @@ struct State {
     /// When the first stop signal arrived before the event loop took over.
     signalled_at: Option<Instant>,
     api: Option<ApiShutdownControl>,
+    /// A committed handoff whose transferred session is not on disk yet.
+    #[cfg(unix)]
+    unsaved_handoff: bool,
 }
 
 impl StartupStop {
@@ -110,6 +116,8 @@ impl StartupStop {
                     phase: Phase::Booting,
                     signalled_at: None,
                     api: None,
+                    #[cfg(unix)]
+                    unsaved_handoff: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -176,17 +184,28 @@ impl StartupStop {
     }
 
     /// The source committed: the import owns the panes, and the session it
-    /// carries is written next.
+    /// carries is written next, by the returned instant.
     #[cfg(unix)]
-    pub(crate) fn committed(&self) {
-        self.set_phase(Phase::Saving {
-            until: Instant::now() + HANDOFF_SAVE_BOUND,
-        });
+    pub(crate) fn committed(&self) -> Instant {
+        let until = Instant::now() + HANDOFF_SAVE_BOUND;
+        self.lock().unsaved_handoff = true;
+        self.set_phase(Phase::Saving { until });
+        until
     }
 
     /// The transferred session is on disk; a stop may give startup up again.
     #[cfg(unix)]
     pub(crate) fn saved(&self) {
+        self.lock().unsaved_handoff = false;
+        self.set_phase(Phase::Serving);
+    }
+
+    /// The transferred session could not be written within the save bound.
+    /// Startup goes on (the event loop keeps trying to save), but a stop that
+    /// gives startup up from here on reports the lost transfer and exits
+    /// with status 1.
+    #[cfg(unix)]
+    pub(crate) fn save_failed(&self) {
         self.set_phase(Phase::Serving);
     }
 
@@ -284,6 +303,8 @@ impl StartupStop {
 
         // The lock stays held: the event loop cannot take over while the
         // process leaves.
+        #[cfg(unix)]
+        let unsaved_handoff = state.unsaved_handoff;
         let status = match &state.phase {
             #[cfg(unix)]
             Phase::Committing { .. } => {
@@ -294,12 +315,19 @@ impl StartupStop {
             Phase::Saving { .. } => {
                 error!(
                     bound_ms = HANDOFF_SAVE_BOUND.as_millis() as u64,
-                    "handoff session save did not finish after the stop signal; exiting without it"
+                    "handoff session save did not finish after the stop signal, the transferred session was not written; exiting without it"
                 );
                 1
             }
             Phase::Failed => {
                 warn!("failed server startup did not end after the stop signal; exiting");
+                1
+            }
+            #[cfg(unix)]
+            _ if unsaved_handoff => {
+                error!(
+                    "server startup did not finish after the stop signal and the transferred session was not written; exiting, the handed-over session is lost"
+                );
                 1
             }
             _ => {

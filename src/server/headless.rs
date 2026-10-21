@@ -328,27 +328,29 @@ pub(crate) fn install_server_signal_handling(server_stop: &ServerStop, startup_s
     });
 }
 
-impl HeadlessServer {
-    /// Creates and starts the headless server.
-    ///
-    /// This:
-    /// 1. Prepares the client socket path (cleans up stale sockets)
-    /// 2. Binds the client socket listener
-    /// 3. Returns the server ready to run
-    pub fn new(
-        app: app::App,
-        config_diagnostics: &[String],
-        api_tx: Option<api::ApiRequestSender>,
-        api_server: Option<api::ServerHandle>,
-        server_stop: ServerStop,
-    ) -> io::Result<Self> {
-        let should_quit = server_stop.flag().clone();
+/// The client protocol socket, bound and listening, with the channel its
+/// connections report on. Bound apart from the server so that a failure here
+/// leaves the App with the caller, which must drain the API server before it
+/// destroys the App (herdr-ir4j, ADR-0014 rule 3).
+pub(crate) struct ClientSocket {
+    #[cfg(unix)]
+    listener: LocalListener,
+    path: PathBuf,
+    identity: SocketFileIdentity,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+    server_event_rx: mpsc::Receiver<ServerEvent>,
+}
+
+impl ClientSocket {
+    /// Prepares the client socket path (cleans up stale sockets) and binds
+    /// the listener.
+    pub(crate) fn bind(server_stop: &ServerStop) -> io::Result<Self> {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
         let listener = bind_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
-        let client_socket_identity = socket_file_identity(&client_path)?;
+        let identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
 
         // Set non-blocking on Unix so we can poll it from the event loop.
@@ -358,7 +360,44 @@ impl HeadlessServer {
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
         #[cfg(windows)]
-        spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone())?;
+        spawn_windows_client_accept_thread(
+            listener,
+            server_stop.flag().clone(),
+            server_event_tx.clone(),
+        )?;
+        #[cfg(not(windows))]
+        let _ = server_stop;
+        Ok(Self {
+            #[cfg(unix)]
+            listener,
+            path: client_path,
+            identity,
+            server_event_tx,
+            server_event_rx,
+        })
+    }
+}
+
+impl HeadlessServer {
+    /// Creates the headless server on a client socket already bound, ready to
+    /// run.
+    pub(crate) fn new(
+        app: app::App,
+        config_diagnostics: &[String],
+        api_tx: Option<api::ApiRequestSender>,
+        api_server: Option<api::ServerHandle>,
+        server_stop: ServerStop,
+        client_socket: ClientSocket,
+    ) -> Self {
+        let should_quit = server_stop.flag().clone();
+        let ClientSocket {
+            #[cfg(unix)]
+            listener,
+            path: client_path,
+            identity: client_socket_identity,
+            server_event_tx,
+            server_event_rx,
+        } = client_socket;
 
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
@@ -366,7 +405,7 @@ impl HeadlessServer {
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
         let _ = api_tx;
-        Ok(Self {
+        Self {
             app,
             #[cfg(unix)]
             api_tx,
@@ -415,7 +454,7 @@ impl HeadlessServer {
             server_stop,
             server_event_rx,
             server_event_tx,
-        })
+        }
     }
 
     /// Runs the headless server event loop until shutdown.
