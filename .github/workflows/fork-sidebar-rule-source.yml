@@ -8,13 +8,14 @@ name: Fork sidebar rule source (upm)
 
 on:
   push:
-    branches: [fix/sidebar-rule-source, fix/adopt-0.9.5]
+    branches: [ci/5bka-retry, fix/sidebar-rule-source, fix/adopt-0.9.5]
 
 permissions:
   contents: read
 
 env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
+  ZIG_FETCH_FAULT_FIRST_ATTEMPT: '1'
 
 jobs:
   crate-tests:

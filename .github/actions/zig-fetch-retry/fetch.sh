@@ -77,8 +77,14 @@ trap 'rm -f "$log"' EXIT
 echo "zig-fetch-retry: prefetching libghostty-vt packages for $zig_target (up to $attempts attempts)"
 attempt=1
 while :; do
-  (cd "$vendored" && "$zig" "${args[@]}") >"$log" 2>&1
-  rc=$?
+  if [ "${ZIG_FETCH_FAULT_FIRST_ATTEMPT:-}" = 1 ] && [ "$attempt" -eq 1 ]; then
+    # CI proof branch ci/5bka-retry only: fail the first attempt as a runner DNS failure would.
+    echo "build.zig.zon:14:20: error: unable to connect to server: NameServerFailure (injected by ZIG_FETCH_FAULT_FIRST_ATTEMPT)" >"$log"
+    rc=1
+  else
+    (cd "$vendored" && "$zig" "${args[@]}") >"$log" 2>&1
+    rc=$?
+  fi
   cat "$log"
   if [ "$rc" -eq 0 ]; then
     echo "zig-fetch-retry: fetch succeeded on attempt $attempt/$attempts"
