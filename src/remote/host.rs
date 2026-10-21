@@ -277,8 +277,7 @@ struct SystemctlOutput {
 }
 
 fn run_systemctl(args: &[&str]) -> io::Result<SystemctlOutput> {
-    let output = std::process::Command::new("systemctl")
-        .args(args)
+    let output = systemctl_command(args, crate::platform::user_manager_runtime_dir().as_deref())
         .stdin(std::process::Stdio::null())
         .output()?;
     Ok(SystemctlOutput {
@@ -289,8 +288,35 @@ fn run_systemctl(args: &[&str]) -> io::Result<SystemctlOutput> {
     })
 }
 
+/// `systemctl` addressed at the user manager itself (bd herdr-waz6, codex hwaz6-r3): its runtime
+/// dir comes from the effective uid, not from the caller's XDG_RUNTIME_DIR, and
+/// DBUS_SESSION_BUS_ADDRESS is dropped so systemctl takes the manager's private socket there. A
+/// stripped or redirected environment made the manager unreachable and sent the bridge to the
+/// fallback scan (measured on dcc: with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS unset
+/// `systemctl --user show` fails; with XDG_RUNTIME_DIR=/run/user/<uid> it answers).
+fn systemctl_command(args: &[&str], manager_runtime: Option<&Path>) -> std::process::Command {
+    let mut command = std::process::Command::new("systemctl");
+    command.args(args);
+    if let Some(runtime) = manager_runtime {
+        command
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    }
+    command
+}
+
+fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if !dirs.contains(&dir) {
+        dirs.push(dir);
+    }
+}
+
 /// Every systemd --user unit search directory (systemd.unit(5) "User Unit Search Path"); only the
-/// fallback when the user manager cannot be asked.
+/// fallback when the user manager cannot be asked. It is deliberately a superset (bd herdr-waz6):
+/// the bridge's environment is not the manager's, so the home defaults count even when
+/// XDG_CONFIG_HOME or XDG_DATA_HOME point elsewhere (codex hwaz6-r3), and the vendor data dirs
+/// whatever XDG_DATA_DIRS says (hwaz6-r2). An extra directory can only turn "absent" into
+/// "installed", which costs a refusal; a missing one let the bridge spawn beside the unit.
 fn unit_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let var = |name: &str| env(name).filter(|value| !value.is_empty());
     let home = var("HOME").map(PathBuf::from);
@@ -325,6 +351,11 @@ fn unit_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
     if let Some(config_home) = &config_home {
         dirs.push(config_home.join("systemd/user"));
     }
+    if let Some(home) = &home {
+        for default in [".config/systemd/user.control", ".config/systemd/user"] {
+            push_unique(&mut dirs, home.join(default));
+        }
+    }
     dirs.extend(config_dirs.iter().map(|dir| dir.join("systemd/user")));
     dirs.push("/etc/systemd/user".into());
     if let Some(runtime) = &runtime {
@@ -337,14 +368,14 @@ fn unit_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
     if let Some(data_home) = &data_home {
         dirs.push(data_home.join("systemd/user"));
     }
+    if let Some(home) = &home {
+        push_unique(&mut dirs, home.join(".local/share/systemd/user"));
+    }
     dirs.extend(data_dirs.iter().map(|dir| dir.join("systemd/user")));
     // systemd searches the vendor data dirs whatever XDG_DATA_DIRS says (`systemd-analyze --user
     // unit-paths` with XDG_DATA_DIRS=/opt/x still lists both; codex hwaz6-r2).
     for vendor in ["/usr/local/share/systemd/user", "/usr/share/systemd/user"] {
-        let vendor = PathBuf::from(vendor);
-        if !dirs.contains(&vendor) {
-            dirs.push(vendor);
-        }
+        push_unique(&mut dirs, PathBuf::from(vendor));
     }
     dirs.push("/usr/local/lib/systemd/user".into());
     dirs.push("/usr/lib/systemd/user".into());
@@ -903,6 +934,17 @@ mod tests {
         let dirs = unit_dirs(&xdg);
         assert!(dirs.contains(&PathBuf::from("/cfg/systemd/user")));
         assert!(dirs.contains(&PathBuf::from("/data/systemd/user")));
+        // ...and the home defaults stay in: the redirect is the bridge's, not the manager's (hwaz6-r3).
+        for home_default in [
+            "/home/u/.config/systemd/user.control",
+            "/home/u/.config/systemd/user",
+            "/home/u/.local/share/systemd/user",
+        ] {
+            assert!(
+                dirs.contains(&PathBuf::from(home_default)),
+                "{home_default} missing from {dirs:?}"
+            );
+        }
         // XDG_DATA_DIRS that leaves out the vendor dirs: systemd still searches them, once each.
         let custom_data = |name: &str| -> Option<std::ffi::OsString> {
             match name {
@@ -929,6 +971,64 @@ mod tests {
             1,
             "{defaults:?}"
         );
+    }
+
+    // codex hwaz6-r3 P1: no reachable manager and XDG_CONFIG_HOME/XDG_DATA_HOME redirected; the unit
+    // lives in the home default. It must read installed, never absent (absent = a direct spawn).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn redirected_xdg_dirs_still_find_the_home_unit_without_a_manager() {
+        let root = temp_root("redirect");
+        let home = root.join("home");
+        let unit_dir = home.join(".config/systemd/user");
+        let alt = root.join("alt");
+        std::fs::create_dir_all(&unit_dir).unwrap();
+        std::fs::create_dir_all(&alt).unwrap();
+        std::fs::write(unit_dir.join(HERDR_UNIT), "[Service]\n").unwrap();
+        let env = |name: &str| -> Option<std::ffi::OsString> {
+            match name {
+                "HOME" => Some(home.clone().into_os_string()),
+                "XDG_CONFIG_HOME" | "XDG_DATA_HOME" => Some(alt.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let no_bus = |_: &[&str]| -> io::Result<SystemctlOutput> {
+            Ok(SystemctlOutput {
+                success: false,
+                status: "exit status: 1".into(),
+                stdout: String::new(),
+                stderr: "Failed to connect to user scope bus".into(),
+            })
+        };
+        assert_eq!(
+            herdr_unit_state(&no_bus, &unit_dirs(&env)),
+            UnitState::Installed
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn systemctl_is_addressed_at_the_user_manager_runtime_dir() {
+        type Envs = Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>;
+        let envs = |command: &std::process::Command| -> Envs {
+            command
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(|v| v.to_os_string())))
+                .collect()
+        };
+        let addressed = systemctl_command(&["--user", "show"], Some(Path::new("/run/user/1000")));
+        let set = envs(&addressed);
+        assert!(
+            set.contains(&("XDG_RUNTIME_DIR".into(), Some("/run/user/1000".into()))),
+            "{set:?}"
+        );
+        assert!(
+            set.contains(&("DBUS_SESSION_BUS_ADDRESS".into(), None)),
+            "{set:?}"
+        );
+        assert_eq!(addressed.get_args().collect::<Vec<_>>(), ["--user", "show"]);
+        // No running manager: the caller's environment is left as it is.
+        assert!(envs(&systemctl_command(&["--user", "show"], None)).is_empty());
     }
 
     #[test]

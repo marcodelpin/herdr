@@ -69,7 +69,7 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=21
+          expected=23
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
@@ -125,6 +125,22 @@ jobs:
             file: src/remote/host.rs
             perl: 's/for vendor in \["\/usr\/local\/share\/systemd\/user", "\/usr\/share\/systemd\/user"\]/for vendor in [] as [\&str; 0] \/* MUTANT *\//'
             expect: "unit_dirs_cover_every_user_search_path"
+          - name: home config default hidden by XDG_CONFIG_HOME
+            file: src/remote/host.rs
+            perl: 's/for default in \["\.config\/systemd\/user\.control", "\.config\/systemd\/user"\]/for default in [] as [\&str; 0] \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path redirected_xdg_dirs_still_find_the_home_unit_without_a_manager"
+          - name: home data default hidden by XDG_DATA_HOME
+            file: src/remote/host.rs
+            perl: 's/push_unique\(&mut dirs, home\.join\("\.local\/share\/systemd\/user"\)\);/let _ = home; \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: systemctl asked at the caller address
+            file: src/remote/host.rs
+            perl: 's/if let Some\(runtime\) = manager_runtime \{/if let Some(runtime) = None::<\&Path> { let _ = manager_runtime; \/* MUTANT *\//'
+            expect: "systemctl_is_addressed_at_the_user_manager_runtime_dir"
+          - name: caller dbus address kept
+            file: src/remote/host.rs
+            perl: 's/\n            \.env_remove\("DBUS_SESSION_BUS_ADDRESS"\);/; \/* MUTANT *\//'
+            expect: "systemctl_is_addressed_at_the_user_manager_runtime_dir"
           - name: symlink mask not seen
             file: src/remote/host.rs
             perl: 's/let masked = metadata.file_type\(\).is_symlink\(\)/let masked = false \/* MUTANT *\/ \&\& metadata.file_type().is_symlink()/'
