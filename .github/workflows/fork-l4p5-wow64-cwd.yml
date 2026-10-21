@@ -1,0 +1,77 @@
+# Fork-only workflow for herdr-l4p5 (not for upstream): windows_process_cwd_reads_normalized_
+# child_launch_directory went red on windows-latest image 20261018.275 (OS build 26100.33650)
+# while it stayed green on 20261007.264 (build 26100.33438). Several Windows jobs run so both
+# images get sampled; each prints the image, runs the cwd tests 25 times in a row (a flake shows
+# as a count, not as one lucky pass), then the whole crate test suite. bd herdr-l4p5.
+name: Fork l4p5 wow64 cwd
+
+on:
+  push:
+    branches: [ci/l4p5]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  windows-cwd:
+    name: windows cwd (${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c, d]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Build the tests
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            cargo nextest run --locked --bin herdr --no-run && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((attempt * 20))
+          done
+
+      - name: WOW64 cwd probe (diagnostic, never fails the job)
+        shell: bash
+        env:
+          L4P5_PROBE_ITERATIONS: "20"
+        run: |
+          cargo nextest run --locked --bin herdr --run-ignored only --no-capture -E 'test(/l4p5_wow64_cwd_probe/)' 2>&1 | grep -E 'L4P5PROBE|PASS|FAIL' || true
+
+      - name: Run the cwd tests 25 times
+        shell: bash
+        run: |
+          filter='test(/windows_process_cwd_/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline | tee cwd-tests.txt
+          fails=0
+          for i in $(seq 1 25); do
+            cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never --failure-output final -E "$filter" > run-$i.log 2>&1 || { fails=$((fails + 1)); echo "attempt $i FAILED"; cat run-$i.log; }
+          done
+          echo "L4P5STRESS failed=$fails of 25"
+          [ "$fails" = 0 ]
+
+      - name: Run the crate tests
+        if: ${{ !cancelled() }}
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never

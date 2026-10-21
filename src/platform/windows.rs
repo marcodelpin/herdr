@@ -4229,6 +4229,85 @@ mod tests {
         }
     }
 
+    // herdr-l4p5 CI diagnostic, not a gate: run with --run-ignored only. For each shell it
+    // waits until cmd.exe has really executed `cd` (marker file), then samples the x86 and
+    // the native PEB cwd for 10 s and prints when each one first shows the new directory.
+    #[test]
+    #[ignore = "herdr-l4p5 diagnostic"]
+    fn l4p5_wow64_cwd_probe() {
+        use std::path::PathBuf;
+        let iterations: usize = std::env::var("L4P5_PROBE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+        let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        let root = std::env::temp_dir().join(format!("Herdr-L4p5-Probe-{}", std::process::id()));
+        let changed = root.join("Changed");
+        fs::create_dir_all(&changed).expect("create probe dirs");
+        let root = super::normalize_cwd_for_launch_platform(&root);
+        let changed = super::normalize_cwd_for_launch_platform(&changed);
+        let native_cwd = |pid: u32| {
+            let process = super::ProcessHandle::open(
+                pid,
+                super::PROCESS_QUERY_LIMITED_INFORMATION | super::PROCESS_VM_READ,
+            )?;
+            let parameters = super::read_process_parameters(process.0)?;
+            super::read_unicode_string(process.0, parameters.current_directory.dos_path)
+                .map(PathBuf::from)
+        };
+        for shell in ["System32", "SysWOW64"] {
+            let shell = windows.join(shell).join("cmd.exe");
+            for iteration in 0..iterations {
+                let marker = root.join(format!("marker-{iteration}"));
+                let _ = fs::remove_file(&marker);
+                let mut child = Command::new(&shell)
+                    .args(["/D", "/Q", "/K"])
+                    .current_dir(&root)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn cmd");
+                let started = Instant::now();
+                use std::io::Write;
+                writeln!(
+                    child.stdin.as_ref().unwrap(),
+                    "cd /d \"{}\" & echo ok> \"{}\"\r",
+                    changed.display(),
+                    marker.display()
+                )
+                .expect("write cd");
+                let deadline = started + Duration::from_secs(10);
+                let (mut marker_ms, mut x86_ms, mut native_ms) = (None, None, None);
+                let (mut x86_last, mut native_last) = (None, None);
+                while Instant::now() < deadline
+                    && (marker_ms.is_none() || x86_ms.is_none() || native_ms.is_none())
+                {
+                    let elapsed = started.elapsed().as_millis();
+                    if marker_ms.is_none() && marker.is_file() {
+                        marker_ms = Some(elapsed);
+                    }
+                    x86_last = super::process_cwd(child.id());
+                    if x86_ms.is_none() && x86_last.as_ref() == Some(&changed) {
+                        x86_ms = Some(elapsed);
+                    }
+                    native_last = native_cwd(child.id());
+                    if native_ms.is_none() && native_last.as_ref() == Some(&changed) {
+                        native_ms = Some(elapsed);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                println!(
+                    "L4P5PROBE shell={} iter={iteration} marker_ms={marker_ms:?} reader_ms={x86_ms:?} native_ms={native_ms:?} reader_last={x86_last:?} native_last={native_last:?}",
+                    shell.display()
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn windows_shim_cwd_uses_only_an_unambiguous_direct_shell() {
         let cases = [
