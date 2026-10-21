@@ -102,7 +102,23 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedHerdr {
+    spawn_server_with_env(
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+        &[],
+    )
+}
+
+fn spawn_server_with_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
+    extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
@@ -131,6 +147,9 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -722,6 +741,72 @@ fn sigterm_answers_connections_that_have_not_finished_their_request() {
     assert!(
         wait_for_exit(&mut spawned.child, Duration::from_secs(15)),
         "server must stop on SIGTERM"
+    );
+    assert!(!api_socket.exists(), "api socket must be removed");
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+/// A SIGTERM that lands after the API socket accepts connections but before
+/// the event loop runs takes the shutdown drain as well (herdr-ir4j). Before
+/// the fix the signal still had its default disposition there and the process
+/// died with every accepted request unanswered. The test hook holds startup
+/// right after the API bind, so the signal lands in that window on every run.
+#[test]
+fn sigterm_during_startup_answers_requests_already_accepted() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &[("HERDR_TEST_HOLD_AFTER_API_BIND_MS", "2000")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
+
+    let mut clients = Vec::new();
+    for index in 0..8 {
+        let mut client = UnixStream::connect(&api_socket).expect("connect to a live server");
+        client
+            .write_all(
+                format!("{{\"id\":\"startup-{index}\",\"method\":\"workspace.list\",\"params\":{{}}}}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        clients.push(client);
+    }
+    // Still inside the held startup window: the hold lasts 2 s from the bind.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+
+    for (index, client) in clients.into_iter().enumerate() {
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut line = String::new();
+        let read = BufReader::new(client).read_line(&mut line);
+        assert!(
+            matches!(read, Ok(bytes) if bytes > 0) && line.ends_with('\n'),
+            "request {index} accepted during startup got no reply: {read:?} {line:?}"
+        );
+        assert!(
+            line.contains(&format!("\"id\":\"startup-{index}\""))
+                && (line.contains("\"result\"")
+                    || line.contains("\"code\":\"server_unavailable\"")),
+            "request {index}: {line}"
+        );
+    }
+
+    assert!(
+        wait_for_exit(&mut spawned.child, Duration::from_secs(30)),
+        "server must stop on a SIGTERM received during startup"
     );
     assert!(!api_socket.exists(), "api socket must be removed");
 

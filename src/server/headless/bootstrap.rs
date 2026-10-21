@@ -50,6 +50,7 @@ pub fn run_server() -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
+    hold_startup_after_api_bind_for_test();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -98,6 +99,19 @@ pub fn run_server() -> io::Result<()> {
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
     result
+}
+
+/// Test hook: holds startup right after the API socket binds, so an
+/// integration test can land a signal in the window before the event loop
+/// runs (herdr-ir4j). Capped so a stray value cannot stall a real start.
+fn hold_startup_after_api_bind_for_test() {
+    let Some(millis) = std::env::var("HERDR_TEST_HOLD_AFTER_API_BIND_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    std::thread::sleep(Duration::from_millis(millis.min(10_000)));
 }
 
 fn seed_startup_workspace_if_empty(app: &mut app::App) {
