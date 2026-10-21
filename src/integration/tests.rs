@@ -5468,3 +5468,54 @@ fn claude_windows_hook_bounds_claude_pid_to_u32_and_still_reports() {
     }
     let _ = fs::remove_dir_all(base);
 }
+
+// herdr-wf1f: version 11 once named two different claude hooks (the fork's
+// and upstream's), and a number-only check read both as current. At the
+// expected version the installed text must also be the bundled asset.
+#[test]
+fn claude_hook_with_expected_version_but_other_content_is_outdated() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let hook_path = base.join(CLAUDE_HOOK_INSTALL_NAME);
+    fs::create_dir_all(&base).unwrap();
+    let status = |content: &str| {
+        fs::write(&hook_path, content).unwrap();
+        integration_status_at(
+            crate::api::schema::IntegrationTarget::Claude,
+            hook_path.clone(),
+            CLAUDE_INTEGRATION_VERSION,
+        )
+    };
+
+    let current = status(CLAUDE_HOOK_ASSET);
+    assert_eq!(current.installed_version, Some(CLAUDE_INTEGRATION_VERSION));
+    assert_eq!(current.state, IntegrationStatusKind::Current);
+
+    // another hook carrying the same version number
+    let other = format!(
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION={CLAUDE_INTEGRATION_VERSION}\n"
+    );
+    let collided = status(&other);
+    assert_eq!(collided.installed_version, Some(CLAUDE_INTEGRATION_VERSION));
+    assert_eq!(collided.state, IntegrationStatusKind::Outdated);
+
+    // the bundled asset with one line changed is a different hook too
+    let edited = CLAUDE_HOOK_ASSET.replacen("CLAUDE_PID", "CLAUDE_PID_X", 1);
+    assert_ne!(edited, CLAUDE_HOOK_ASSET);
+    assert_eq!(status(&edited).state, IntegrationStatusKind::Outdated);
+
+    // line endings alone do not make a different hook
+    let crlf = CLAUDE_HOOK_ASSET
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_eq!(status(&crlf).state, IntegrationStatusKind::Current);
+
+    // a hook from a newer herdr is not compared with this build's asset
+    let newer = format!(
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION={}\n",
+        CLAUDE_INTEGRATION_VERSION + 1
+    );
+    assert_eq!(status(&newer).state, IntegrationStatusKind::Current);
+
+    let _ = fs::remove_dir_all(base);
+}

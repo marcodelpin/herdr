@@ -441,6 +441,12 @@ fn opencode_tui_integration_is_valid(plugin_path: &Path, expected_version: u32) 
             .is_some_and(|version| version >= expected_version)))
 }
 
+/// Whether the installed file is the bundled asset, ignoring CRLF versus LF.
+fn installed_text_matches_asset(path: &Path, asset: &str) -> bool {
+    fs::read_to_string(path)
+        .is_ok_and(|content| content.replace("\r\n", "\n") == asset.replace("\r\n", "\n"))
+}
+
 fn integration_state_for_path(
     path: &Path,
     expected_version: u32,
@@ -481,6 +487,17 @@ pub(crate) fn integration_status_at(
     if target == crate::api::schema::IntegrationTarget::Opencode
         && state == super::IntegrationStatusKind::Current
         && !opencode_tui_integration_is_valid(&path, expected_version)
+    {
+        state = super::IntegrationStatusKind::Outdated;
+    }
+    // One version number has named two different claude hooks (the fork's and
+    // upstream's at 11), so at this build's version the installed text must
+    // also be the bundled asset (herdr-wf1f). A newer version is left alone.
+    if target == crate::api::schema::IntegrationTarget::Claude
+        && state == super::IntegrationStatusKind::Current
+        && expected_version == super::CLAUDE_INTEGRATION_VERSION
+        && installed_version == Some(expected_version)
+        && !installed_text_matches_asset(&path, super::CLAUDE_HOOK_ASSET)
     {
         state = super::IntegrationStatusKind::Outdated;
     }
