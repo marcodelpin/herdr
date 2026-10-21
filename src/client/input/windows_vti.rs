@@ -4498,7 +4498,9 @@ mod tests {
         );
     }
 
-    fn key_codes(events: &[crate::protocol::ClientInputEvent]) -> Vec<crate::protocol::ClientKeyCode> {
+    fn key_codes(
+        events: &[crate::protocol::ClientInputEvent],
+    ) -> Vec<crate::protocol::ClientKeyCode> {
         events
             .iter()
             .filter_map(|event| match event {
