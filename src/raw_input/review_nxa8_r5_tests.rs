@@ -261,6 +261,87 @@ fn review_r5_2c_escape_aborts_a_truncated_control_string() {
     );
 }
 
+/// Same class as codex f5251-r5 finding 2, found by the extended property
+/// stream (ADR-0013 amendment 1, D1): a colour reply cut off before its
+/// terminator, whose header an idle release dropped. Its tail is held in the
+/// header's context. When a byte that ends the reply's shape comes (an
+/// ESC-led key, a typed letter) or the context's deadline passes, the tail
+/// is reply bytes once header and tail spell the reply through `rgb:`, and
+/// is dropped, after a semantic key or not. Before, only after a semantic
+/// key: otherwise the tail was typed. A shorter shape is what typing after
+/// Alt+] gives (#344), and stays typed. On the Unix reader and on the pump,
+/// with a colour reply awaited or not.
+#[test]
+fn review_r5_2e_unterminated_colour_reply_tail_is_not_typed() {
+    // (header, tail, the input that ends the reply, what reaches the pane)
+    let cases: [(&[u8], &[u8], &[u8], &[&[u8]]); 8] = [
+        (
+            b"\x1b]4;171;rgb:b397/69a",
+            b"b/5249",
+            b"\x1bOP",
+            &[b"\x1bOP"],
+        ),
+        (b"\x1b]4;171;rgb:b397/69a", b"b/5249", b"x", &[b"x"]),
+        (b"\x1b]4;171;rgb:b397/69a", b"b/5249", b"", &[]),
+        (
+            b"\x1b]4",
+            b";192;rgb:21ec/c639/488b",
+            b"\x1b[A",
+            &[b"\x1b[A"],
+        ),
+        (b"\x1b]", b"11;rgb:aaaa/bbbb/cc", b"\x1b[A", &[b"\x1b[A"]),
+        (b"\x1b]", b"11;rgb:aaaa/bbbb/cc", b"", &[]),
+        (b"\x1b]11;rgb:aaaa/bbbb/cccc", b"\x1b", b"[A", &[b"\x1b[A"]),
+        (b"\x1b]", b"1a", b"\r", &[b"1a\r"]),
+    ];
+    let mut wrong = Vec::new();
+    for pump in [false, true] {
+        // After the idle release dropped the header, inside its tail hold.
+        let at = if pump { 30 } else { 600 };
+        for query in [false, true] {
+            for (header, tail, end, expected) in cases {
+                let base = Instant::now();
+                let mut framer = RawInputByteFramer::with_host_input_policy(false);
+                framer.set_test_clock(base);
+                if query {
+                    framer.host_color_query_sent();
+                }
+                let mut reads = vec![(0, header), (at, tail)];
+                if !end.is_empty() {
+                    reads.push((at + 100, end));
+                }
+                let events: Vec<RawInputEvent> = if pump {
+                    framer.set_pump_policy();
+                    let mut chunks = Vec::new();
+                    let mut now = 0;
+                    for (read_at, bytes) in reads {
+                        chunks.extend(ticks(&mut framer, base, now, read_at));
+                        chunks.extend(push_at(&mut framer, base, read_at, bytes));
+                        now = read_at;
+                    }
+                    chunks.extend(ticks(&mut framer, base, now, 5_000));
+                    events_from_framed_chunks(chunks)
+                } else {
+                    unix_reader(&mut framer, base, &reads, 5_000)
+                        .iter()
+                        .flat_map(|chunk| parse_framed_input(chunk))
+                        .collect()
+                };
+                let expected: Vec<Vec<u8>> = expected.iter().map(|run| run.to_vec()).collect();
+                if typed_runs(&events) != expected || framer.has_pending_input() {
+                    wrong.push(format!(
+                        "pump={pump} query={query} {} then {} then {}: {events:?}",
+                        header.escape_ascii(),
+                        tail.escape_ascii(),
+                        end.escape_ascii()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// The same rule after an idle release dropped an OSC header that ended in
 /// ESC (ADR-0013 amendment 1, D1): that ESC was only the possible start of
 /// the ST. `\` completes the ST and is dropped; `[` disproves it, so the ESC
