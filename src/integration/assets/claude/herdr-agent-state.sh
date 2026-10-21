@@ -69,10 +69,14 @@ agent_pid_raw = os.environ.get("CLAUDE_PID")
 agent_pid = None
 # herdr's agent_pid is a u32 pid: forward only plain decimal digits in
 # 1..=4294967295 and omit anything else, so the report itself still lands.
+# Zero padding is allowed; at most 10 significant digits reach int(), which
+# refuses very long digit strings.
 if agent_pid_raw and agent_pid_raw.isascii() and agent_pid_raw.isdigit():
-    parsed_pid = int(agent_pid_raw)
-    if 1 <= parsed_pid <= 4294967295:
-        agent_pid = parsed_pid
+    significant_pid = agent_pid_raw.lstrip("0")
+    if 1 <= len(significant_pid) <= 10:
+        parsed_pid = int(significant_pid)
+        if parsed_pid <= 4294967295:
+            agent_pid = parsed_pid
 raw_cwd = hook_input.get("cwd")
 agent_session_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
 
