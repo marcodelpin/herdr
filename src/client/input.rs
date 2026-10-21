@@ -25,6 +25,8 @@ use super::ClientLoopEvent;
 
 #[cfg(any(windows, test))]
 pub(super) mod windows_vti;
+#[cfg(test)]
+pub(crate) use windows_vti::PumpUnderTest;
 
 // ---------------------------------------------------------------------------
 // Stdin reader thread

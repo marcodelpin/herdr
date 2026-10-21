@@ -104,6 +104,10 @@ pub enum RawInputEvent {
 #[cfg(any(windows, test))]
 pub(crate) struct RawInputFramer {
     byte_framer: RawInputByteFramer,
+    /// Bytes the byte framer released as chunks, for the property test's
+    /// I5 check on the production pump (ADR-0013 D2).
+    #[cfg(test)]
+    released: usize,
 }
 
 #[cfg(any(windows, test))]
@@ -121,7 +125,19 @@ impl RawInputFramer {
 
     fn with_byte_framer(mut byte_framer: RawInputByteFramer) -> Self {
         byte_framer.set_pump_policy();
-        Self { byte_framer }
+        Self {
+            byte_framer,
+            #[cfg(test)]
+            released: 0,
+        }
+    }
+
+    fn events(&mut self, chunks: Vec<Vec<u8>>) -> Vec<RawInputEvent> {
+        #[cfg(test)]
+        {
+            self.released += chunks.iter().map(Vec::len).sum::<usize>();
+        }
+        events_from_framed_chunks(chunks)
     }
 
     /// Moves this framer's clock `by` into the future, as the pump's console
@@ -145,7 +161,8 @@ impl RawInputFramer {
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<RawInputEvent> {
-        events_from_framed_chunks(self.byte_framer.push(data))
+        let chunks = self.byte_framer.push(data);
+        self.events(chunks)
     }
 
     #[cfg(any(windows, test))]
@@ -172,7 +189,8 @@ impl RawInputFramer {
     }
 
     pub(crate) fn flush_timeout(&mut self) -> Vec<RawInputEvent> {
-        events_from_framed_chunks(self.byte_framer.flush_timeout())
+        let chunks = self.byte_framer.flush_timeout();
+        self.events(chunks)
     }
 
     pub(crate) fn flush_keyboard_escape(&mut self) -> Vec<RawInputEvent> {
@@ -180,7 +198,7 @@ impl RawInputFramer {
             let escape = std::mem::take(&mut self.byte_framer.buffer);
             self.byte_framer
                 .open_tail_hold(HoldAfter::Escape { color_reply: false });
-            events_from_framed_chunks(vec![escape])
+            self.events(vec![escape])
         } else {
             self.flush_timeout()
         }
@@ -190,7 +208,8 @@ impl RawInputFramer {
     /// interval: what was held is input and goes first. A host reply prefix
     /// inside its reply window stays (ADR-0013 D1).
     pub(crate) fn flush_interrupted(&mut self) -> Vec<RawInputEvent> {
-        events_from_framed_chunks(self.byte_framer.flush_interrupted())
+        let chunks = self.byte_framer.flush_interrupted();
+        self.events(chunks)
     }
 }
 

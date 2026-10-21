@@ -845,6 +845,80 @@ impl WindowsInputTranslator {
     }
 }
 
+/// Test handle for the raw-input hold property test
+/// (`raw_input::hold_property_tests`): the production mapper and pump under
+/// the caller's clock. Raw reads enter the pump as the mapper hands them
+/// over, key records go through the mapper (ADR-0013 D6).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PumpUnderTest(WindowsInputTranslator);
+
+#[cfg(test)]
+impl PumpUnderTest {
+    pub(crate) fn framer(&self) -> &crate::raw_input::RawInputFramer {
+        &self.0.pump.framer
+    }
+
+    pub(crate) fn framer_mut(&mut self) -> &mut crate::raw_input::RawInputFramer {
+        &mut self.0.pump.framer
+    }
+
+    /// Raw input bytes, as the mapper's win32-input-mode framer passes them
+    /// on.
+    pub(crate) fn bytes(&mut self, bytes: &[u8]) -> Vec<crate::protocol::ClientInputEvent> {
+        self.0
+            .pump
+            .process(PlatformInputItem::Bytes(bytes.to_vec()))
+    }
+
+    /// A native console key record.
+    pub(crate) fn key(
+        &mut self,
+        record: WindowsKeyRecord,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        self.0.translate(WindowsInputRecord::Key(record))
+    }
+
+    /// A key record serialized in win32-input-mode, one console record per
+    /// character, as the host sends it.
+    pub(crate) fn serialized_key(
+        &mut self,
+        record: WindowsKeyRecord,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let serialized = format!(
+            "\x1b[{};{};{};{};{};{}_",
+            record.virtual_key_code,
+            record.virtual_scan_code,
+            record.unicode,
+            u16::from(record.key_down),
+            record.control_key_state,
+            record.repeat_count,
+        );
+        let mut events = Vec::new();
+        for unit in serialized.encode_utf16() {
+            events.extend(self.0.translate(WindowsInputRecord::Key(WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: 0,
+                virtual_scan_code: 0,
+                unicode: unit,
+                control_key_state: 0,
+            })));
+        }
+        events
+    }
+
+    /// One idle tick at the framer's clock; the caller moves the clock.
+    pub(crate) fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for item in self.0.mapper.idle() {
+            events.extend(self.0.pump.process(item));
+        }
+        events.extend(self.0.pump.idle());
+        events
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct WindowsMouseButtons {
     left: bool,
