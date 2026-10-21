@@ -64,7 +64,7 @@ jobs:
       # of the animated-working-indicator workflow (run 34568308787), taking every later
       # test with it.
       - name: Run the crate tests
-        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+        run: cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --final-status-level slow --failure-output final --success-output never
 
       # The fork's own tests, by name: 10 platform-agnostic pure tests of resume_command()
       # (the stock path, the launcher-prefix composition, verbatim spacing, control-character
