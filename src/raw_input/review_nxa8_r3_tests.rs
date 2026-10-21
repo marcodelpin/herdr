@@ -167,7 +167,7 @@ fn review_r3_1_interruption_emits_escape_found_after_held_text() {
     let mut framer = RawInputFramer::default();
     framer.byte_framer.host_color_query_sent();
     assert!(framer.push(b"\x1b]4;50;").is_empty());
-    assert!(framer.flush_timeout().is_empty());
+    assert!(framer.idle_tick().is_empty());
     assert!(framer.push(b"a").is_empty());
     assert!(framer.push(b"\x1b").is_empty());
 

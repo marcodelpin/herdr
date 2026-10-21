@@ -99,19 +99,44 @@ pub enum RawInputEvent {
     Unsupported,
 }
 
-/// Byte framer plus event decoding, for the Windows input pump.
+/// Byte framer plus event decoding, for the Windows input pump. Its byte
+/// framer runs the pump policy (ADR-0013 D2, D4).
 #[cfg(any(windows, test))]
-#[derive(Default)]
 pub(crate) struct RawInputFramer {
     byte_framer: RawInputByteFramer,
 }
 
 #[cfg(any(windows, test))]
+impl Default for RawInputFramer {
+    fn default() -> Self {
+        Self::with_byte_framer(RawInputByteFramer::default())
+    }
+}
+
+#[cfg(any(windows, test))]
 impl RawInputFramer {
     pub(crate) fn for_host_input() -> Self {
-        Self {
-            byte_framer: RawInputByteFramer::for_host_input(),
-        }
+        Self::with_byte_framer(RawInputByteFramer::for_host_input())
+    }
+
+    fn with_byte_framer(mut byte_framer: RawInputByteFramer) -> Self {
+        byte_framer.set_pump_policy();
+        Self { byte_framer }
+    }
+
+    /// Moves this framer's clock `by` into the future, as the pump's console
+    /// wait does between idle ticks (test translator only).
+    #[cfg(test)]
+    pub(crate) fn advance_test_clock(&mut self, by: Duration) {
+        self.byte_framer.test_clock_skew += by;
+    }
+
+    /// One pump idle tick: the console wait passed with no record, then the
+    /// pump flushes (ADR-0013 D2).
+    #[cfg(test)]
+    pub(crate) fn idle_tick(&mut self) -> Vec<RawInputEvent> {
+        self.advance_test_clock(PUMP_IDLE_QUIET);
+        self.flush_timeout()
     }
 
     #[cfg(any(windows, test))]
@@ -137,8 +162,13 @@ impl RawInputFramer {
         self.byte_framer.has_pending_bracketed_paste()
     }
 
+    /// An X10 mouse report is in progress: `ESC [ M` and fewer than three
+    /// report bytes are pending, or the context of a released `ESC` / `ESC [`
+    /// holds the rest of one (ADR-0013 D4). The framer's context answers,
+    /// not the buffer's shape alone.
     pub(crate) fn has_pending_default_mouse_sequence(&self) -> bool {
         starts_with_incomplete_default_mouse_sequence(&self.byte_framer.buffer)
+            || self.byte_framer.holds_x10_tail()
     }
 
     pub(crate) fn flush_timeout(&mut self) -> Vec<RawInputEvent> {
@@ -156,8 +186,9 @@ impl RawInputFramer {
         }
     }
 
-    /// Semantic input ends every hold, unlike another idle interval: what was
-    /// held is input and goes first.
+    /// Semantic input ends every report and key hold, unlike another idle
+    /// interval: what was held is input and goes first. A host reply prefix
+    /// inside its reply window stays (ADR-0013 D1).
     pub(crate) fn flush_interrupted(&mut self) -> Vec<RawInputEvent> {
         events_from_framed_chunks(self.byte_framer.flush_interrupted())
     }
@@ -205,6 +236,12 @@ pub(crate) struct RawInputByteFramer {
     tail_hold: Option<TailHold>,
     #[cfg(test)]
     test_clock: Option<Instant>,
+    /// Added to the clock, fixed or real (test translator idle ticks).
+    #[cfg(test)]
+    test_clock_skew: Duration,
+    /// The Windows pump drives this framer (ADR-0013 D2, D4).
+    #[cfg(any(windows, test))]
+    pump_policy: bool,
     host_color_replies_awaited: u16,
     #[cfg(any(windows, test))]
     host_default_color_query_issued: bool,
@@ -246,8 +283,10 @@ enum HoldAfter {
     DroppedPrefix(Vec<u8>),
     /// An incomplete OSC string was dropped at its idle timeout; colour reply
     /// payload through BEL or ST is its tail. `split_st` when the dropped
-    /// bytes ended in the ESC of an ST, so a lone `\` completes it.
-    OscHeader { split_st: bool },
+    /// bytes ended in the ESC of an ST, so a lone `\` completes it. `header`
+    /// is what was dropped (at most the report budget), so an interruption
+    /// can tell a colour reply from text (ADR-0013 D1).
+    OscHeader { split_st: bool, header: Vec<u8> },
     /// A confirmed host sends Escape as `CSI 27u`, so the `ESC` / `ESC [` the
     /// first `len` buffered bytes hold may still get a delayed mouse tail (#3480).
     #[cfg(unix)]
@@ -260,15 +299,36 @@ struct TailHold {
     /// When the context opened. Its deadline is derived, never stored: see
     /// `tail_hold_deadline`.
     opened_at: Instant,
+    /// A semantic key came while it held a colour reply's tail: from then on
+    /// its reply-shaped bytes complete the reply or are dropped, never typed
+    /// after that key (ADR-0013 D1, I4').
+    interrupted: bool,
 }
 
-/// How a release treats bytes that could still wait (ADR-0012 D1).
+/// How a release treats bytes that could still wait (ADR-0013 D1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Release {
-    /// An idle interval: bytes may stay held, each within its named bound.
+    /// A reader waited idle: bytes may stay held, each within its named bound.
     Idle,
-    /// Semantic input, or a byte past its last bound: nothing stays held.
+    /// The pump says it is idle; that is not evidence the newest byte is
+    /// quiet. As `Idle`, but a lossy disposal waits until the newest
+    /// pending byte is `PUMP_IDLE_QUIET` old (ADR-0013 D2).
+    PumpIdle,
+    /// Semantic input: report and key holds end. A host reply prefix inside
+    /// its reply window is not input and stays.
     Interrupt,
+    /// A byte past its last bound: nothing stays held.
+    Backstop,
+}
+
+impl Release {
+    fn idle(self) -> bool {
+        matches!(self, Release::Idle | Release::PumpIdle)
+    }
+
+    fn interrupt(self) -> bool {
+        !self.idle()
+    }
 }
 
 /// What the bytes in `buffer` are, given what was disposed of before them.
@@ -278,11 +338,53 @@ enum Verdict {
     Emit,
     /// The first `n` complete the disposed report: drop them.
     Drop(usize),
-    /// The first `n` complete a reply whose ESC was released: put ESC back
-    /// so the whole reply parses as one.
+    /// The first `n` complete a reply (or, on the pump, an X10 report) whose
+    /// prefix was released: put the prefix back so the whole parses as one.
     Rejoin(usize),
     /// They can still complete it: wait, until the deadline.
     Hold,
+}
+
+impl HoldAfter {
+    /// How many leading bytes of `tail` still spell a colour reply after
+    /// what this context dropped or released (0 for key and report contexts).
+    fn reply_shaped_len(&self, tail: &[u8]) -> usize {
+        let before: &[u8] = match self {
+            HoldAfter::OscHeader { header, .. } => header,
+            HoldAfter::Escape { color_reply: true } => &[ESC],
+            _ => return 0,
+        };
+        let mut reply = before.to_vec();
+        let mut len = 0;
+        for byte in tail.iter().take(MAX_DISCARDED_CONTROL_TAIL_BYTES) {
+            reply.push(*byte);
+            if !is_color_reply_shape_prefix(&reply) {
+                break;
+            }
+            len += 1;
+        }
+        len
+    }
+
+    /// The bytes a released context sent to the pane as a key.
+    fn released_prefix(&self) -> &'static [u8] {
+        match self {
+            HoldAfter::CsiIntroducer => b"\x1b[",
+            _ => &[ESC],
+        }
+    }
+
+    /// The length of an incomplete X10 report tail `tail` starts with after
+    /// this released context (`[M..` after ESC, `M..` after `ESC [`).
+    fn incomplete_x10_tail_len(&self, tail: &[u8]) -> Option<usize> {
+        let marker: &[u8] = match self {
+            HoldAfter::Escape { .. } => b"[M",
+            HoldAfter::CsiIntroducer => b"M",
+            _ => return None,
+        };
+        let report = tail.strip_prefix(marker)?;
+        (report.len() < 3 && report.iter().all(|byte| *byte >= 0x20)).then_some(tail.len())
+    }
 }
 
 impl HoldAfter {
@@ -302,11 +404,12 @@ impl HoldAfter {
 
 /// Classifies the pending bytes `tail` against what was disposed of before
 /// them. `burst` says every pending byte arrived within `ORPHAN_TAIL_BURST`
-/// of the first. Pure: the deadline is checked by the caller first.
-fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool) -> Verdict {
+/// of the first; `pump` that the Windows pump drives the framer (ADR-0013
+/// D4). Pure: the deadline is checked by the caller first.
+fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool, pump: bool) -> Verdict {
     match after {
         HoldAfter::Escape { .. } if tail.first() == Some(&b'[') => {
-            classify_report_continuation(&[ESC], tail, true, burst)
+            classify_report_continuation(&[ESC], tail, true, burst, pump)
         }
         HoldAfter::Escape { color_reply: true } if tail.first() == Some(&b']') => {
             match orphaned_color_reply_tail(tail) {
@@ -322,11 +425,13 @@ fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool) -> Verdict {
             }
         }
         HoldAfter::Escape { .. } => Verdict::Emit,
-        HoldAfter::CsiIntroducer => classify_report_continuation(b"\x1b[", tail, true, burst),
+        HoldAfter::CsiIntroducer => classify_report_continuation(b"\x1b[", tail, true, burst, pump),
         HoldAfter::DroppedPrefix(prefix) => {
-            classify_report_continuation(prefix, tail, false, burst)
+            classify_report_continuation(prefix, tail, false, burst, pump)
         }
-        HoldAfter::OscHeader { split_st: true } if tail.first() == Some(&b'\\') => Verdict::Drop(1),
+        HoldAfter::OscHeader { split_st: true, .. } if tail.first() == Some(&b'\\') => {
+            Verdict::Drop(1)
+        }
         HoldAfter::OscHeader { .. } => match classify_discarded_osc_tail(tail) {
             DiscardedOscTail::Pending => Verdict::Hold,
             DiscardedOscTail::Terminated(len) => Verdict::Drop(len),
@@ -343,11 +448,16 @@ fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool) -> Verdict {
 /// prefix reached the pane as a key: a key or X10 tail after it is dropped
 /// only when it arrived as one `burst`, since typing can spell one. An SGR
 /// mouse tail cannot be typed by accident and is dropped however it came.
+/// On the Windows `pump`, typed keys never reach the framer as bytes, so an
+/// X10 tail after a released prefix is the report at any spread: it is put
+/// back together, so the pump accepts the key records it staged for it
+/// (ADR-0013 D4).
 fn classify_report_continuation(
     prefix: &[u8],
     tail: &[u8],
     released: bool,
     burst: bool,
+    pump: bool,
 ) -> Verdict {
     let mut report = prefix.to_vec();
     report.extend_from_slice(&tail[..tail.len().min(MAX_DISCARDED_CONTROL_TAIL_BYTES)]);
@@ -385,7 +495,11 @@ fn classify_report_continuation(
             } else if report.len() < X10_LEN {
                 Verdict::Hold
             } else if parse_default_mouse(&report[..X10_LEN]).is_some() {
-                complete(X10_LEN)
+                if released && pump {
+                    Verdict::Rejoin(X10_LEN - prefix.len())
+                } else {
+                    complete(X10_LEN)
+                }
             } else {
                 Verdict::Emit
             }
@@ -455,6 +569,9 @@ const DISAMBIGUATED_MOUSE_TAIL_LIMIT: Duration =
 /// the idle flush interval, which is what one read means to the reader.
 /// Typing the same bytes takes one keystroke each, tens of ms apart.
 const ORPHAN_TAIL_BURST: Duration = Duration::from_millis(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS as u64);
+/// A pump idle is evidence that a sequence ended only once its newest byte
+/// is this old: one idle flush interval (ADR-0013 D2).
+const PUMP_IDLE_QUIET: Duration = Duration::from_millis(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS as u64);
 /// Backstop for every pending byte except an unterminated bracketed paste:
 /// past this age it is released as on an interruption (ADR-0012 D2). The
 /// longest named hold plus one split-read wait, so no named hold reaches it.
@@ -483,6 +600,108 @@ pub(crate) fn reader_idle_wait(
     }
 }
 
+/// The framer side of the Unix stdin reader loop, one turn at a time
+/// (ADR-0013 D3). The reader and the property harness both run it, so an
+/// empty filtered read takes the production path in tests too.
+#[cfg(any(unix, test))]
+#[derive(Debug, Default)]
+pub(crate) struct ReaderSchedule {
+    /// When the bytes the framer last received get their idle flush, or,
+    /// after a flush that kept bytes, when the framer is next due.
+    idle_flush_at: Option<Instant>,
+}
+
+#[cfg(any(unix, test))]
+impl ReaderSchedule {
+    /// The one wait before `read()`, rounded up to whole milliseconds, and
+    /// whether the framer is due when it ends idle (ADR-0012 D4).
+    pub(crate) fn wait(
+        &self,
+        framer: &RawInputByteFramer,
+        direct_pending: bool,
+    ) -> Option<(i32, bool)> {
+        let now = framer.now();
+        let idle = self
+            .idle_flush_at
+            .filter(|_| framer.has_pending_input())
+            .map(|at| ceil_ms(at.saturating_duration_since(now)));
+        let framer_wait = match (idle, framer.held_input_release_ms()) {
+            (Some(idle), Some(release)) => Some(idle.min(release)),
+            (idle, release) => idle.or(release),
+        };
+        reader_idle_wait(framer_wait, direct_pending)
+    }
+
+    /// A read woke the reader; `filtered` is what the direct-graphics filter
+    /// let through, possibly nothing. Every wake runs the framer's due
+    /// releases first. Only bytes the framer receives restart its idle
+    /// interval; a wake that brought it none flushes it when that interval
+    /// (or its release time) has passed (ADR-0013 D3).
+    pub(crate) fn on_read(
+        &mut self,
+        framer: &mut RawInputByteFramer,
+        filtered: Vec<Vec<u8>>,
+        mouse_capture: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut chunks = framer.release_due();
+        let mut received = false;
+        for chunk in filtered.into_iter().filter(|chunk| !chunk.is_empty()) {
+            received = true;
+            chunks.extend(framer.push(&chunk));
+        }
+        let now = framer.now();
+        if received {
+            self.arm_idle_flush(framer, mouse_capture);
+        } else if framer.has_pending_input() && self.idle_flush_at.is_some_and(|at| now >= at) {
+            chunks.extend(self.flush(framer));
+        }
+        chunks
+    }
+
+    /// The wait ended with no input. `released` is what the graphics filter
+    /// let go because no response is awaited any more.
+    pub(crate) fn on_idle(
+        &mut self,
+        framer: &mut RawInputByteFramer,
+        released: Option<Vec<u8>>,
+        framer_due: bool,
+        mouse_capture: bool,
+    ) -> Vec<Vec<u8>> {
+        if let Some(data) = released {
+            let chunks = framer.push(&data);
+            self.arm_idle_flush(framer, mouse_capture);
+            chunks
+        } else if framer_due {
+            self.flush(framer)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn arm_idle_flush(&mut self, framer: &RawInputByteFramer, mouse_capture: bool) {
+        self.idle_flush_at = Some(
+            framer.now()
+                + Duration::from_millis(framer.idle_flush_timeout_ms(mouse_capture) as u64),
+        );
+    }
+
+    fn flush(&mut self, framer: &mut RawInputByteFramer) -> Vec<Vec<u8>> {
+        let chunks = framer.flush_timeout();
+        let now = framer.now();
+        self.idle_flush_at = framer
+            .held_input_release_ms()
+            .map(|ms| now + Duration::from_millis(ms.max(0) as u64));
+        chunks
+    }
+}
+
+/// `duration` in whole milliseconds, rounded up, so a wait of it ends at or
+/// after the instant it was measured to.
+#[cfg(any(unix, test))]
+fn ceil_ms(duration: Duration) -> i32 {
+    i32::try_from(duration.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX)
+}
+
 impl RawInputByteFramer {
     pub(crate) fn for_host_input() -> Self {
         Self::with_host_input_policy(
@@ -499,16 +718,8 @@ impl RawInputByteFramer {
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         // Bounds are checked before the new bytes can be classified with the
-        // old ones: a byte past the backstop is released as on an
-        // interruption, an expired hold as if the reader had flushed at its
-        // deadline (ADR-0012 D2).
-        let mut chunks = if self.pending_input_expired() {
-            self.release_everything()
-        } else if self.tail_hold_expired() {
-            self.flush_timeout()
-        } else {
-            Vec::new()
-        };
+        // old ones (ADR-0012 D2).
+        let mut chunks = self.release_due();
         if data.is_empty() {
             chunks.extend(self.push_extended());
             return chunks;
@@ -546,12 +757,122 @@ impl RawInputByteFramer {
         self.drain_available_chunks()
     }
 
+    /// Runs every release that time alone has made due: a byte past the
+    /// backstop is released as past its last bound, an expired hold as if the
+    /// reader had flushed at its deadline. `push` and every reader wake run
+    /// it, whatever else they do (ADR-0013 D3).
+    pub(crate) fn release_due(&mut self) -> Vec<Vec<u8>> {
+        if self.pending_input_expired() {
+            self.release_everything(Release::Backstop)
+        } else if self.tail_hold_expired() {
+            self.flush_timeout()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(now) = self.test_clock {
-            return now;
+            return now + self.test_clock_skew;
         }
+        #[cfg(test)]
+        return Instant::now() + self.test_clock_skew;
+        #[cfg(not(test))]
         Instant::now()
+    }
+
+    #[cfg(any(windows, test))]
+    fn set_pump_policy(&mut self) {
+        self.pump_policy = true;
+    }
+
+    fn pump_policy(&self) -> bool {
+        #[cfg(any(windows, test))]
+        return self.pump_policy;
+        #[cfg(not(any(windows, test)))]
+        false
+    }
+
+    /// Whether the newest pending byte arrived at least `PUMP_IDLE_QUIET`
+    /// ago: only then is a pump idle evidence that no more of it is coming.
+    fn newest_pending_quiet(&self) -> bool {
+        let now = self.now();
+        self.buffer.is_empty()
+            || self
+                .arrivals
+                .back()
+                .is_none_or(|(_, at)| now.saturating_duration_since(*at) >= PUMP_IDLE_QUIET)
+    }
+
+    /// The open context of a released `ESC` / `ESC [` holds an incomplete X10
+    /// report tail (ADR-0013 D4).
+    #[cfg(any(windows, test))]
+    fn holds_x10_tail(&self) -> bool {
+        self.tail_hold
+            .as_ref()
+            .is_some_and(|hold| hold.after.incomplete_x10_tail_len(&self.buffer).is_some())
+            && !self.tail_hold_expired()
+    }
+
+    /// Bytes an interruption leaves pending: a colour reply prefix while its
+    /// reply is still awaited (the Windows default-colour window, or the
+    /// host reply window of a colour query). They can only complete the
+    /// reply or be dropped under its own bound, never reach the pane as
+    /// input (ADR-0013 D1).
+    fn interruption_keeps_pending(&self) -> bool {
+        if self.buffer.len() > MAX_DISCARDED_CONTROL_TAIL_BYTES {
+            return false;
+        }
+        if self.interruption_keeps_tail_hold() {
+            return true;
+        }
+        #[cfg(any(windows, test))]
+        if self.host_default_color_query_issued
+            && self
+                .host_default_color_query_deadline
+                .is_some_and(|deadline| self.now() < deadline)
+            && is_incomplete_host_default_color_prefix(&self.buffer)
+        {
+            return true;
+        }
+        self.host_color_replies_awaited > 0
+            && self.awaiting_host_reply()
+            && is_color_reply_shape_prefix(&self.buffer)
+            && !(starts_with_incomplete_default_color_response(&self.buffer)
+                && self.host_color_reply_abandoned())
+    }
+
+    /// An open colour reply tail context an interruption leaves open: the
+    /// header of an OSC reply was dropped, or the ESC of an awaited colour
+    /// reply went out as Escape, and what is held can still complete that
+    /// reply. A semantic key is the user's, not the host's: it does not end
+    /// what the host is sending, so the tail is still dropped if it completes
+    /// the reply, and framed as input only at its deadline or when it cannot
+    /// (ADR-0013 D1). Key and report contexts still end (#4048).
+    fn interruption_keeps_tail_hold(&self) -> bool {
+        let Some(hold) = &self.tail_hold else {
+            return false;
+        };
+        // The bytes decide: what was dropped or released before the held
+        // tail, and the tail, must still spell the start of a colour reply.
+        let reply_so_far = match &hold.after {
+            // Only the `\` of its ST is missing.
+            HoldAfter::OscHeader { split_st: true, .. } if self.buffer.is_empty() => {
+                return !self.tail_hold_expired();
+            }
+            HoldAfter::OscHeader { header, .. } => [header.as_slice(), &self.buffer].concat(),
+            HoldAfter::Escape { color_reply: true } if self.buffer.first() == Some(&b']') => {
+                [&[ESC][..], &self.buffer].concat()
+            }
+            _ => return false,
+        };
+        is_color_reply_shape_prefix(&reply_so_far)
+            && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
+            && !self.tail_hold_expired()
+            && (self.buffer.is_empty()
+                || classify_held_tail(&hold.after, &self.buffer, false, self.pump_policy())
+                    == Verdict::Hold)
     }
 
     /// Freezes this framer's clock at `now`, for deterministic tests.
@@ -636,13 +957,14 @@ impl RawInputByteFramer {
         self.tail_hold = Some(TailHold {
             after,
             opened_at: self.now(),
+            interrupted: false,
         });
     }
 
     /// Opens the hold only on an idle release: an interruption leaves no
     /// context behind (ADR-0012 D1).
     fn open_tail_hold_on(&mut self, mode: Release, after: HoldAfter) {
-        if mode == Release::Idle {
+        if mode.idle() {
             self.open_tail_hold(after);
         }
     }
@@ -675,10 +997,16 @@ impl RawInputByteFramer {
         if self.host_default_color_query_deadline.is_some() {
             return false;
         }
+        // A reply that came to the front of `buffer` only after the bytes
+        // before it in its read were dropped (an orphan UTF-8 continuation)
+        // has no read time of its own: its newest byte's arrival is that time
+        // (ADR-0013 D1).
         let now = self.now();
+        let last_read = self
+            .partial_host_color_reply_read_at
+            .or_else(|| self.arrivals.back().map(|(_, at)| *at));
         self.buffer.len() >= MAX_DISCARDED_CONTROL_TAIL_BYTES
-            || self
-                .partial_host_color_reply_read_at
+            || last_read
                 .is_none_or(|at| now.saturating_duration_since(at) >= HOST_COLOR_REPLY_IDLE_LIMIT)
     }
 
@@ -871,23 +1199,29 @@ impl RawInputByteFramer {
             .unwrap_or(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
     }
 
-    /// Ends every hold at once, for semantic input (Windows key, focus and
-    /// mouse records): what was held is input and is emitted, in order, before
-    /// the caller emits that event (ADR-0012 D1, I4).
+    /// Ends every report and key hold at once, for semantic input (Windows
+    /// key, focus and mouse records): what was held is input and is emitted,
+    /// in order, before the caller emits that event. A host reply prefix
+    /// inside its reply window is not input and stays (ADR-0013 D1, I4').
     #[cfg(any(windows, test))]
     pub(crate) fn flush_interrupted(&mut self) -> Vec<Vec<u8>> {
-        self.release_everything()
+        self.release_everything(Release::Interrupt)
     }
 
-    /// Repeats the interrupt release until nothing is pending but an
-    /// unterminated bracketed paste. Opens no context.
-    fn release_everything(&mut self) -> Vec<Vec<u8>> {
+    /// Repeats an interrupting release until nothing is pending but an
+    /// unterminated bracketed paste or, on an interruption, a reply prefix
+    /// inside its window. Opens no context.
+    fn release_everything(&mut self, mode: Release) -> Vec<Vec<u8>> {
+        debug_assert!(mode.interrupt());
         let mut chunks = Vec::new();
         // Each pass emits or drops at least the front of `buffer`; the bound
         // only guards against a rule that would not.
         for _ in 0..=MAX_DISCARDED_CONTROL_TAIL_BYTES {
-            chunks.extend(self.release(Release::Interrupt));
-            if self.buffer.is_empty() || self.waiting_for_paste_terminator() {
+            chunks.extend(self.release(mode));
+            if self.buffer.is_empty()
+                || self.waiting_for_paste_terminator()
+                || (mode == Release::Interrupt && self.interruption_keeps_pending())
+            {
                 break;
             }
         }
@@ -899,29 +1233,60 @@ impl RawInputByteFramer {
         self.waiting_for_paste_terminator()
     }
 
-    /// The idle release: the reader saw no input for its idle wait. A byte
-    /// older than the backstop is released as on an interruption first.
+    /// The idle release: the reader saw no input for its idle wait (on the
+    /// pump: the pump says so, see `Release::PumpIdle`). A byte older than
+    /// the backstop is released as past its last bound first.
     pub(crate) fn flush_timeout(&mut self) -> Vec<Vec<u8>> {
         if self.pending_input_expired() {
             tracing::debug!(
                 len = self.buffer.len(),
                 "releasing pending input past its age limit"
             );
-            return self.release_everything();
+            return self.release_everything(Release::Backstop);
         }
-        self.release(Release::Idle)
+        self.release(if self.pump_policy() {
+            Release::PumpIdle
+        } else {
+            Release::Idle
+        })
     }
 
     fn release(&mut self, mode: Release) -> Vec<Vec<u8>> {
-        let interrupt = mode == Release::Interrupt;
+        let interrupt = mode.interrupt();
+        // A pump idle right after a push is no evidence the sequence ended:
+        // what would drop bytes waits for one quiet interval (ADR-0013 D2).
+        let defer_loss = mode == Release::PumpIdle && !self.newest_pending_quiet();
         // The deadline is checked before anything is classified. An expired
         // hold's bytes are then framed as ordinary input, in order. An
         // interruption ends the hold whatever its deadline.
-        let expired_hold = if interrupt || self.tail_hold_expired() {
-            self.tail_hold.take()
-        } else {
-            None
-        };
+        let expired_hold =
+            if (interrupt && !self.interruption_keeps_tail_hold()) || self.tail_hold_expired() {
+                self.tail_hold.take()
+            } else {
+                None
+            };
+        // A colour reply's tail context survives an interruption (ADR-0013 D1).
+        let kept_hold = interrupt && self.tail_hold.is_some();
+        if let Some(hold) = self.tail_hold.as_mut().filter(|_| kept_hold) {
+            hold.interrupted = true;
+        }
+        // On the pump an X10 report tail whose prefix went out as a key is
+        // the report, and the pump replays the key records it staged for it:
+        // unfinished, it is dropped like an unfinished `ESC [ M` (ADR-0013 D4).
+        if let Some(len) = expired_hold
+            .as_ref()
+            .filter(|_| self.pump_policy())
+            .and_then(|hold| hold.after.incomplete_x10_tail_len(&self.buffer))
+        {
+            tracing::debug!(len, "dropping unfinished X10 report tail");
+            self.buffer.drain(..len);
+        }
+        // What a kept colour reply context held is not input (ADR-0013 D1).
+        if let Some(hold) = expired_hold.as_ref().filter(|hold| hold.interrupted) {
+            let len = hold.after.reply_shaped_len(&self.buffer);
+            tracing::debug!(len, "dropping unfinished colour reply tail at its deadline");
+            self.buffer.drain(..len);
+        }
         if let Some(hold) = &expired_hold {
             tracing::debug!(
                 after = ?hold.after,
@@ -951,7 +1316,7 @@ impl RawInputByteFramer {
             self.end_host_color_tail_recovery();
         }
         let mut chunks = self.drain_available_chunks();
-        if interrupt {
+        if interrupt && !kept_hold {
             // A hold opened while draining belongs to bytes already framed.
             self.tail_hold = None;
         }
@@ -973,6 +1338,11 @@ impl RawInputByteFramer {
         if self.tail_hold.is_some() {
             return chunks;
         }
+        // A reply still arriving is not input: an interruption leaves it to
+        // its own bound (ADR-0013 D1).
+        if mode == Release::Interrupt && self.interruption_keeps_pending() {
+            return chunks;
+        }
 
         if let Some(family) = self.discard_until {
             // An interruption drops what a discard still holds and ends it;
@@ -992,6 +1362,9 @@ impl RawInputByteFramer {
             }
             #[cfg(any(windows, test))]
             if self.host_color_tail_deadline.is_some() {
+                return chunks;
+            }
+            if defer_loss {
                 return chunks;
             }
             let keep_split_st = self.buffer.last() == Some(&ESC);
@@ -1030,6 +1403,9 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_sgr_mouse_sequence(&self.buffer) {
+            if defer_loss {
+                return chunks;
+            }
             // `CSI <` starts no key: these bytes are a mouse report fragment.
             // They are dropped, and what follows them is held as its tail.
             tracing::debug!(
@@ -1062,10 +1438,15 @@ impl RawInputByteFramer {
             && (self.host_default_color_query_deadline.is_some() || host_color_query_expired)
             && is_incomplete_host_default_color_prefix(&self.buffer)
         {
-            if !interrupt
+            // Inside its window an interruption keeps it too: it can only
+            // complete the reply or be dropped (ADR-0013 D1).
+            if mode != Release::Backstop
                 && self.host_default_color_query_deadline.is_some()
                 && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
             {
+                return chunks;
+            }
+            if defer_loss {
                 return chunks;
             }
             if !interrupt
@@ -1088,6 +1469,9 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_default_color_response(&self.buffer) {
+            if defer_loss {
+                return chunks;
+            }
             if interrupt || self.host_color_reply_abandoned() {
                 // The host went quiet mid-reply; never let it hold input (#5052).
                 tracing::debug!(
@@ -1121,6 +1505,9 @@ impl RawInputByteFramer {
         if self.host_cell_size_replies_awaited > 0
             && starts_with_incomplete_host_cell_size_report(&self.buffer)
         {
+            if defer_loss {
+                return chunks;
+            }
             tracing::debug!(
                 len = self.buffer.len(),
                 "discarding incomplete host cell size report after input timeout"
@@ -1143,6 +1530,9 @@ impl RawInputByteFramer {
                     len = self.buffer.len(),
                     "holding incomplete host color scheme report one flush"
                 );
+                return chunks;
+            }
+            if defer_loss {
                 return chunks;
             }
             tracing::debug!(
@@ -1174,19 +1564,23 @@ impl RawInputByteFramer {
         }
 
         if let Some(ControlString::Incomplete { family }) = control_string(&self.buffer) {
+            if defer_loss {
+                return chunks;
+            }
             tracing::debug!(
                 len = self.buffer.len(),
                 "discarding incomplete host control string after input timeout"
             );
             let split_st = self.buffer.last() == Some(&ESC);
-            self.buffer.clear();
+            let mut header = std::mem::take(&mut self.buffer);
+            header.truncate(MAX_DISCARDED_CONTROL_TAIL_BYTES + 1);
             if interrupt {
                 return chunks;
             }
             if family == ControlStringFamily::Osc {
                 // Its tail is held under a deadline and dropped only if it
                 // completes a reply; anything else is input (#5251).
-                self.open_tail_hold(HoldAfter::OscHeader { split_st });
+                self.open_tail_hold(HoldAfter::OscHeader { split_st, header });
                 return chunks;
             }
             // This intentionally gives host control replies precedence over legacy
@@ -1277,6 +1671,9 @@ impl RawInputByteFramer {
 
         // An incomplete sequence that cannot be a key, waited out or
         // interrupted: never input. Its CSI prefix may still get a tail.
+        if defer_loss {
+            return chunks;
+        }
         tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
         let prefix = std::mem::take(&mut self.buffer);
         if is_dropped_csi_key_prefix(&prefix) {
@@ -1306,7 +1703,13 @@ impl RawInputByteFramer {
             }
             _ => false,
         };
-        match classify_held_tail(&hold.after, &self.buffer, burst) {
+        let prefix = hold.after.released_prefix();
+        let reply_shaped = if hold.interrupted {
+            hold.after.reply_shaped_len(&self.buffer)
+        } else {
+            0
+        };
+        match classify_held_tail(&hold.after, &self.buffer, burst, self.pump_policy()) {
             // The deadline follows from the held bytes' arrival.
             Verdict::Hold => false,
             Verdict::Drop(len) => {
@@ -1316,13 +1719,16 @@ impl RawInputByteFramer {
                 true
             }
             Verdict::Rejoin(_) => {
-                // Put the released ESC back: the reply is complete, so it
-                // parses as a host reply and never as input.
-                self.buffer.insert(0, ESC);
+                // Put the released prefix back: the reply (or pump X10
+                // report) is complete, so it parses as one and never as input.
+                self.buffer.splice(0..0, prefix.iter().copied());
                 self.tail_hold = None;
                 true
             }
             Verdict::Emit => {
+                // After a semantic key, the reply-shaped bytes before the
+                // byte that ended the reply are not typed (ADR-0013 D1).
+                self.buffer.drain(..reply_shaped);
                 self.tail_hold = None;
                 true
             }
@@ -1738,6 +2144,59 @@ fn is_incomplete_host_default_color_prefix(buffer: &[u8]) -> bool {
         && [b"\x1b]10;".as_slice(), b"\x1b]11;".as_slice()]
             .iter()
             .any(|prefix| prefix.starts_with(buffer) || buffer.starts_with(prefix))
+}
+
+/// An unfinished OSC 10, 11 or 4 colour reply, or a prefix of one (`ESC ]`,
+/// `ESC ] 1`, ...).
+/// Whether `bytes` is the start of a colour reply, `ESC ] 10 ;`, `ESC ] 11 ;`
+/// or `ESC ] 4 ; <index> ;`, then `rgb:` and up to three groups of one to
+/// four hex digits, possibly up to the ESC of its ST, and nothing past it:
+/// text such as `ESC ] 4 ; 50 ; a` is not one (ADR-0013 D1).
+fn is_color_reply_shape_prefix(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(b"\x1b]") else {
+        return false;
+    };
+    let headers: [&[u8]; 3] = [b"10;", b"11;", b"4;"];
+    if headers.iter().any(|header| header.starts_with(rest)) {
+        return true;
+    }
+    let body = if let Some(body) = rest.strip_prefix(b"10;").or(rest.strip_prefix(b"11;")) {
+        body
+    } else if let Some(index) = rest.strip_prefix(b"4;") {
+        let digits = index
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=3).contains(&digits) {
+            return false;
+        }
+        match index.get(digits) {
+            None => return true,
+            Some(b';') => &index[digits + 1..],
+            Some(_) => return false,
+        }
+    } else {
+        return false;
+    };
+    if b"rgb:".starts_with(body) {
+        return true;
+    }
+    let Some(groups) = body.strip_prefix(b"rgb:") else {
+        return false;
+    };
+    let (groups, split_st) = match groups.strip_suffix(&[ESC]) {
+        Some(groups) => (groups, true),
+        None => (groups, false),
+    };
+    let groups: Vec<&[u8]> = groups.split(|byte| *byte == b'/').collect();
+    let last = groups.len() - 1;
+    groups.len() <= 3
+        && groups.iter().enumerate().all(|(index, group)| {
+            group.iter().all(u8::is_ascii_hexdigit)
+                && group.len() <= 4
+                && (index == last && !split_st || !group.is_empty())
+        })
+        && (!split_st || groups.len() == 3)
 }
 
 fn starts_with_incomplete_host_color_scheme_report(buffer: &[u8]) -> bool {
@@ -2235,6 +2694,8 @@ mod review_5251_r1_tests;
 mod review_5251_r2_tests;
 #[cfg(test)]
 mod review_nxa8_r3_tests;
+#[cfg(test)]
+mod review_nxa8_r4_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3179,7 +3640,7 @@ mod tests {
         let mut framer = RawInputFramer::default();
 
         assert!(framer.push(b"\x1b[<3").is_empty());
-        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.idle_tick().is_empty());
         let events = framer.push(b"5;58;30Mx");
 
         assert_eq!(events.len(), 1);
@@ -3922,9 +4383,9 @@ mod tests {
             let mut framer = RawInputFramer::default();
 
             assert!(framer.push(b"\x1b]").is_empty());
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
             let mut events = framer.push(held);
-            events.extend(framer.flush_timeout());
+            events.extend(framer.idle_tick());
             events.extend(framer.push(b"\x1b[200~hello world\x1b[201~"));
 
             let pasted: Vec<_> = events
@@ -4067,11 +4528,11 @@ mod tests {
         framer.host_default_color_query_sent(Duration::from_secs(1));
         assert!(framer.push(b"\x1b]10").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(framer.push(b";rgb:aaaa/").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(matches!(
             framer.push(b"bbbb/cccc\x1b\\").as_slice(),
@@ -4084,7 +4545,7 @@ mod tests {
         let mut expired = RawInputFramer::for_host_input();
         expired.host_default_color_query_sent(Duration::ZERO);
         assert!(expired.push(b"\x1b]11;").is_empty());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         assert!(matches!(
             expired.push(b"x").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
@@ -4104,10 +4565,10 @@ mod tests {
         let mut framer = RawInputFramer::for_host_input();
         framer.host_default_color_query_sent(Duration::ZERO);
         assert!(framer.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.idle_tick().is_empty());
         assert!(framer.push(b"2222/").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(matches!(
             framer.push(b"3333\x1b\\x").as_slice(),
@@ -4117,9 +4578,9 @@ mod tests {
         let mut expired = RawInputFramer::for_host_input();
         expired.host_default_color_query_sent(Duration::ZERO);
         assert!(expired.push(b"\x1b]10;rgb:aaaa/").is_empty());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         expired.byte_framer.host_color_tail_deadline = Some(Instant::now());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         assert!(matches!(
             expired.push(b"y").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('y')
@@ -4128,18 +4589,18 @@ mod tests {
         let mut raw_keyboard = RawInputFramer::for_host_input();
         raw_keyboard.host_default_color_query_sent(Duration::ZERO);
         assert!(raw_keyboard.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(raw_keyboard.flush_timeout().is_empty());
+        assert!(raw_keyboard.idle_tick().is_empty());
         assert!(raw_keyboard.push(b"a").is_empty());
         raw_keyboard.byte_framer.host_color_tail_deadline = Some(Instant::now());
         assert!(matches!(
-            raw_keyboard.flush_timeout().as_slice(),
+            raw_keyboard.idle_tick().as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('a')
         ));
 
         let mut split_st = RawInputFramer::for_host_input();
         split_st.host_default_color_query_sent(Duration::ZERO);
         assert!(split_st.push(b"\x1b]11;rgb:1111/2222/3333\x1b").is_empty());
-        assert!(split_st.flush_timeout().is_empty());
+        assert!(split_st.idle_tick().is_empty());
         assert!(matches!(
             split_st.push(b"\\x").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
@@ -4150,7 +4611,7 @@ mod tests {
         assert!(abandoned_st
             .push(b"\x1b]11;rgb:1111/2222/3333\x1b")
             .is_empty());
-        assert!(abandoned_st.flush_timeout().is_empty());
+        assert!(abandoned_st.idle_tick().is_empty());
         assert!(matches!(
             abandoned_st
                 .push(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\")
@@ -4164,7 +4625,7 @@ mod tests {
         let mut next_reply = RawInputFramer::for_host_input();
         next_reply.host_default_color_query_sent(Duration::ZERO);
         assert!(next_reply.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(next_reply.flush_timeout().is_empty());
+        assert!(next_reply.idle_tick().is_empty());
         assert!(next_reply.push(b"\x1b").is_empty());
         assert!(matches!(
             next_reply.push(b"]10;rgb:aaaa/bbbb/cccc\x1b\\").as_slice(),

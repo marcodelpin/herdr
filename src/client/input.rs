@@ -158,25 +158,12 @@ fn unix_stdin_reader_loop(
         pending_mode = framer.has_pending_input().then_some(sgr_pixels);
     }
 
-    // When pushed bytes get their idle flush. Every wait of the reader is
-    // one wait: this, the framer's release time and the graphics filter's
-    // poll, whichever is first (ADR-0012 D4).
-    let mut idle_flush_at = None;
+    // Every wait of the reader is one wait: the framer's idle flush, its
+    // release time and the graphics filter's poll, whichever is first. The
+    // schedule runs the framer side of every wake (ADR-0013 D3).
+    let mut schedule = crate::raw_input::ReaderSchedule::default();
     while !should_quit.load(Ordering::Acquire) {
-        let idle_ms =
-            idle_flush_at
-                .filter(|_| framer.has_pending_input())
-                .map(|at: std::time::Instant| {
-                    let remaining = at.saturating_duration_since(std::time::Instant::now());
-                    i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX)
-                });
-        let framer_wait = match (idle_ms, framer.held_input_release_ms()) {
-            (Some(idle), Some(release)) => Some(idle.min(release)),
-            (idle, release) => idle.or(release),
-        };
-        if let Some((wait_ms, framer_due)) =
-            crate::raw_input::reader_idle_wait(framer_wait, direct_filter.has_pending())
-        {
+        if let Some((wait_ms, framer_due)) = schedule.wait(&framer, direct_filter.has_pending()) {
             if stdin_read_ready(&reader, wait_ms) == Some(false) {
                 let sgr_pixels =
                     pending_mode.unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
@@ -190,22 +177,12 @@ fn unix_stdin_reader_loop(
                 } else {
                     None
                 };
-                let chunks = if let Some(data) = released {
-                    let chunks = framer.push(&data);
-                    idle_flush_at = Some(
-                        std::time::Instant::now()
-                            + std::time::Duration::from_millis(framer.idle_flush_timeout_ms(
-                                host_mouse_capture_active.load(Ordering::Acquire),
-                            )
-                                as u64),
-                    );
-                    chunks
-                } else if framer_due {
-                    idle_flush_at = None;
-                    framer.flush_timeout()
-                } else {
-                    Vec::new()
-                };
+                let chunks = schedule.on_idle(
+                    &mut framer,
+                    released,
+                    framer_due,
+                    host_mouse_capture_active.load(Ordering::Acquire),
+                );
                 if !framer.has_pending_input() {
                     pending_mode = None;
                 }
@@ -244,7 +221,7 @@ fn unix_stdin_reader_loop(
                     &direct_response,
                     &direct_response_active,
                 );
-                let chunks = if let Some((raw_chunks, responses)) = filtered {
+                let raw_chunks = if let Some((raw_chunks, responses)) = filtered {
                     for response in responses {
                         if event_tx
                             .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
@@ -254,17 +231,15 @@ fn unix_stdin_reader_loop(
                         }
                     }
                     raw_chunks
-                        .into_iter()
-                        .flat_map(|chunk| framer.push(&chunk))
-                        .collect()
                 } else {
-                    framer.push(&scratch[..n])
+                    vec![scratch[..n].to_vec()]
                 };
-                idle_flush_at = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_millis(framer.idle_flush_timeout_ms(
-                            host_mouse_capture_active.load(Ordering::Acquire),
-                        ) as u64),
+                // A read the graphics filter kept whole still runs the
+                // framer's deadlines and idle flush (ADR-0013 D3).
+                let chunks = schedule.on_read(
+                    &mut framer,
+                    raw_chunks,
+                    host_mouse_capture_active.load(Ordering::Acquire),
                 );
                 if !framer.has_pending_input() {
                     pending_mode = None;
