@@ -9,7 +9,7 @@ name: Fork win deploy 0921
 
 on:
   push:
-    branches: [fix/win-deploy-0921, fix/adopt-0.9.5]
+    branches: [ci/5bka-normal-r2, fix/win-deploy-0921, fix/adopt-0.9.5]
 
 permissions:
   contents: read
