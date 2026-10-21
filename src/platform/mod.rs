@@ -451,6 +451,12 @@ pub(crate) use unix_common::{
 mod client_state;
 pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
 
+/// Only Linux has a systemd --user manager to address.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn user_manager_runtime_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}
 
