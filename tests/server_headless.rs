@@ -1198,6 +1198,13 @@ impl FullListener {
         }
         Self { fd, fillers }
     }
+
+    /// Accepts one queued connection, so one waiting connect() completes.
+    fn admit_one(&mut self) {
+        let accepted = unsafe { libc::accept(self.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert!(accepted >= 0, "{}", std::io::Error::last_os_error());
+        self.fillers.push(accepted);
+    }
 }
 
 impl Drop for FullListener {
@@ -1675,5 +1682,319 @@ fn server_refuses_to_start_when_its_startup_stop_thread_cannot_start() {
         "{content}"
     );
 
+    cleanup_spawned_herdr(spawned, base);
+}
+
+/// A handoff import past `committed` and `owned`, its post-commit startup
+/// blocked on the plugin registry lock another process holds, and SIGTERM
+/// sent before the commit. `before_commit` runs on the import's app data dir
+/// right before the source commits.
+struct CommittedHandoff {
+    import: ImportServer,
+    _source: UnixStream,
+    _pty: portable_pty::PtyPair,
+    pane_child: Box<dyn Child + Send + Sync>,
+    registry_lock: fs::File,
+    session_file: PathBuf,
+    log: PathBuf,
+    signalled: Instant,
+    marker: &'static str,
+}
+
+impl CommittedHandoff {
+    fn start(base: &Path, before_commit: impl FnOnce(&Path)) -> Self {
+        use std::os::unix::io::RawFd;
+
+        let config_home = base.join("config");
+        let runtime_dir = base.join("runtime");
+        let api_socket = runtime_dir.join("herdr.sock");
+        let log = server_log_path(&config_home);
+        let app_dir = log.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_file = app_dir.join("session.json");
+        let marker = "ir4j-transferred-workspace";
+
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut pane_cmd = CommandBuilder::new("/bin/sleep");
+        pane_cmd.arg("600");
+        let pane_child = pty.slave.spawn_command(pane_cmd).unwrap();
+        let pane_pid = pane_child.process_id().expect("pane pid");
+        let master_fd: RawFd = pty.master.as_raw_fd().expect("pty master fd");
+
+        let cwd = base.display().to_string();
+        let manifest = format!(
+            concat!(
+                r#"{{"version":1,"source_version":"ir4j-test","source_protocol":0,"#,
+                r#""expected_version":null,"expected_protocol":null,"#,
+                r#""snapshot":{{"version":0,"workspaces":[{{"custom_name":"{marker}","identity_cwd":"{cwd}","#,
+                r#""tabs":[{{"layout":{{"Pane":1}},"panes":{{"1":{{"cwd":"{cwd}"}}}},"zoomed":false,"focused":1,"root_pane":1}}],"#,
+                r#""active_tab":0}}],"active":0,"selected":0}},"#,
+                r#""panes":[{{"pane_id":1,"child_pid":{pid},"rows":24,"cols":80,"cell_width_px":0,"cell_height_px":0}}]}}"#
+            ),
+            marker = marker,
+            cwd = cwd,
+            pid = pane_pid,
+        );
+        let (import, mut source) = start_handoff_import(
+            base,
+            &config_home,
+            &runtime_dir,
+            &api_socket,
+            &manifest,
+            &[master_fd],
+        );
+        assert_eq!(read_handoff_line(&mut source), "ready");
+
+        let registry_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(app_dir.join(".plugins.lock"))
+            .unwrap();
+        registry_lock.lock().unwrap();
+        before_commit(&app_dir);
+
+        let pid = import.child.id() as libc::pid_t;
+        let signalled = Instant::now();
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        source.write_all(b"committed\n").unwrap();
+        assert_eq!(read_handoff_line(&mut source), "owned");
+        Self {
+            import,
+            _source: source,
+            _pty: pty,
+            pane_child,
+            registry_lock,
+            session_file,
+            log,
+            signalled,
+            marker,
+        }
+    }
+
+    fn session(&self) -> String {
+        fs::read_to_string(&self.session_file).unwrap_or_default()
+    }
+
+    fn finish(mut self, base: &Path) {
+        drop(self.registry_lock);
+        let _ = self.pane_child.kill();
+        let _ = self.pane_child.wait();
+        drop(self.import);
+        cleanup_test_base(base);
+    }
+}
+
+/// codex ir4j-r3 finding 1: the save right after the commit fails once (the
+/// temporary session file's path is a directory, which fails the save the way
+/// a full disk does), then the cause goes away. The import must not count a
+/// failed save as the transferred session on disk: it keeps trying within the
+/// save bound, before the post-commit step that waits on the plugin lock, so
+/// the session it leaves after the stop holds the transferred workspace.
+#[test]
+fn sigterm_before_a_handoff_commit_whose_first_save_fails_keeps_the_transferred_session() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let handoff = CommittedHandoff::start(&base, |app_dir| {
+        fs::create_dir_all(app_dir.join("session.json.tmp").join("blocker")).unwrap();
+    });
+    let app_dir = handoff.session_file.parent().unwrap().to_path_buf();
+    wait_for_log_line(
+        &handoff.log,
+        "failed to save session",
+        Duration::from_secs(5),
+    );
+    fs::remove_dir_all(app_dir.join("session.json.tmp")).unwrap();
+
+    let mut handoff = handoff;
+    let status = wait_for_import_exit(
+        &mut handoff.import,
+        handoff.signalled,
+        Duration::from_secs(45),
+    );
+    let exited_after = handoff.signalled.elapsed();
+    let session = handoff.session();
+    assert!(
+        session.contains(handoff.marker),
+        "the transferred workspace was lost after a failed save (exit {status:?} {exited_after:?} after SIGTERM); session file:\n{session}"
+    );
+    assert!(
+        exited_after <= STARTUP_STOP_EXIT_BOUND,
+        "handoff import exited {exited_after:?} after SIGTERM, past the bound"
+    );
+    assert!(status.success(), "exit status {status:?}");
+    handoff.finish(&base);
+}
+
+/// codex ir4j-r3 finding 1, the save never succeeds: the stop must not end
+/// the import as a success with the transferred workspace on no disk. It
+/// waits for the save until the save bound, then exits with an error status
+/// and says in the log that the transferred session was not written.
+#[test]
+fn sigterm_before_a_handoff_commit_whose_save_keeps_failing_exits_with_an_error() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let mut handoff = CommittedHandoff::start(&base, |app_dir| {
+        fs::create_dir_all(app_dir.join("session.json.tmp").join("blocker")).unwrap();
+    });
+    // The save bound (10 s from `committed`) plus scheduling.
+    let status = wait_for_import_exit(
+        &mut handoff.import,
+        handoff.signalled,
+        Duration::from_secs(45),
+    );
+    let exited_after = handoff.signalled.elapsed();
+    let session = handoff.session();
+    let log = fs::read_to_string(&handoff.log).unwrap_or_default();
+    assert!(
+        !session.contains(handoff.marker),
+        "the save was meant to fail throughout; session file:\n{session}"
+    );
+    assert!(
+        !status.success(),
+        "the import exited successfully {exited_after:?} after SIGTERM although the transferred session was never written ({status:?})"
+    );
+    assert!(
+        log.contains("the transferred session was not written"),
+        "the log must name the lost transfer:\n{log}"
+    );
+    assert!(
+        exited_after <= Duration::from_secs(14),
+        "handoff import exited {exited_after:?} after SIGTERM, past the save bound"
+    );
+    handoff.finish(&base);
+}
+
+/// codex ir4j-r3 finding 2: the App is destroyed by a startup error before
+/// the drain. Twelve restored panes run a shell that ignores SIGHUP and
+/// SIGTERM, so destroying the App takes 12 x (250 ms + 250 ms) of grace
+/// periods. Startup fails on the client socket probe (another live listener,
+/// reached once a backlog slot frees: "already running"). The connections
+/// accepted before the failure must be answered by the drain, not left to
+/// the 5 s initial-read timeout while the panes are being ended.
+#[test]
+fn startup_error_with_panes_slow_to_end_answers_every_accepted_connection() {
+    const PANES: usize = 12;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let log = server_log_path(&config_home);
+    let app_dir = log.parent().unwrap().to_path_buf();
+    let ready_dir = base.join("pane-ready");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::create_dir_all(&ready_dir).unwrap();
+    fs::create_dir_all(&runtime_dir).unwrap();
+
+    let shell = base.join("stubborn-shell.sh");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\ntrap '' HUP TERM\ntouch '{}'/$$\nwhile :; do sleep 1; done\n",
+            ready_dir.display()
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cwd = base.display().to_string();
+    let workspaces: Vec<String> = (1..=PANES)
+        .map(|pane| {
+            format!(
+                concat!(
+                    r#"{{"id":"w{pane}","custom_name":"stubborn-{pane}","identity_cwd":"{cwd}","#,
+                    r#""tabs":[{{"layout":{{"Pane":{pane}}},"panes":{{"{pane}":{{"cwd":"{cwd}"}}}},"#,
+                    r#""zoomed":false,"focused":{pane},"root_pane":{pane}}}]}}"#
+                ),
+                pane = pane,
+                cwd = cwd,
+            )
+        })
+        .collect();
+    fs::write(
+        app_dir.join("session.json"),
+        format!(
+            r#"{{"version":3,"active":0,"selected":0,"workspaces":[{}]}}"#,
+            workspaces.join(",")
+        ),
+    )
+    .unwrap();
+    let mut occupied = FullListener::bind(&client_socket);
+
+    let shell_path = shell.to_str().unwrap().to_owned();
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &[("SHELL", shell_path.as_str())],
+    );
+    wait_for_log_line(&log, "api server listening", Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let pane_pids = loop {
+        let pids: Vec<libc::pid_t> = fs::read_dir(&ready_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        if pids.len() >= PANES {
+            break pids;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {PANES} panes started:\n{}",
+            pids.len(),
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        spawned.child.try_wait().unwrap().is_none(),
+        "the server must still be waiting in the client socket probe"
+    );
+
+    let clients = connect_startup_window_clients(&api_socket);
+    thread::sleep(Duration::from_millis(300));
+    for client in &clients {
+        client.stream.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let read = (&client.stream).read(&mut byte);
+        assert!(
+            matches!(&read, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "{} must still be unanswered before the startup error: {read:?}",
+            client.kind
+        );
+        client.stream.set_nonblocking(false).unwrap();
+    }
+    let failed = Instant::now();
+    occupied.admit_one();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_answered_by_bound(clients, failed, "the startup error");
+    }));
+
+    let status = wait_for_exit_status(&mut spawned.child, Duration::from_secs(20));
+    for pid in pane_pids {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    let status = status.expect("server must exit after its startup failed");
+    assert!(!status.success(), "exit status {status:?}");
+    assert!(!api_socket.exists(), "api socket must be removed");
+
+    drop(occupied);
     cleanup_spawned_herdr(spawned, base);
 }

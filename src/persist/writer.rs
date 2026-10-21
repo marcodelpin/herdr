@@ -35,18 +35,30 @@ impl SessionWriter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &mut self,
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
+        // Logged by try_save; tests check the file instead.
+        let _ = self.try_save(snapshot, history);
+    }
+
+    /// Writes the session, and says whether it reached the disk. A failure
+    /// of the optional history file does not count.
+    pub(crate) fn try_save(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::save_to_path(&self.path, snapshot)
         });
         if let Err(err) = result {
             crate::logging::session_save_failed(&self.path, &err.to_string());
-            return;
+            return Err(err);
         }
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
@@ -56,22 +68,31 @@ impl SessionWriter {
             crate::logging::session_save_failed(&history_path, &err.to_string());
         }
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
+        // Logged by try_clear; tests check the file instead.
+        let _ = self.try_clear();
+    }
+
+    /// Clears the session file, and says whether it was cleared.
+    pub(crate) fn try_clear(&mut self) -> io::Result<()> {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::clear_path(&self.path)
         });
         if let Err(err) = result {
             crate::logging::session_clear_failed(&self.path, &err.to_string());
-            return;
+            return Err(err);
         }
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::clear_path(&history_path) {
             crate::logging::session_clear_failed(&history_path, &err.to_string());
         }
         crate::logging::session_cleared(&self.path);
+        Ok(())
     }
 }
 

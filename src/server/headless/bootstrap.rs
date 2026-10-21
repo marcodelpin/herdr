@@ -5,6 +5,11 @@ use super::*;
 #[cfg(unix)]
 const HANDOFF_COMMIT_WAIT_MARGIN: Duration = Duration::from_secs(1);
 
+/// How long a failed write of a transferred handoff session waits before the
+/// next attempt, within the handoff save bound.
+#[cfg(unix)]
+const HANDOFF_SAVE_RETRY: Duration = Duration::from_millis(250);
+
 /// A startup error after the API socket was bound. Handled only after the
 /// API server drained, so no accepted connection is left without a reply
 /// (herdr-ir4j, ADR-0014 rule 3).
@@ -13,6 +18,17 @@ struct StartupFailure {
     /// The socket another server already serves, reported as "already
     /// running" with exit status 1.
     already_running: Option<(&'static str, PathBuf)>,
+    /// What startup had built (the App or the server holding it), destroyed
+    /// only after the drain: destroying the App ends its panes, with grace
+    /// periods that can add up to seconds.
+    held: Option<Box<dyn std::any::Any>>,
+}
+
+impl StartupFailure {
+    fn holding(mut self, built: impl std::any::Any) -> Self {
+        self.held = Some(Box::new(built));
+        self
+    }
 }
 
 impl From<io::Error> for StartupFailure {
@@ -20,12 +36,14 @@ impl From<io::Error> for StartupFailure {
         Self {
             err,
             already_running: None,
+            held: None,
         }
     }
 }
 
 /// Leaves a startup that failed after the API bind: drains the API server
-/// first, drops its handle (which unlinks the socket path) only afterwards.
+/// first, drops its handle (which unlinks the socket path) and what startup
+/// had built only afterwards.
 fn leave_failed_startup(
     startup_stop: &StartupStop,
     api_server: Option<api::ServerHandle>,
@@ -34,6 +52,7 @@ fn leave_failed_startup(
     warn!(err = %failure.err, "server startup failed");
     startup_stop.fail_startup();
     drop(api_server);
+    drop(failure.held);
     if let Some((socket, path)) = failure.already_running {
         eprintln!("error: herdr server is already running");
         eprintln!("{socket} socket: {}", path.display());
@@ -128,6 +147,7 @@ fn already_running_api(err: io::Error) -> StartupFailure {
         StartupFailure {
             err,
             already_running: Some(("api", api::socket_path())),
+            held: None,
         }
     } else {
         err.into()
@@ -139,6 +159,7 @@ fn already_running_client(err: io::Error) -> StartupFailure {
         StartupFailure {
             err,
             already_running: Some(("client", client_socket_path())),
+            held: None,
         }
     } else {
         err.into()
@@ -215,10 +236,22 @@ fn build_ordinary_server(
     )?;
     seed_startup_workspace_if_empty(&mut app);
 
-    // Create the headless server. The API server handle stays with bootstrap
-    // until the event loop takes the stop over (ADR-0014 rule 3).
-    let mut server = HeadlessServer::new(app, diagnostics, Some(api_tx), None, server_stop)
-        .map_err(already_running_client)?;
+    // The client socket first, while the App is still here: a failure hands
+    // the App back, to be destroyed after the drain (ADR-0014 rule 3).
+    let client_socket = match ClientSocket::bind(&server_stop) {
+        Ok(client_socket) => client_socket,
+        Err(err) => return Err(already_running_client(err).holding(app)),
+    };
+    // The API server handle stays with bootstrap until the event loop takes
+    // the stop over (ADR-0014 rule 3).
+    let mut server = HeadlessServer::new(
+        app,
+        diagnostics,
+        Some(api_tx),
+        None,
+        server_stop,
+        client_socket,
+    );
 
     info!(
         api_socket = %api::socket_path().display(),
@@ -374,7 +407,18 @@ fn build_handoff_import_server(
     api_tx: api::ApiRequestSender,
     server_stop: crate::server::shutdown::ServerStop,
 ) -> Result<HeadlessServer, StartupFailure> {
-    let mut server = HeadlessServer::new(app, diagnostics, Some(api_tx), None, server_stop)?;
+    let client_socket = match ClientSocket::bind(&server_stop) {
+        Ok(client_socket) => client_socket,
+        Err(err) => return Err(StartupFailure::from(err).holding(app)),
+    };
+    let mut server = HeadlessServer::new(
+        app,
+        diagnostics,
+        Some(api_tx),
+        None,
+        server_stop,
+        client_socket,
+    );
     // Carried across before any client attaches, so the first title sent is
     // the override rather than the configured one it replaced.
     server.api_window_title = received.manifest.api_window_title.take();
@@ -389,13 +433,17 @@ fn build_handoff_import_server(
     let commit_wait_ends =
         Instant::now() + crate::server::handoff::COMMIT_TIMEOUT + HANDOFF_COMMIT_WAIT_MARGIN;
     if !startup_stop.begin_commit_wait(commit_wait_ends) {
-        return Err(
-            io::Error::other("stop signal received before the handoff import was ready").into(),
-        );
+        return Err(StartupFailure::from(io::Error::other(
+            "stop signal received before the handoff import was ready",
+        ))
+        .holding(server));
     }
-    crate::server::handoff::report_ready(&mut received.stream)?;
-    crate::server::handoff::wait_committed(&mut received.stream)?;
-    startup_stop.committed();
+    let committed = crate::server::handoff::report_ready(&mut received.stream)
+        .and_then(|()| crate::server::handoff::wait_committed(&mut received.stream));
+    if let Err(err) = committed {
+        return Err(StartupFailure::from(err).holding(server));
+    }
+    let save_by = startup_stop.committed();
     server.app.assume_handoff_ownership();
     server.app.unpause_handoff_readers();
     server.pending_handoff_repaint_nudge = true;
@@ -405,13 +453,37 @@ fn build_handoff_import_server(
     // The source no longer saves this session: write it before any step that
     // can wait on another process, so a stop or a crash from here on cannot
     // lose what was transferred (ADR-0014 rule 2).
-    server.app.save_session_now();
-    startup_stop.saved();
+    save_transferred_session(startup_stop, &mut server.app, save_by);
 
     info!("handoff import server started");
     print_ready_message(&api::socket_path(), &client_socket_path());
     server.app.run_plugin_startup_hooks();
     Ok(server)
+}
+
+/// Writes the session a handoff transferred, retrying a failed write until
+/// `save_by`. Only a write that reached the disk counts as saved; a session
+/// that never did is reported to `startup_stop`, so a stop that gives startup
+/// up exits with status 1 instead of as a success (ADR-0014 invariant I6).
+#[cfg(unix)]
+fn save_transferred_session(startup_stop: &StartupStop, app: &mut app::App, save_by: Instant) {
+    loop {
+        let Err(err) = app.try_save_session_now() else {
+            startup_stop.saved();
+            return;
+        };
+        if Instant::now() + HANDOFF_SAVE_RETRY >= save_by {
+            tracing::error!(
+                %err,
+                "the transferred session was not written within the handoff save bound; continuing, the event loop keeps trying"
+            );
+            app.state.session_dirty = true;
+            startup_stop.save_failed();
+            return;
+        }
+        warn!(%err, "writing the transferred session failed; retrying");
+        std::thread::sleep(HANDOFF_SAVE_RETRY);
+    }
 }
 
 #[cfg(not(unix))]
