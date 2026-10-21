@@ -7,6 +7,14 @@ pub(crate) struct SavedSshBridge {
     _bridge: SshStdioBridge,
 }
 
+impl SavedSshBridge {
+    /// The failure the remote bridge reported on its stderr (bd herdr-waz6: the remote side explains
+    /// why it did not start a server, e.g. a failed `systemctl --user start herdr.service`).
+    pub(crate) fn reported_failure(&self) -> Option<io::Error> {
+        self._bridge.reported_failure()
+    }
+}
+
 pub(crate) struct SavedSshStream {
     pub(crate) stream: crate::ipc::LocalStream,
     pub(crate) bridge: SavedSshBridge,
