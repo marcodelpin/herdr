@@ -840,6 +840,11 @@ fn sigterm_inside_startup_window(pid: libc::pid_t, clients: &[WindowClient]) -> 
 /// Every client reads one whole line, a reply or `server_unavailable`, before
 /// the drain bound counted from the signal; never EOF, never a reset.
 fn assert_answered_after_startup_sigterm(clients: Vec<WindowClient>, signalled: Instant) {
+    assert_answered_by_bound(clients, signalled, "SIGTERM");
+}
+
+/// [`assert_answered_after_startup_sigterm`] counted from `event` at `since`.
+fn assert_answered_by_bound(clients: Vec<WindowClient>, signalled: Instant, event: &str) {
     for client in clients {
         let remaining = (signalled + STARTUP_STOP_REPLY_BOUND)
             .saturating_duration_since(Instant::now())
@@ -850,12 +855,12 @@ fn assert_answered_after_startup_sigterm(clients: Vec<WindowClient>, signalled: 
         let elapsed = signalled.elapsed();
         assert!(
             matches!(read, Ok(bytes) if bytes > 0) && line.ends_with('\n'),
-            "{} accepted during startup got no reply {elapsed:?} after SIGTERM: {read:?} {line:?}",
+            "{} accepted during startup got no reply {elapsed:?} after {event}: {read:?} {line:?}",
             client.kind
         );
         assert!(
             elapsed <= STARTUP_STOP_REPLY_BOUND,
-            "{} answered {elapsed:?} after SIGTERM, past the drain bound",
+            "{} answered {elapsed:?} after {event}, past the drain bound",
             client.kind
         );
         match &client.id {
@@ -1460,13 +1465,20 @@ fn sigterm_before_a_handoff_commit_then_a_blocked_plugin_lock_keeps_the_transfer
         Duration::from_secs(5),
     );
 
-    let status = wait_for_import_exit(&mut import, signalled, STARTUP_STOP_EXIT_BOUND);
-    assert!(status.success(), "exit status {status:?}");
+    // Waited past the bound on purpose, so a server that exits late shows
+    // whether it lost the session, not only that it was slow.
+    let status = wait_for_import_exit(&mut import, signalled, Duration::from_secs(45));
+    let exited_after = signalled.elapsed();
     let session = fs::read_to_string(&session_file).unwrap_or_default();
     assert!(
         session.contains(marker),
-        "the transferred workspace was lost; session file:\n{session}"
+        "the transferred workspace was lost (exit {exited_after:?} after SIGTERM); session file:\n{session}"
     );
+    assert!(
+        exited_after <= STARTUP_STOP_EXIT_BOUND,
+        "handoff import exited {exited_after:?} after SIGTERM, past the bound"
+    );
+    assert!(status.success(), "exit status {status:?}");
 
     drop(registry_lock);
     let _ = pane_child.kill();
@@ -1567,13 +1579,63 @@ fn startup_error_after_the_api_bind_answers_every_accepted_connection() {
     thread::sleep(Duration::from_millis(300));
     let released = Instant::now();
     fs::write(&release, b"").unwrap();
-    assert_answered_after_startup_sigterm(clients, released);
+    assert_answered_by_bound(clients, released, "the startup error");
 
     let status = wait_for_exit_status(&mut spawned.child, STARTUP_STOP_EXIT_BOUND)
         .expect("server must exit after its startup failed");
     assert!(!status.success(), "exit status {status:?}");
     assert!(!api_socket.exists(), "api socket must be removed");
 
+    cleanup_spawned_herdr(spawned, base);
+}
+
+/// ir4j-r2 P1 #3, the "already running" exit without a stop: an occupied
+/// client socket after the API bind used to end the process with
+/// process::exit(1) at once. Every accepted client must be answered first.
+#[test]
+fn startup_error_already_running_answers_every_accepted_connection() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let release = base.join("release-startup-hold");
+    let log = server_log_path(&config_home);
+    fs::create_dir_all(&runtime_dir).unwrap();
+    let occupied = std::os::unix::net::UnixListener::bind(&client_socket).unwrap();
+
+    let mut spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        &[
+            ("HERDR_TEST_HOLD_AFTER_API_BIND_MS", "30000"),
+            (
+                "HERDR_TEST_HOLD_AFTER_API_BIND_RELEASE",
+                release.to_str().unwrap(),
+            ),
+        ],
+    );
+    wait_for_log_line(
+        &log,
+        "startup held after the api bind for a test",
+        Duration::from_secs(30),
+    );
+
+    let clients = connect_startup_window_clients(&api_socket);
+    thread::sleep(Duration::from_millis(300));
+    let released = Instant::now();
+    fs::write(&release, b"").unwrap();
+    assert_answered_by_bound(clients, released, "the startup error");
+
+    let status = wait_for_exit_status(&mut spawned.child, STARTUP_STOP_EXIT_BOUND)
+        .expect("server must exit after its startup failed");
+    assert!(!status.success(), "exit status {status:?}");
+    assert!(!api_socket.exists(), "api socket must be removed");
+
+    drop(occupied);
     cleanup_spawned_herdr(spawned, base);
 }
 
