@@ -10,13 +10,19 @@
 # found by asking the user manager for LoadState (masked refuses), with a scan of every systemd
 # --user search dir as the fallback; the saved-machine client shows the bridge's own error; the
 # tests drive the entry point and the systemctl wiring through seams.
-# This host cannot build the crate (no Zig 0.16.0), so the tests run here. Each mutant removes one
-# guard and must turn the named tests red. bd herdr-waz6.
-name: Fork waz6 bridge starts unit
+# Round 3, branch fix/waz6-unit-only-bridge (codex hwaz6-r2 found four more spellings of "the
+# unit's endpoint", all in the classifier): where the unit is installed the bridge never spawns,
+# whatever endpoint it targets. The unit's own endpoint starts the unit; any other endpoint, or a
+# masked unit, is refused; the direct spawn is only for hosts with no unit. A misread endpoint can
+# now cost a refusal, never an unmanaged server. The fallback unit scan also searches the vendor
+# data dirs whatever XDG_DATA_DIRS says, as systemd does.
+# The crate tests run here, the acceptance surface. Each mutant removes one guard and must turn the
+# named tests red. bd herdr-waz6.
+name: Fork waz6 bridge never spawns beside the unit
 
 on:
   push:
-    branches: [fix/waz6-bridge-starts-unit]
+    branches: [fix/waz6-unit-only-bridge]
 
 permissions:
   contents: read
@@ -63,7 +69,7 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=19
+          expected=21
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
@@ -77,16 +83,16 @@ jobs:
         include:
           - name: unit never chosen
             file: src/remote/host.rs
-            perl: 's/\(EndpointTarget::Unit, UnitState::Installed\) => Ok\(ServerStartPlan::SystemdUnit\)/(EndpointTarget::Unit, UnitState::Installed) => Ok(ServerStartPlan::DirectSpawn) \/* MUTANT *\//'
+            perl: 's/\(UnitState::Installed, EndpointTarget::Unit\) => Ok\(ServerStartPlan::SystemdUnit\)/(UnitState::Installed, EndpointTarget::Unit) => Ok(ServerStartPlan::DirectSpawn) \/* MUTANT *\//'
             expect: "entry_starts_the_unit_for_the_default_endpoint_and_never_spawns plan_table"
-          - name: unit chosen for another session
+          - name: another session spawns beside the unit
             file: src/remote/host.rs
-            perl: 's/\(EndpointTarget::Other, _\) \| \(_, UnitState::Absent\) =>/(_, UnitState::Absent) => Ok(ServerStartPlan::DirectSpawn),\n        (EndpointTarget::Other, UnitState::Installed) => Ok(ServerStartPlan::SystemdUnit),\n        (EndpointTarget::Other, UnitState::Masked) =>/'
-            expect: "plan_table"
-          - name: other session asks systemd
+            perl: 's/\(UnitState::Installed, EndpointTarget::Other\) => Err\(/(UnitState::Installed, EndpointTarget::Other) => Ok(ServerStartPlan::DirectSpawn), \/* MUTANT *\/\n        #[allow(unreachable_patterns)]\n        (UnitState::Installed, EndpointTarget::Other) => Err(/'
+            expect: "entry_refuses_another_session_when_the_unit_is_installed plan_table"
+          - name: another session skips systemd
             file: src/remote/host.rs
-            perl: 's/EndpointTarget::Other => UnitState::Absent,/EndpointTarget::Other => host.unit_state(), \/* MUTANT *\//'
-            expect: "entry_spawns_directly_for_another_session_without_asking_systemd"
+            perl: 's/let plan = server_start_plan\(host.unit_state\(\), target\)\?;/let plan = server_start_plan(if target == EndpointTarget::Other { UnitState::Absent } else { host.unit_state() } \/* MUTANT *\/, target)?;/'
+            expect: "entry_refuses_another_session_when_the_unit_is_installed entry_refuses_another_session_when_the_unit_is_masked"
           - name: mixed endpoint read as other
             file: src/remote/host.rs
             perl: 's/_ => EndpointTarget::Mixed,/_ => EndpointTarget::Other, \/* MUTANT *\//'
@@ -97,8 +103,8 @@ jobs:
             expect: "socket_override_naming_the_default_socket_targets_the_unit"
           - name: masked unit spawns directly
             file: src/remote/host.rs
-            perl: 's/\(_, UnitState::Absent\) =>/(_, UnitState::Absent | UnitState::Masked) => \/* MUTANT *\//'
-            expect: "entry_refuses_when_the_unit_is_masked plan_table"
+            perl: 's/\(UnitState::Absent, _\) =>/(UnitState::Absent | UnitState::Masked, _) => \/* MUTANT *\//'
+            expect: "entry_refuses_when_the_unit_is_masked entry_refuses_another_session_when_the_unit_is_masked plan_table"
           - name: load state ignored
             file: src/remote/host.rs
             perl: 's/Ok\(output\) if output.success =>/Ok(output) if false \&\& output.success => \/* MUTANT *\//'
@@ -114,6 +120,10 @@ jobs:
           - name: runtime search dir dropped
             file: src/remote/host.rs
             perl: 's/        dirs.push\(runtime.join\("systemd\/user"\)\);/        let _ = runtime; \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: vendor data dirs dropped
+            file: src/remote/host.rs
+            perl: 's/for vendor in \["\/usr\/local\/share\/systemd\/user", "\/usr\/share\/systemd\/user"\]/for vendor in [] as [\&str; 0] \/* MUTANT *\//'
             expect: "unit_dirs_cover_every_user_search_path"
           - name: symlink mask not seen
             file: src/remote/host.rs
