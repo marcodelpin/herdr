@@ -109,7 +109,10 @@ pub fn run_server() -> io::Result<()> {
 
 /// Test hook: holds startup right after the API socket binds, so an
 /// integration test can land a signal in the window before the event loop
-/// runs (herdr-ir4j). Capped so a stray value cannot stall a real start.
+/// runs (herdr-ir4j). The hold is acknowledged in the server log, so a test
+/// knows the server is inside the window, and lasts until the file named by
+/// `HERDR_TEST_HOLD_AFTER_API_BIND_RELEASE` exists or the given time passed.
+/// Capped so a stray value cannot stall a real start for long.
 fn hold_startup_after_api_bind_for_test() {
     let Some(millis) = std::env::var("HERDR_TEST_HOLD_AFTER_API_BIND_MS")
         .ok()
@@ -117,7 +120,13 @@ fn hold_startup_after_api_bind_for_test() {
     else {
         return;
     };
-    std::thread::sleep(Duration::from_millis(millis.min(10_000)));
+    let until = Instant::now() + Duration::from_millis(millis.min(60_000));
+    let release = std::env::var_os("HERDR_TEST_HOLD_AFTER_API_BIND_RELEASE").map(PathBuf::from);
+    info!("startup held after the api bind for a test");
+    while Instant::now() < until && !release.as_deref().is_some_and(Path::exists) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    info!("startup hold after the api bind released");
 }
 
 fn seed_startup_workspace_if_empty(app: &mut app::App) {

@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::api::schema::InstalledPluginInfo;
 
@@ -29,7 +29,16 @@ pub(crate) fn with_registry_lock<T>(
         .read(true)
         .write(true)
         .open(lock_path)?;
-    lock.lock()?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Another herdr process holds the registry; server startup waits
+            // here. Logged so a stalled start names what it waits for.
+            info!("waiting for the plugin registry lock held by another process");
+            lock.lock()?;
+        }
+        Err(std::fs::TryLockError::Error(err)) => return Err(err),
+    }
     operation()
 }
 
