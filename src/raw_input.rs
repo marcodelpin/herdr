@@ -348,6 +348,10 @@ enum Verdict {
 impl HoldAfter {
     /// How many leading bytes of `tail` still spell a colour reply after
     /// what this context dropped or released (0 for key and report contexts).
+    /// An ESC counts as the start of the reply's ST only while the byte after
+    /// it can still be `\`: a byte that disproves the ST leaves the ESC to
+    /// start the next token, unless that byte is a new ESC, which brings its
+    /// own (ADR-0013 amendment 1, D1).
     fn reply_shaped_len(&self, tail: &[u8]) -> usize {
         let before: &[u8] = match self {
             HoldAfter::OscHeader { header, .. } => header,
@@ -362,6 +366,14 @@ impl HoldAfter {
                 break;
             }
             len += 1;
+        }
+        if len > 0
+            && tail[len - 1] == ESC
+            && tail
+                .get(len)
+                .is_some_and(|next| !matches!(*next, b'\\' | ESC))
+        {
+            len -= 1;
         }
         len
     }
@@ -486,20 +498,30 @@ fn classify_report_continuation(
         },
         b'M' => {
             const X10_LEN: usize = 6;
-            if report[3..]
-                .iter()
-                .take(X10_LEN - 3)
-                .any(|byte| *byte < 0x20)
-            {
+            let payload = &report[3..report.len().min(X10_LEN)];
+            let disproved = payload.iter().position(|byte| *byte < 0x20);
+            if released && pump {
+                // The frame is the report's or the key records the pump
+                // staged for it. A byte that disproves it drops the frame
+                // through that byte, so the pump replays the staged keys and
+                // the framer never also types them (ADR-0013 amendment 1, D4).
+                if let Some(index) = disproved {
+                    return Verdict::Drop(3 + index + 1 - prefix.len());
+                }
+                return if report.len() < X10_LEN {
+                    Verdict::Hold
+                } else if parse_default_mouse(&report[..X10_LEN]).is_some() {
+                    Verdict::Rejoin(X10_LEN - prefix.len())
+                } else {
+                    Verdict::Drop(X10_LEN - prefix.len())
+                };
+            }
+            if disproved.is_some() {
                 Verdict::Emit
             } else if report.len() < X10_LEN {
                 Verdict::Hold
             } else if parse_default_mouse(&report[..X10_LEN]).is_some() {
-                if released && pump {
-                    Verdict::Rejoin(X10_LEN - prefix.len())
-                } else {
-                    complete(X10_LEN)
-                }
+                complete(X10_LEN)
             } else {
                 Verdict::Emit
             }
@@ -1746,11 +1768,18 @@ impl RawInputByteFramer {
             if let Some(family) = self.discard_until {
                 #[cfg(any(windows, test))]
                 if let Some(deadline) = self.host_color_tail_deadline {
+                    // The held ESC was the possible start of the ST; a byte
+                    // other than `\` disproves that. A new ESC brings its own
+                    // token, so the held one only ended a reply cut short;
+                    // any other byte follows the held ESC, which starts the
+                    // next token (ADR-0013 amendment 1, D1).
                     if self.host_color_tail_split_st
                         && self.buffer.len() > 1
                         && self.buffer[1] != b'\\'
                     {
-                        self.buffer.drain(..1);
+                        if self.buffer[1] == ESC {
+                            self.buffer.drain(..1);
+                        }
                         self.end_host_color_tail_recovery();
                         continue;
                     }
