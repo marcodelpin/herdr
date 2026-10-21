@@ -1060,7 +1060,11 @@ fn sigterm_while_a_handoff_import_waits_for_commitment_answers_every_accepted_co
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
-    fs::write(config_home.join("herdr/config.toml"), "onboarding = false\n").unwrap();
+    fs::write(
+        config_home.join("herdr/config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
 
     let listener = std::os::unix::net::UnixListener::bind(&handoff_socket).unwrap();
     listener.set_nonblocking(true).unwrap();

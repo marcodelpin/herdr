@@ -82,6 +82,7 @@ mod native_graphics;
 mod notifications;
 mod render;
 mod retained_surface;
+mod startup_stop;
 mod surface_interest;
 
 // Producers can refill even a bounded channel while it is being drained.
@@ -93,6 +94,7 @@ pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
 #[cfg(unix)]
 use lifecycle::wait_for_old_public_sockets_to_close;
+pub(crate) use startup_stop::StartupStop;
 
 use crate::protocol::MAX_GRAPHICS_FRAME_SIZE;
 
@@ -310,45 +312,19 @@ fn spawn_windows_client_accept_thread(
     })
 }
 
-/// Wakes the event loop when a stop signal arrives. Signal handling is
-/// installed before the API socket accepts connections (herdr-ir4j), when the
-/// loop's channel does not exist yet; until [`QuitSignalWake::connect`] runs, a
-/// signal only sets the stop flag.
-#[derive(Clone, Default)]
-pub(crate) struct QuitSignalWake {
-    loop_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<ServerEvent>>>>,
-}
-
-impl QuitSignalWake {
-    fn connect(&self, loop_tx: mpsc::Sender<ServerEvent>) {
-        if let Ok(mut slot) = self.loop_tx.lock() {
-            *slot = Some(loop_tx);
-        }
-    }
-
-    fn wake(&self) {
-        if let Ok(slot) = self.loop_tx.lock() {
-            if let Some(loop_tx) = slot.as_ref() {
-                let _ = loop_tx.try_send(ServerEvent::QuitSignal);
-            }
-        }
-    }
-}
-
 /// Routes SIGINT and SIGTERM (a console control event on Windows) to
 /// `server_stop` from now on. Call it inside the server's Tokio runtime and
 /// before the API socket binds: a connection the server accepts must never
 /// meet the default disposition, which ends the process with the request
-/// unanswered instead of taking the shutdown drain.
-pub(crate) fn install_server_signal_handling(server_stop: &ServerStop) -> QuitSignalWake {
-    let wake = QuitSignalWake::default();
+/// unanswered instead of taking the shutdown drain. Until the event loop runs,
+/// `startup_stop` takes the signal (herdr-ir4j).
+pub(crate) fn install_server_signal_handling(server_stop: &ServerStop, startup_stop: &StartupStop) {
     let server_stop = server_stop.clone();
-    let notify = wake.clone();
+    let notify = startup_stop.clone();
     crate::platform::spawn_server_signal_monitor(move |signal| {
         server_stop.request(ShutdownReason::Signal(signal));
-        notify.wake();
+        notify.signalled();
     });
-    wake
 }
 
 impl HeadlessServer {
@@ -451,14 +427,14 @@ impl HeadlessServer {
     /// - Handles scheduled tasks (session save, metadata expiry, etc.)
     /// - Renders virtually and streams frames to clients
     ///
-    /// `quit_signal` comes from [`install_server_signal_handling`], called
+    /// `startup_stop` comes from [`install_server_signal_handling`], called
     /// before the API socket accepted its first connection.
-    pub async fn run(&mut self, quit_signal: QuitSignalWake) -> io::Result<()> {
+    pub async fn run(&mut self, startup_stop: StartupStop) -> io::Result<()> {
         crate::logging::startup("server");
 
         // A signal received before this point already set the stop flag, which
         // the first pass of the loop reads; later ones also wake the loop.
-        quit_signal.connect(self.server_event_tx.clone());
+        startup_stop.hand_over_to_event_loop(self.server_event_tx.clone());
         let quit_notify = self.server_event_tx.clone();
         let _host_shutdown = crate::platform::HostShutdownMonitor::start(
             self.host_shutdown_requested.clone(),

@@ -1,5 +1,11 @@
 use super::*;
 
+/// How long after a stop signal a handoff import may still finish starting,
+/// on top of the commitment wait's own timeout: the steps after it only log,
+/// report ownership and start plugin hooks (herdr-ir4j).
+#[cfg(unix)]
+const HANDOFF_STARTUP_STOP_MARGIN: Duration = Duration::from_secs(5);
+
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     crate::platform::ignore_server_hangup();
@@ -42,10 +48,11 @@ pub fn run_server() -> io::Result<()> {
         .map_err(io::Error::other)?;
     // Before the API socket accepts anything, so a stop signal from here on
     // takes the shutdown drain (herdr-ir4j).
-    let quit_signal = {
+    let startup_stop = StartupStop::default();
+    {
         let _runtime = rt.enter();
-        install_server_signal_handling(&server_stop)
-    };
+        install_server_signal_handling(&server_stop, &startup_stop);
+    }
 
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
@@ -61,6 +68,14 @@ pub fn run_server() -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
+    // A stop signal from here until the event loop runs drains the API server
+    // at once, whatever startup is blocked on (App::try_new waiting for the
+    // plugin registry lock, the test hold below), and ends the process if
+    // startup has not reached the loop within the drain's bound.
+    startup_stop.watch(
+        _api_server.shutdown_control(),
+        api::API_SHUTDOWN_DRAIN_TIMEOUT,
+    );
     hold_startup_after_api_bind_for_test();
 
     let result = rt.block_on(async {
@@ -99,8 +114,9 @@ pub fn run_server() -> io::Result<()> {
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
 
-        server.run(quit_signal).await
+        server.run(startup_stop.clone()).await
     });
+    startup_stop.settle_after_failed_startup();
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
@@ -186,6 +202,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .build()
         .map_err(io::Error::other)?;
 
+    let startup_stop = StartupStop::default();
     let result = rt.block_on(async {
         let app = app::App::new_from_handoff(
             &loaded_config.config,
@@ -204,12 +221,20 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
         // Before the API socket accepts anything (herdr-ir4j).
-        let quit_signal = install_server_signal_handling(&server_stop);
+        install_server_signal_handling(&server_stop, &startup_stop);
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
             server_stop.clone(),
         )?;
+        // A stop signal drains the API server at once; the commitment wait
+        // below is joined, not abandoned: leaving after `ready` can strand
+        // every pane when the source already committed. That wait ends within
+        // its own timeout, so startup gets that long plus a margin.
+        startup_stop.watch(
+            api_server.shutdown_control(),
+            crate::server::handoff::COMMIT_TIMEOUT + HANDOFF_STARTUP_STOP_MARGIN,
+        );
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
@@ -235,8 +260,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
-        server.run(quit_signal).await
+        server.run(startup_stop.clone()).await
     });
+    startup_stop.settle_after_failed_startup();
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
