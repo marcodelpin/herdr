@@ -16,7 +16,8 @@ name: Fork 14v resume launcher
 on:
   push:
     # fix/waz6-on-adopt-0.9.5: the herdr-waz6 port gets the crate tests and the dcc artifact (herdr-ih1r).
-    branches: [fix/14v-resume-launcher, fix/adopt-0.9.5, fix/waz6-on-adopt-0.9.5]
+    # fix/c3-claude-integration-v13: herdr-d98u and herdr-wf1f (bddrain cluster c3), CI only.
+    branches: [fix/14v-resume-launcher, fix/adopt-0.9.5, fix/waz6-on-adopt-0.9.5, fix/c3-claude-integration-v13]
 
 permissions:
   contents: read
