@@ -130,7 +130,7 @@ impl RawInputFramer {
             && self
                 .byte_framer
                 .host_default_color_query_deadline
-                .is_some_and(|deadline| Instant::now() < deadline)
+                .is_some_and(|deadline| self.byte_framer.now() < deadline)
     }
 
     #[cfg(all(test, not(windows)))]
@@ -152,22 +152,19 @@ impl RawInputFramer {
 
     pub(crate) fn flush_keyboard_escape(&mut self) -> Vec<RawInputEvent> {
         if self.byte_framer.buffer.as_slice() == [ESC] {
-            self.byte_framer.lone_escape_recently_flushed = true;
-            self.byte_framer.orphaned_color_reply_until = None;
-            events_from_framed_chunks(vec![std::mem::take(&mut self.byte_framer.buffer)])
+            let escape = std::mem::take(&mut self.byte_framer.buffer);
+            self.byte_framer
+                .open_tail_hold(HoldAfter::Escape { color_reply: false });
+            events_from_framed_chunks(vec![escape])
         } else {
             self.flush_timeout()
         }
     }
 
-    /// Semantic input ends mouse recovery, unlike another idle interval.
+    /// Semantic input ends every hold, unlike another idle interval: what was
+    /// held is input and goes first.
     pub(crate) fn flush_interrupted(&mut self) -> Vec<RawInputEvent> {
-        #[cfg(windows)]
-        self.byte_framer.flush_lone_escape_on_interruption();
-        let mut chunks = self.byte_framer.flush_timeout();
-        self.byte_framer.release_timed_out_mouse_prefix(&mut chunks);
-        chunks.extend(self.byte_framer.drain_available_chunks());
-        events_from_framed_chunks(chunks)
+        events_from_framed_chunks(self.byte_framer.flush_interrupted())
     }
 }
 
@@ -198,23 +195,15 @@ fn events_from_framed_chunks(chunks: Vec<Vec<u8>>) -> Vec<RawInputEvent> {
 
 #[derive(Default)]
 pub(crate) struct RawInputByteFramer {
+    /// Every byte neither emitted nor dropped yet, and only those (ADR-0010).
     buffer: Vec<u8>,
     discard_until: Option<ControlStringFamily>,
     discarded_tail_bytes: usize,
-    // Keep the discarded prefix separate from continuation bytes awaiting validation.
-    timed_out_mouse_prefix: Option<Vec<u8>>,
-    timed_out_mouse_prefix_at: Option<Instant>,
-    lone_escape_recently_flushed: bool,
-    /// Set when a lone ESC was released as a key while a host color query was
-    /// outstanding: until then, a `]10;` / `]11;` / `]4;` tail is that reply.
-    orphaned_color_reply_until: Option<Instant>,
-    /// When a timed-out `ESC [` was released as Alt+[. A mouse report split
-    /// right after its introducer continues with `<` (#5251).
-    csi_introducer_flushed_at: Option<Instant>,
-    /// When the current OSC discard began. Bytes after the dropped header are
-    /// held as a possible color reply tail, never longer than
-    /// `DISCARDED_OSC_TAIL_LIMIT`.
-    osc_tail_since: Option<Instant>,
+    /// The one bounded hold over `buffer`: what it may still complete, and
+    /// the one deadline after which every held byte is input.
+    tail_hold: Option<TailHold>,
+    #[cfg(test)]
+    test_clock: Option<Instant>,
     host_color_replies_awaited: u16,
     #[cfg(windows)]
     host_default_color_query_issued: bool,
@@ -237,8 +226,105 @@ pub(crate) struct RawInputByteFramer {
     split_coalesced_escape: bool,
     #[cfg(unix)]
     host_escape_disambiguation_active: bool,
+}
+
+/// Bytes disposed of just before `buffer` without their tail, or (Unix) a
+/// prefix still in `buffer` that waits for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HoldAfter {
+    /// A lone ESC was released as Escape. `[<...M` after it is the rest of an
+    /// SGR mouse report; with a colour query outstanding, `]10;` / `]11;` /
+    /// `]4;` through BEL or ST is the rest of that reply.
+    Escape { color_reply: bool },
+    /// `ESC [` was released as Alt+[; `<...M` is the rest of a mouse report (#5251).
+    CsiIntroducer,
+    /// An incomplete `ESC [ <` report was dropped at its idle timeout.
+    MousePrefix(Vec<u8>),
+    /// An incomplete OSC string was dropped at its idle timeout; colour reply
+    /// payload through BEL or ST is its tail. `split_st` when the dropped
+    /// bytes ended in the ESC of an ST, so a lone `\` completes it.
+    OscHeader { split_st: bool },
+    /// A confirmed host sends Escape as `CSI 27u`, so the `ESC` / `ESC [` the
+    /// first `len` buffered bytes hold may still get a delayed mouse tail (#3480).
     #[cfg(unix)]
-    awaiting_mouse_tail_after: Option<usize>,
+    DisambiguatedPrefix { len: usize },
+}
+
+#[derive(Debug)]
+struct TailHold {
+    after: HoldAfter,
+    /// The one deadline. Set when the hold opens and once more when its first
+    /// byte is held; never extended after that.
+    deadline: Instant,
+    /// Whether bytes are held yet (the deadline was set from their arrival).
+    holding: bool,
+}
+
+/// What the bytes in `buffer` are, given what was disposed of before them.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// They cannot complete it: frame them as ordinary input.
+    Emit,
+    /// The first `n` complete the disposed report: drop them.
+    Drop(usize),
+    /// The first `n` complete a reply whose ESC was released: put ESC back
+    /// so the whole reply parses as one.
+    Rejoin(usize),
+    /// They can still complete it: wait, until the deadline.
+    Hold,
+}
+
+impl HoldAfter {
+    fn limit(&self) -> Duration {
+        match self {
+            HoldAfter::Escape { color_reply: true } | HoldAfter::OscHeader { .. } => {
+                COLOR_REPLY_TAIL_LIMIT
+            }
+            HoldAfter::Escape { color_reply: false }
+            | HoldAfter::CsiIntroducer
+            | HoldAfter::MousePrefix(_) => MOUSE_REPORT_TAIL_LIMIT,
+            #[cfg(unix)]
+            HoldAfter::DisambiguatedPrefix { .. } => DISAMBIGUATED_MOUSE_TAIL_LIMIT,
+        }
+    }
+}
+
+/// Classifies the pending bytes `tail` against what was disposed of before
+/// them. Pure: the deadline is checked by the caller first (ADR-0010).
+fn classify_held_tail(after: &HoldAfter, tail: &[u8]) -> Verdict {
+    let mouse = |prefix: &[u8]| match classify_sgr_mouse_continuation(prefix, tail) {
+        SgrMouseContinuation::Incomplete => Verdict::Hold,
+        SgrMouseContinuation::Complete(len) => Verdict::Drop(len),
+        SgrMouseContinuation::Invalid => Verdict::Emit,
+    };
+    match after {
+        HoldAfter::Escape { .. } if tail.first() == Some(&b'[') => mouse(&[ESC]),
+        HoldAfter::Escape { color_reply: true } if tail.first() == Some(&b']') => {
+            match orphaned_color_reply_tail(tail) {
+                OrphanedColorReply::Prefix => Verdict::Hold,
+                OrphanedColorReply::Unrelated => Verdict::Emit,
+                OrphanedColorReply::Header(header) => {
+                    match classify_discarded_osc_tail(&tail[header..]) {
+                        DiscardedOscTail::Pending => Verdict::Hold,
+                        DiscardedOscTail::Terminated(len) => Verdict::Rejoin(header + len),
+                        DiscardedOscTail::Foreign => Verdict::Emit,
+                    }
+                }
+            }
+        }
+        HoldAfter::Escape { .. } => Verdict::Emit,
+        HoldAfter::CsiIntroducer => mouse(b"\x1b["),
+        HoldAfter::MousePrefix(prefix) => mouse(prefix),
+        HoldAfter::OscHeader { split_st: true } if tail.first() == Some(&b'\\') => Verdict::Drop(1),
+        HoldAfter::OscHeader { .. } => match classify_discarded_osc_tail(tail) {
+            DiscardedOscTail::Pending => Verdict::Hold,
+            DiscardedOscTail::Terminated(len) => Verdict::Drop(len),
+            DiscardedOscTail::Foreign => Verdict::Emit,
+        },
+        // Pushes end this hold before classification; see `push_extended`.
+        #[cfg(unix)]
+        HoldAfter::DisambiguatedPrefix { .. } => Verdict::Hold,
+    }
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -253,19 +339,18 @@ const HOST_REPLY_QUIET_WINDOW: Duration = Duration::from_secs(1);
 const HOST_COLOR_REPLY_IDLE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(any(unix, test))]
 const HOST_CELL_SIZE_QUERY_REPLIES: u16 = 1;
-const MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES: usize = 32;
-/// Longest a timed-out mouse report prefix waits for its tail: the split-read
-/// wait for any incomplete sequence. A bare `[` it holds is then released as
-/// the key it was; longer prefixes are mouse bytes and are dropped.
-const TIMED_OUT_MOUSE_PREFIX_LIMIT: Duration =
+/// Bound of a mouse report tail hold (after a released ESC or `ESC [`, or a
+/// dropped `ESC [ <` prefix): the split-read wait for any incomplete sequence.
+/// It bounds both how late the tail may start and how long its bytes are held.
+const MOUSE_REPORT_TAIL_LIMIT: Duration =
     Duration::from_millis(INCOMPLETE_SEQUENCE_FLUSH_TIMEOUT_MS as u64);
-/// How long after a timed-out `ESC [` was released as Alt+[ a `<` still reads
-/// as the rest of a split mouse report. Same split-read wait.
-const ORPHANED_CSI_TAIL_WINDOW: Duration =
-    Duration::from_millis(INCOMPLETE_SEQUENCE_FLUSH_TIMEOUT_MS as u64);
-/// Longest bytes after a dropped OSC header are held as a possible color reply
-/// tail before they are released as input. Same limit as an unfinished reply.
-const DISCARDED_OSC_TAIL_LIMIT: Duration = HOST_COLOR_REPLY_IDLE_LIMIT;
+/// Bound of a colour reply tail hold (after an ESC released while a colour
+/// query was outstanding, or a dropped OSC header): the unfinished-reply limit.
+const COLOR_REPLY_TAIL_LIMIT: Duration = HOST_COLOR_REPLY_IDLE_LIMIT;
+/// Bound of the confirmed-disambiguation hold of `ESC` / `ESC [` (#3480).
+#[cfg(unix)]
+const DISAMBIGUATED_MOUSE_TAIL_LIMIT: Duration =
+    Duration::from_millis(DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS as u64);
 
 impl RawInputByteFramer {
     pub(crate) fn for_host_input() -> Self {
@@ -282,29 +367,78 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        // An expired hold ends as if the reader had flushed at its deadline,
+        // before the new bytes can be classified with the old ones (ADR-0010).
+        let mut chunks = if self.tail_hold_expired() {
+            self.flush_timeout()
+        } else {
+            Vec::new()
+        };
         if data.is_empty() {
-            return self.push_extended();
+            chunks.extend(self.push_extended());
+            return chunks;
         }
         // Bytes after the idle limit are never part of the abandoned reply.
         self.drop_abandoned_host_color_reply();
         self.buffer.extend_from_slice(data);
-        let chunks = self.push_extended();
+        chunks.extend(self.push_extended());
+        let now = self.now();
         self.partial_host_color_reply_read_at =
-            starts_with_incomplete_default_color_response(&self.buffer).then(Instant::now);
+            starts_with_incomplete_default_color_response(&self.buffer).then_some(now);
         chunks
     }
 
     fn push_extended(&mut self) -> Vec<Vec<u8>> {
         #[cfg(unix)]
-        if let Some(prefix_len) = self.awaiting_mouse_tail_after.take() {
+        if let Some(HoldAfter::DisambiguatedPrefix { len }) =
+            self.tail_hold.as_ref().map(|hold| hold.after.clone())
+        {
+            self.tail_hold = None;
             if !continues_escape_sequence(&self.buffer) {
                 // The prefix already outlived keyboard timing; it was a key.
-                let mut chunks = vec![self.buffer.drain(..prefix_len).collect()];
+                let mut chunks = vec![self.buffer.drain(..len).collect()];
                 chunks.extend(self.drain_available_chunks());
                 return chunks;
             }
         }
         self.drain_available_chunks()
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
+    /// Freezes this framer's clock at `now`, for deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, now: Instant) {
+        self.test_clock = Some(now);
+    }
+
+    /// The deadline of the hold, for tests that assert nothing outlives it.
+    #[cfg(test)]
+    fn tail_hold_deadline(&self) -> Option<Instant> {
+        self.tail_hold.as_ref().map(|hold| hold.deadline)
+    }
+
+    fn tail_hold_expired(&self) -> bool {
+        let now = self.now();
+        self.tail_hold
+            .as_ref()
+            .is_some_and(|hold| now >= hold.deadline)
+    }
+
+    /// Opens the hold for the tail of what was just disposed of.
+    fn open_tail_hold(&mut self, after: HoldAfter) {
+        let deadline = self.now() + after.limit();
+        self.tail_hold = Some(TailHold {
+            after,
+            deadline,
+            holding: false,
+        });
     }
 
     /// Hold a lone trailing ESC for one idle flush so an OSC 10/11 reply split
@@ -318,13 +452,13 @@ impl RawInputByteFramer {
     pub(crate) fn host_default_color_query_sent(&mut self, reply_window: Duration) {
         self.host_color_query_sent_with_replies(2);
         self.host_default_color_query_issued = true;
-        self.host_default_color_query_deadline = Some(Instant::now() + reply_window);
+        self.host_default_color_query_deadline = Some(self.now() + reply_window);
     }
 
     fn host_color_query_sent_with_replies(&mut self, replies: u16) {
         self.host_color_replies_awaited = self.host_color_replies_awaited.saturating_add(replies);
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     /// Whether a buffered unfinished OSC 10/11 reply has waited past its idle
@@ -335,10 +469,11 @@ impl RawInputByteFramer {
         if self.host_default_color_query_deadline.is_some() {
             return false;
         }
+        let now = self.now();
         self.buffer.len() >= MAX_DISCARDED_CONTROL_TAIL_BYTES
             || self
                 .partial_host_color_reply_read_at
-                .is_none_or(|at| at.elapsed() >= HOST_COLOR_REPLY_IDLE_LIMIT)
+                .is_none_or(|at| now.saturating_duration_since(at) >= HOST_COLOR_REPLY_IDLE_LIMIT)
     }
 
     fn drop_abandoned_host_color_reply(&mut self) {
@@ -356,18 +491,10 @@ impl RawInputByteFramer {
         self.partial_host_color_reply_read_at = None;
     }
 
-    #[cfg(windows)]
-    fn flush_lone_escape_on_interruption(&mut self) {
-        if self.buffer.as_slice() == [ESC] {
-            self.held_pending_host_reply_esc = true;
-            self.host_default_color_query_deadline = None;
-        }
-    }
-
     fn host_appearance_query_sent(&mut self) {
         self.host_appearance_reply_awaited = true;
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     /// Same hold window as `host_color_query_sent`, for the XTWINOPS cell size
@@ -376,16 +503,17 @@ impl RawInputByteFramer {
     pub(crate) fn host_cell_size_query_sent(&mut self) {
         self.host_cell_size_replies_awaited = HOST_CELL_SIZE_QUERY_REPLIES;
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     fn awaiting_host_reply(&self) -> bool {
+        let now = self.now();
         (self.host_color_replies_awaited > 0
             || self.host_cell_size_replies_awaited > 0
             || self.host_appearance_reply_awaited)
             && self
                 .host_reply_activity_at
-                .is_some_and(|at| at.elapsed() < HOST_REPLY_QUIET_WINDOW)
+                .is_some_and(|at| now.saturating_duration_since(at) < HOST_REPLY_QUIET_WINDOW)
     }
 
     /// Stop expecting replies the host never sent, so their reply handling no
@@ -416,11 +544,9 @@ impl RawInputByteFramer {
     /// Moves every time-bounded hold `by` into the past.
     #[cfg(test)]
     fn age_held_input(&mut self, by: Duration) {
-        let age = |at: Option<Instant>| at.and_then(|at| at.checked_sub(by));
-        self.timed_out_mouse_prefix_at = age(self.timed_out_mouse_prefix_at);
-        self.orphaned_color_reply_until = age(self.orphaned_color_reply_until);
-        self.csi_introducer_flushed_at = age(self.csi_introducer_flushed_at);
-        self.osc_tail_since = age(self.osc_tail_since);
+        if let Some(hold) = &mut self.tail_hold {
+            hold.deadline = hold.deadline.checked_sub(by).unwrap_or(hold.deadline);
+        }
     }
 
     #[cfg(test)]
@@ -442,58 +568,45 @@ impl RawInputByteFramer {
         self.host_appearance_query_on_focus = true;
     }
 
+    /// Every held byte is in `buffer`, so this is all the input not yet
+    /// emitted or dropped.
     #[cfg(any(unix, test))]
     pub(crate) fn has_pending_input(&self) -> bool {
-        !self.buffer.is_empty() || self.timed_out_mouse_prefix.is_some()
+        !self.buffer.is_empty()
     }
 
-    /// Milliseconds until a time-bounded hold must be released by
-    /// `flush_timeout` even if no further input arrives, if one is active.
+    /// Milliseconds until `flush_timeout` must run even if no further input
+    /// arrives: the hold's deadline while it holds bytes, or one idle interval
+    /// while a lone ESC (or `ESC [`) is held one flush for a host reply. `None`
+    /// means only more input can change what is pending.
     #[cfg(any(unix, test))]
     pub(crate) fn held_input_release_ms(&self) -> Option<i32> {
-        let prefix = self
-            .timed_out_mouse_prefix
-            .as_ref()
-            .and(self.timed_out_mouse_prefix_at)
-            .map(|at| at + TIMED_OUT_MOUSE_PREFIX_LIMIT);
-        let osc_tail = (self.discard_until == Some(ControlStringFamily::Osc)
-            && !self.buffer.is_empty())
-        .then_some(self.osc_tail_since)
-        .flatten()
-        .map(|since| since + DISCARDED_OSC_TAIL_LIMIT);
-        let color_reply = self
-            .holds_orphaned_color_reply_prefix()
-            .then_some(self.orphaned_color_reply_until)
-            .flatten();
-        let deadline = [prefix, osc_tail, color_reply]
-            .into_iter()
-            .flatten()
-            .min()?;
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
-        // Round up so the deadline has passed when the wait ends.
-        Some(
-            i32::try_from(remaining)
-                .unwrap_or(i32::MAX)
-                .saturating_add(1),
-        )
+        if self.buffer.is_empty() {
+            return None;
+        }
+        if let Some(hold) = &self.tail_hold {
+            let remaining = hold
+                .deadline
+                .saturating_duration_since(self.now())
+                .as_millis();
+            // Round up so the deadline has passed when the wait ends.
+            return Some(
+                i32::try_from(remaining)
+                    .unwrap_or(i32::MAX)
+                    .saturating_add(1),
+            );
+        }
+        self.holds_reply_prefix_one_flush()
+            .then_some(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
     }
 
-    fn orphaned_color_reply_open(&self) -> bool {
-        self.orphaned_color_reply_until
-            .is_some_and(|until| Instant::now() < until)
-    }
-
-    fn holds_orphaned_color_reply_prefix(&self) -> bool {
-        self.lone_escape_recently_flushed
-            && self.orphaned_color_reply_open()
-            && orphaned_color_reply_tail(&self.buffer) == OrphanedColorReply::Prefix
-    }
-
-    fn orphaned_csi_tail_open(&self) -> bool {
-        self.csi_introducer_flushed_at
-            .is_some_and(|at| at.elapsed() < ORPHANED_CSI_TAIL_WINDOW)
+    /// A lone ESC or `ESC [` held for exactly one more flush while a host
+    /// reply is awaited (see `flush_timeout`).
+    #[cfg(any(unix, test))]
+    fn holds_reply_prefix_one_flush(&self) -> bool {
+        self.held_pending_host_reply_esc
+            && (matches!(self.buffer.as_slice(), [ESC] | [ESC, b'['])
+                || starts_with_incomplete_host_color_scheme_report(&self.buffer))
     }
 
     #[cfg(unix)]
@@ -542,11 +655,31 @@ impl RawInputByteFramer {
     /// How long to keep holding input after a first idle flush held it.
     #[cfg(unix)]
     pub(crate) fn held_input_flush_timeout_ms(&self) -> i32 {
-        if self.awaiting_mouse_tail_after.is_some() {
-            DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS
-        } else {
-            RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS
+        self.held_input_release_ms()
+            .unwrap_or(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+    }
+
+    /// Ends every hold at once, for semantic input (Windows key, focus and
+    /// mouse records): what was held is input and is emitted, in order, before
+    /// the caller emits that event. Opens no new hold.
+    #[cfg(any(windows, test))]
+    pub(crate) fn flush_interrupted(&mut self) -> Vec<Vec<u8>> {
+        // A lone ESC held one flush for a host reply is served by this flush.
+        if self.buffer.as_slice() == [ESC] {
+            self.held_pending_host_reply_esc = true;
+            #[cfg(windows)]
+            {
+                self.host_default_color_query_deadline = None;
+            }
         }
+        self.tail_hold = None;
+        let mut chunks = self.flush_timeout();
+        // A hold this flush opened belongs to bytes already emitted or dropped;
+        // semantic input ends it too.
+        if self.tail_hold.take().is_some() {
+            chunks.extend(self.drain_available_chunks());
+        }
+        chunks
     }
 
     #[cfg(any(windows, test))]
@@ -556,22 +689,48 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn flush_timeout(&mut self) -> Vec<Vec<u8>> {
+        // The deadline is checked before anything is classified. An expired
+        // hold's bytes are then framed as ordinary input, in order.
+        let expired_hold = if self.tail_hold_expired() {
+            self.tail_hold.take()
+        } else {
+            None
+        };
+        if let Some(hold) = &expired_hold {
+            tracing::debug!(
+                after = ?hold.after,
+                len = self.buffer.len(),
+                "releasing held input at its deadline"
+            );
+        }
+        // A finished mouse wait also counts as this prefix's one-flush host
+        // reply hold, so the two holds never stack.
+        #[cfg(unix)]
+        let mouse_wait_served = matches!(
+            expired_hold.map(|hold| hold.after),
+            Some(HoldAfter::DisambiguatedPrefix { .. })
+        );
+        #[cfg(not(unix))]
+        let mouse_wait_served = {
+            let _ = expired_hold;
+            false
+        };
         let mut chunks = self.drain_available_chunks();
         self.expire_unanswered_host_queries();
 
         #[cfg(windows)]
         let host_color_query_expired = self
             .host_default_color_query_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
+            .is_some_and(|deadline| self.now() >= deadline);
         #[cfg(windows)]
         if host_color_query_expired {
             self.host_default_color_query_deadline = None;
             self.host_color_replies_awaited = 0;
         }
 
-        // Idle is not evidence that a mouse report has ended. The continuation
-        // stays bounded and is released if it cannot complete a valid report.
-        if self.timed_out_mouse_prefix.is_some() {
+        // Idle is not evidence that a held tail has ended: it waits for the
+        // deadline, or for a byte that decides it.
+        if self.tail_hold.is_some() {
             return chunks;
         }
 
@@ -581,11 +740,6 @@ impl RawInputByteFramer {
             }
             #[cfg(windows)]
             if self.host_color_tail_deadline.is_some() {
-                return chunks;
-            }
-            // A possible color reply tail stays held; draining above releases
-            // it once `DISCARDED_OSC_TAIL_LIMIT` has passed.
-            if family == ControlStringFamily::Osc {
                 return chunks;
             }
             let keep_split_st = self.buffer.last() == Some(&ESC);
@@ -609,64 +763,36 @@ impl RawInputByteFramer {
 
         // A confirmed host sends Escape as `CSI 27u`, so a mouse report prefix
         // that outlives keyboard timing may still get a delayed tail (#3480).
-        // Keep it briefly; `push` releases it if other input follows.
-        // A finished mouse wait also counts as this prefix's one-flush host
-        // reply hold, so the two holds never stack.
-        #[cfg(unix)]
-        let mouse_wait_served = self.awaiting_mouse_tail_after.take().is_some();
-        #[cfg(not(unix))]
-        let mouse_wait_served = false;
-        #[cfg(unix)]
+        // Keep it until its deadline; `push` releases it if other input follows.
         // Prefixes already inside a sequence waited the long window; only the
         // ambiguous ESC / ESC[ prefixes need this extra mouse-tail hold.
+        #[cfg(unix)]
         if !mouse_wait_served
             && self.host_escape_disambiguation_active
             && self.pending_could_be_escape_key()
             && could_continue_as_mouse_report(&self.buffer)
         {
-            self.awaiting_mouse_tail_after = Some(self.buffer.len());
-            return chunks;
-        }
-
-        // Part of a color reply header after its ESC was released as a key;
-        // held only while that reply can still arrive.
-        if self.holds_orphaned_color_reply_prefix() {
-            return chunks;
-        }
-
-        if self.orphaned_csi_tail_open() && starts_with_incomplete_orphaned_csi_tail(&self.buffer) {
-            tracing::debug!(
-                len = self.buffer.len(),
-                "retaining incomplete SGR mouse tail after timed-out CSI introducer"
-            );
-            let mut prefix = b"\x1b[".to_vec();
-            prefix.append(&mut self.buffer);
-            self.retain_timed_out_mouse_prefix(prefix);
-            self.csi_introducer_flushed_at = None;
-            return chunks;
-        }
-
-        if self.lone_escape_recently_flushed
-            && starts_with_incomplete_orphaned_sgr_mouse_tail(&self.buffer)
-        {
-            tracing::debug!(
-                len = self.buffer.len(),
-                "discarding incomplete orphaned SGR mouse tail after input timeout"
-            );
-            let mut prefix = vec![ESC];
-            prefix.append(&mut self.buffer);
-            self.retain_timed_out_mouse_prefix(prefix);
-            self.lone_escape_recently_flushed = false;
+            let len = self.buffer.len();
+            self.open_tail_hold(HoldAfter::DisambiguatedPrefix { len });
+            if let Some(hold) = &mut self.tail_hold {
+                hold.holding = true;
+            }
             return chunks;
         }
 
         if starts_with_incomplete_sgr_mouse_sequence(&self.buffer) {
+            // `CSI <` starts no key: these bytes are a mouse report fragment.
+            // They are dropped, and what follows them is held as its tail.
             tracing::debug!(
                 bytes = ?self.buffer,
                 "discarding incomplete SGR mouse sequence after input timeout"
             );
             let prefix = std::mem::take(&mut self.buffer);
-            self.retain_timed_out_mouse_prefix(prefix);
+            if prefix.len() < MAX_DISCARDED_CONTROL_TAIL_BYTES
+                && plausible_sgr_mouse_prefix(&prefix)
+            {
+                self.open_tail_hold(HoldAfter::MousePrefix(prefix));
+            }
             return chunks;
         }
 
@@ -693,8 +819,7 @@ impl RawInputByteFramer {
                 self.discard_until = Some(ControlStringFamily::Osc);
                 let split_st = self.buffer.last() == Some(&ESC);
                 self.discarded_tail_bytes = self.buffer.len() - usize::from(split_st);
-                self.host_color_tail_deadline =
-                    Some(Instant::now() + HOST_COLOR_TAIL_RECOVERY_GRACE);
+                self.host_color_tail_deadline = Some(self.now() + HOST_COLOR_TAIL_RECOVERY_GRACE);
                 self.host_color_tail_split_st = split_st;
                 self.buffer.clear();
                 if split_st {
@@ -778,10 +903,12 @@ impl RawInputByteFramer {
         // (OSC, DCS, APC, PM, SOS) also start host replies, so they keep the
         // control-string path and are never forwarded as Alt keys (#344).
         if is_alt_key_introducer(&self.buffer) && !self.awaiting_host_reply() {
-            if self.buffer.as_slice() == b"\x1b[" {
-                self.csi_introducer_flushed_at = Some(Instant::now());
-            }
+            let csi = self.buffer.as_slice() == b"\x1b[";
             chunks.push(std::mem::take(&mut self.buffer));
+            if csi {
+                // The rest of a split mouse report can still follow.
+                self.open_tail_hold(HoldAfter::CsiIntroducer);
+            }
             return chunks;
         }
 
@@ -790,12 +917,18 @@ impl RawInputByteFramer {
                 len = self.buffer.len(),
                 "discarding incomplete host control string after input timeout"
             );
+            let split_st = self.buffer.last() == Some(&ESC);
+            self.buffer.clear();
+            if family == ControlStringFamily::Osc {
+                // Its tail is held under a deadline and dropped only if it
+                // completes a reply; anything else is input (#5251).
+                self.open_tail_hold(HoldAfter::OscHeader { split_st });
+                return chunks;
+            }
             // This intentionally gives host control replies precedence over legacy
             // Alt forms like Alt+] after timeout, so later reply tails cannot leak.
             self.discard_until = Some(family);
             self.discarded_tail_bytes = 0;
-            self.osc_tail_since = (family == ControlStringFamily::Osc).then(Instant::now);
-            self.buffer.clear();
             return chunks;
         }
 
@@ -813,10 +946,8 @@ impl RawInputByteFramer {
                 tracing::trace!("holding lone escape one flush while awaiting host reply");
                 return chunks;
             }
-            // The reply can still follow without its ESC; see `drain_available_chunks`.
-            self.orphaned_color_reply_until = (self.host_color_replies_awaited > 0
-                && self.awaiting_host_reply())
-            .then(|| Instant::now() + HOST_REPLY_QUIET_WINDOW);
+            // The reply can still follow without its ESC; see `classify_held_tail`.
+            let color_reply = self.host_color_replies_awaited > 0 && self.awaiting_host_reply();
             // No continuation arrived; give up the window so Escape is not delayed again.
             self.host_color_replies_awaited = 0;
             #[cfg(windows)]
@@ -830,14 +961,20 @@ impl RawInputByteFramer {
                 bytes = ?self.buffer,
                 "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
             );
-            self.lone_escape_recently_flushed = true;
             chunks.push(std::mem::take(&mut self.buffer));
+            self.open_tail_hold(HoldAfter::Escape { color_reply });
             return chunks;
         }
 
         if let Ok(text) = std::str::from_utf8(&self.buffer) {
             if parse_terminal_key_sequence(text).is_some() {
+                // While a reply is awaited, `ESC [` is released here rather
+                // than as an Alt introducer above; its tail is held the same.
+                let csi = self.buffer.as_slice() == b"\x1b[";
                 chunks.push(std::mem::take(&mut self.buffer));
+                if csi {
+                    self.open_tail_hold(HoldAfter::CsiIntroducer);
+                }
                 return chunks;
             }
         }
@@ -854,103 +991,60 @@ impl RawInputByteFramer {
         }
 
         tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
-        self.lone_escape_recently_flushed = false;
         self.buffer.clear();
         chunks
     }
 
-    fn retain_timed_out_mouse_prefix(&mut self, prefix: Vec<u8>) {
-        self.timed_out_mouse_prefix = (prefix.len() < MAX_DISCARDED_CONTROL_TAIL_BYTES
-            && plausible_sgr_mouse_prefix(&prefix))
-        .then_some(prefix);
-        self.timed_out_mouse_prefix_at = self.timed_out_mouse_prefix.is_some().then(Instant::now);
-    }
-
-    /// Ends mouse recovery without a completed report. `ESC [` alone is also
-    /// how a key or a legacy sequence can start, so a bare bracket is released
-    /// as the ordinary input it was; longer prefixes are mouse bytes.
-    fn release_timed_out_mouse_prefix(&mut self, chunks: &mut Vec<Vec<u8>>) {
-        if self.timed_out_mouse_prefix.take().as_deref() == Some(b"\x1b[".as_slice()) {
-            chunks.push(vec![b'[']);
+    /// Applies the open tail hold to the front of `buffer`. Returns false
+    /// when the bytes must stay held.
+    fn resolve_tail_hold(&mut self) -> bool {
+        let Some(hold) = &self.tail_hold else {
+            return true;
+        };
+        #[cfg(unix)]
+        if matches!(hold.after, HoldAfter::DisambiguatedPrefix { .. }) {
+            return false;
         }
-        self.timed_out_mouse_prefix_at = None;
-    }
-
-    fn end_osc_tail_discard(&mut self) {
-        self.discard_until = None;
-        self.discarded_tail_bytes = 0;
-        self.osc_tail_since = None;
+        if self.buffer.is_empty() {
+            return false;
+        }
+        match classify_held_tail(&hold.after, &self.buffer) {
+            Verdict::Hold => {
+                if !hold.holding {
+                    let deadline = self.now() + hold.after.limit();
+                    if let Some(hold) = &mut self.tail_hold {
+                        hold.deadline = deadline;
+                        hold.holding = true;
+                    }
+                }
+                false
+            }
+            Verdict::Drop(len) => {
+                tracing::debug!(len, "discarding report tail after its timed-out prefix");
+                self.buffer.drain(..len);
+                self.tail_hold = None;
+                true
+            }
+            Verdict::Rejoin(_) => {
+                // Put the released ESC back: the reply is complete, so it
+                // parses as a host reply and never as input.
+                self.buffer.insert(0, ESC);
+                self.tail_hold = None;
+                true
+            }
+            Verdict::Emit => {
+                self.tail_hold = None;
+                true
+            }
+        }
     }
 
     fn drain_available_chunks(&mut self) -> Vec<Vec<u8>> {
         let mut chunks = Vec::new();
 
         loop {
-            if let Some(prefix) = &self.timed_out_mouse_prefix {
-                match classify_sgr_mouse_continuation(prefix, &self.buffer) {
-                    SgrMouseContinuation::Incomplete => {
-                        let expired = self
-                            .timed_out_mouse_prefix_at
-                            .is_none_or(|at| at.elapsed() >= TIMED_OUT_MOUSE_PREFIX_LIMIT);
-                        if !expired {
-                            break;
-                        }
-                        self.release_timed_out_mouse_prefix(&mut chunks);
-                    }
-                    SgrMouseContinuation::Complete(len) => {
-                        self.buffer.drain(..len);
-                        self.timed_out_mouse_prefix = None;
-                        self.timed_out_mouse_prefix_at = None;
-                    }
-                    SgrMouseContinuation::Invalid => {
-                        self.release_timed_out_mouse_prefix(&mut chunks);
-                    }
-                }
-            }
-
-            if self.lone_escape_recently_flushed {
-                if starts_with_incomplete_orphaned_sgr_mouse_tail(&self.buffer) {
-                    break;
-                }
-                if let Some(len) = complete_orphaned_sgr_mouse_tail_len(&[ESC], &self.buffer) {
-                    self.buffer.drain(..len);
-                    self.lone_escape_recently_flushed = false;
-                    continue;
-                }
-                if self.orphaned_color_reply_open() {
-                    match orphaned_color_reply_tail(&self.buffer) {
-                        // Put the ESC back: the reply is parsed, or bounded
-                        // and dropped, like any other split host reply.
-                        OrphanedColorReply::Header => {
-                            self.buffer.insert(0, ESC);
-                            self.lone_escape_recently_flushed = false;
-                            self.orphaned_color_reply_until = None;
-                            continue;
-                        }
-                        OrphanedColorReply::Prefix => break,
-                        OrphanedColorReply::Unrelated => {}
-                    }
-                }
-                self.lone_escape_recently_flushed = false;
-                self.orphaned_color_reply_until = None;
-            }
-
-            if self.csi_introducer_flushed_at.is_some() {
-                if self.orphaned_csi_tail_open() {
-                    if self.buffer.is_empty()
-                        || starts_with_incomplete_orphaned_csi_tail(&self.buffer)
-                    {
-                        break;
-                    }
-                    if let Some(len) = complete_orphaned_sgr_mouse_tail_len(b"\x1b[", &self.buffer)
-                    {
-                        tracing::debug!("discarding SGR mouse tail after timed-out CSI introducer");
-                        self.buffer.drain(..len);
-                        self.csi_introducer_flushed_at = None;
-                        continue;
-                    }
-                }
-                self.csi_introducer_flushed_at = None;
+            if !self.resolve_tail_hold() {
+                break;
             }
 
             if let Some(family) = self.discard_until {
@@ -996,7 +1090,7 @@ impl RawInputByteFramer {
                             continue;
                         }
                     }
-                    if Instant::now() >= deadline
+                    if self.now() >= deadline
                         || self.discarded_tail_bytes + self.buffer.len()
                             >= MAX_DISCARDED_CONTROL_TAIL_BYTES
                     {
@@ -1013,24 +1107,6 @@ impl RawInputByteFramer {
                         continue;
                     }
                     break;
-                }
-                if family == ControlStringFamily::Osc {
-                    // Past the bound no reply tail is expected, not even its
-                    // terminator: a later BEL or `ESC \` is typing.
-                    let expired = self
-                        .osc_tail_since
-                        .is_none_or(|since| since.elapsed() >= DISCARDED_OSC_TAIL_LIMIT);
-                    match classify_discarded_osc_tail(&self.buffer) {
-                        // Only a color reply tail terminated in time is dropped.
-                        DiscardedOscTail::Terminated(len) if !expired => {
-                            self.buffer.drain(..len);
-                        }
-                        DiscardedOscTail::Pending if !expired => break,
-                        // Anything else was input: release the held bytes.
-                        _ => {}
-                    }
-                    self.end_osc_tail_discard();
-                    continue;
                 }
                 let Some(terminator_len) =
                     control_string_terminator_for_family(&self.buffer, family)
@@ -1078,7 +1154,7 @@ impl RawInputByteFramer {
             }
             if is_host_reply_event(&event) && self.host_reply_activity_at.is_some() {
                 // Long reply bursts (256 palette entries) stay protected.
-                self.host_reply_activity_at = Some(Instant::now());
+                self.host_reply_activity_at = Some(self.now());
             }
             self.held_pending_host_reply_esc = false;
             chunks.push(self.buffer[..consumed].to_vec());
@@ -1176,8 +1252,8 @@ fn classify_discarded_osc_tail(tail: &[u8]) -> DiscardedOscTail {
 
 #[derive(Debug, PartialEq, Eq)]
 enum OrphanedColorReply {
-    /// Starts with a full color reply header.
-    Header,
+    /// Starts with a full color reply header of this many bytes.
+    Header(usize),
     /// Could still grow into one.
     Prefix,
     Unrelated,
@@ -1186,8 +1262,8 @@ enum OrphanedColorReply {
 /// Classifies bytes that followed a lone ESC already released as a key.
 fn orphaned_color_reply_tail(buffer: &[u8]) -> OrphanedColorReply {
     const HEADERS: [&[u8]; 3] = [b"]10;", b"]11;", b"]4;"];
-    if HEADERS.iter().any(|header| buffer.starts_with(header)) {
-        OrphanedColorReply::Header
+    if let Some(header) = HEADERS.iter().find(|header| buffer.starts_with(header)) {
+        OrphanedColorReply::Header(header.len())
     } else if !buffer.is_empty() && HEADERS.iter().any(|header| header.starts_with(buffer)) {
         OrphanedColorReply::Prefix
     } else {
@@ -1499,6 +1575,12 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
         return complete_escape_sequence_len(&buffer[1..]).map(|len| len + 1);
     }
 
+    // No sequence carries ESC right after its CSI or SS3 introducer: the
+    // introducer was a legacy Alt+[ / Alt+O and a new sequence starts.
+    if matches!(buffer, [ESC, b'[' | b'O', ESC, ..]) {
+        return Some(2);
+    }
+
     if buffer.starts_with(b"\x1b[") {
         if buffer.starts_with(b"\x1b[<") {
             return find_csi_final(buffer, b"Mm");
@@ -1562,46 +1644,6 @@ fn could_continue_as_mouse_report(buffer: &[u8]) -> bool {
 #[cfg(any(windows, test))]
 fn starts_with_incomplete_default_mouse_sequence(buffer: &[u8]) -> bool {
     buffer.starts_with(b"\x1b[M") && buffer.len() < 6
-}
-
-fn starts_with_incomplete_orphaned_sgr_mouse_tail(buffer: &[u8]) -> bool {
-    if buffer.len() > MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES {
-        return false;
-    }
-    buffer.len() < 3 && b"[<".starts_with(buffer)
-        || buffer.starts_with(b"[<")
-            && buffer[2..]
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || *byte == b';')
-}
-
-/// Bytes after an `ESC [` already released as Alt+[ that can still become
-/// the rest of an SGR mouse report.
-fn starts_with_incomplete_orphaned_csi_tail(buffer: &[u8]) -> bool {
-    buffer.len() < MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES
-        && buffer.first() == Some(&b'<')
-        && buffer[1..]
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || *byte == b';')
-}
-
-/// Length of a complete SGR mouse report tail at the start of `buffer`, whose
-/// `introducer` (`ESC` or `ESC [`) was already released on timeout.
-fn complete_orphaned_sgr_mouse_tail_len(introducer: &[u8], buffer: &[u8]) -> Option<usize> {
-    let terminator_len = buffer
-        .iter()
-        .position(|byte| matches!(*byte, b'M' | b'm'))
-        .map(|idx| idx + 1)?;
-    // Measured from the `[`, whichever read it arrived in.
-    if introducer.len() - 1 + terminator_len > MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES {
-        return None;
-    }
-    let mut sequence = Vec::with_capacity(introducer.len() + terminator_len);
-    sequence.extend_from_slice(introducer);
-    sequence.extend_from_slice(&buffer[..terminator_len]);
-    let sequence = std::str::from_utf8(&sequence).ok()?;
-    parse_sgr_mouse(sequence)?;
-    Some(terminator_len)
 }
 
 fn discard_host_reply_csi_tail(buffer: &mut Vec<u8>, discarded_tail_bytes: &mut usize) -> bool {
@@ -1881,6 +1923,13 @@ fn parse_mouse_cb(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
 
     Some((kind, modifiers))
 }
+
+#[cfg(test)]
+mod hold_property_tests;
+#[cfg(test)]
+mod review_5251_r1_tests;
+#[cfg(test)]
+mod review_5251_r2_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2873,7 +2922,7 @@ mod tests {
             let mut rest = tail[split..].to_vec();
             rest.extend_from_slice(b"x\x1b[A");
             assert_eq!(framer.push(&rest), vec![b"x".to_vec(), b"\x1b[A".to_vec()]);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert!(!framer.has_pending_input());
         }
     }
@@ -2891,7 +2940,7 @@ mod tests {
             assert!(framer.push(b"\x1b[<3").is_empty());
             assert!(framer.flush_timeout().is_empty());
             assert_eq!(framer.push(tail).concat(), tail);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
         }
     }
 
@@ -2915,7 +2964,7 @@ mod tests {
             let mut expected = b"5;28;".to_vec();
             expected.extend_from_slice(suffix);
             assert_eq!(chunks.concat(), expected);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert_eq!(framer.push(b"123M").concat(), b"123M");
         }
     }
@@ -2930,7 +2979,7 @@ mod tests {
         let mut valid_tail = vec![b'0'; remaining - 2];
         valid_tail.extend_from_slice(b"1M");
         assert!(framer.push(&valid_tail).is_empty()); // complete exactly at limit
-        assert!(framer.timed_out_mouse_prefix.is_none());
+        assert!(framer.tail_hold.is_none());
 
         for length in [remaining, remaining + 1024] {
             let mut framer = RawInputByteFramer::default();
@@ -2938,7 +2987,7 @@ mod tests {
             assert!(framer.flush_timeout().is_empty());
             let tail = vec![b'0'; length];
             assert_eq!(framer.push(&tail).concat(), tail);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert_eq!(framer.push(b"1Mtext").concat(), b"1Mtext");
         }
 
@@ -2950,7 +2999,7 @@ mod tests {
         assert!(framer.flush_timeout().is_empty());
         tail.extend_from_slice(b"01M");
         assert_eq!(framer.push(b"01M").concat(), tail);
-        assert!(framer.timed_out_mouse_prefix.is_none());
+        assert!(framer.tail_hold.is_none());
     }
 
     #[test]
@@ -3138,11 +3187,11 @@ mod tests {
         assert!(framer.has_pending_input());
         let wait = framer.held_input_release_ms().expect("bounded hold");
         assert!(
-            (1..=TIMED_OUT_MOUSE_PREFIX_LIMIT.as_millis() as i32 + 1).contains(&wait),
+            (1..=MOUSE_REPORT_TAIL_LIMIT.as_millis() as i32 + 1).contains(&wait),
             "{wait}"
         );
 
-        framer.age_held_input(TIMED_OUT_MOUSE_PREFIX_LIMIT);
+        framer.age_held_input(MOUSE_REPORT_TAIL_LIMIT);
         assert_eq!(framer.flush_timeout(), vec![b"[".to_vec()]);
         assert!(!framer.has_pending_input());
         assert_eq!(framer.held_input_release_ms(), None);
@@ -3155,9 +3204,11 @@ mod tests {
 
         assert!(framer.push(b"\x1b[<35;10").is_empty());
         assert!(framer.flush_timeout().is_empty());
-        assert!(framer.has_pending_input());
+        // The dropped prefix is not pending input; only its hold is open.
+        assert!(!framer.has_pending_input());
+        assert!(framer.tail_hold.is_some());
 
-        framer.age_held_input(TIMED_OUT_MOUSE_PREFIX_LIMIT);
+        framer.age_held_input(MOUSE_REPORT_TAIL_LIMIT);
         assert!(framer.flush_timeout().is_empty());
         assert!(!framer.has_pending_input());
         // Digits typed later are not taken for the old report's tail.
@@ -3224,7 +3275,7 @@ mod tests {
         let mut framer = RawInputByteFramer::default();
         assert!(framer.push(b"\x1b[").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b[".to_vec()]);
-        framer.age_held_input(ORPHANED_CSI_TAIL_WINDOW);
+        framer.age_held_input(MOUSE_REPORT_TAIL_LIMIT);
         assert_eq!(framer.push(b"<"), vec![b"<".to_vec()]);
     }
 
@@ -3535,11 +3586,11 @@ mod tests {
         assert!(framer.has_pending_input());
         let wait = framer.held_input_release_ms().expect("bounded hold");
         assert!(
-            (1..=DISCARDED_OSC_TAIL_LIMIT.as_millis() as i32 + 1).contains(&wait),
+            (1..=COLOR_REPLY_TAIL_LIMIT.as_millis() as i32 + 1).contains(&wait),
             "{wait}"
         );
 
-        framer.age_held_input(DISCARDED_OSC_TAIL_LIMIT);
+        framer.age_held_input(COLOR_REPLY_TAIL_LIMIT);
         assert_eq!(framer.flush_timeout(), vec![b"a".to_vec(), b"b".to_vec()]);
         assert!(!framer.has_pending_input());
         assert_eq!(framer.held_input_release_ms(), None);
@@ -3591,7 +3642,7 @@ mod tests {
 
             assert!(framer.push(b"\x1b]").is_empty());
             assert!(framer.flush_timeout().is_empty());
-            framer.age_held_input(DISCARDED_OSC_TAIL_LIMIT);
+            framer.age_held_input(COLOR_REPLY_TAIL_LIMIT);
             let mut typed = framer.push(terminator);
             typed.extend(framer.flush_timeout());
             assert_eq!(typed.concat(), terminator.to_vec(), "{terminator:?}");
