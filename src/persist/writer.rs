@@ -9,6 +9,9 @@ use super::{SessionHistorySnapshot, SessionSnapshot};
 pub(crate) struct SessionWriter {
     path: PathBuf,
     protect_unloaded: bool,
+    /// A live handoff transferred a session that no write has reached the
+    /// disk with yet (ADR-0014 invariant I6).
+    owes_transferred_session: bool,
 }
 
 impl SessionWriter {
@@ -16,7 +19,19 @@ impl SessionWriter {
         Self {
             path: super::io::session_path(),
             protect_unloaded,
+            owes_transferred_session: false,
         }
+    }
+
+    /// From now on until a write reaches the disk, the session holds a
+    /// transferred one that exists nowhere else.
+    pub(crate) fn owe_transferred_session(&mut self) {
+        self.owes_transferred_session = true;
+    }
+
+    /// Whether a transferred session is still not on disk.
+    pub(crate) fn owes_transferred_session(&self) -> bool {
+        self.owes_transferred_session
     }
 
     fn preserve_unloaded(&mut self) -> io::Result<()> {
@@ -62,6 +77,7 @@ impl SessionWriter {
         }
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
+        self.owes_transferred_session = false;
         self.preserve_snapshot_history();
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::save_history_to_path(&history_path, history) {
@@ -87,6 +103,8 @@ impl SessionWriter {
             crate::logging::session_clear_failed(&self.path, &err.to_string());
             return Err(err);
         }
+        // No workspace is left to lose.
+        self.owes_transferred_session = false;
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::clear_path(&history_path) {
             crate::logging::session_clear_failed(&history_path, &err.to_string());

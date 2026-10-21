@@ -1694,15 +1694,42 @@ struct CommittedHandoff {
     _source: UnixStream,
     _pty: portable_pty::PtyPair,
     pane_child: Box<dyn Child + Send + Sync>,
-    registry_lock: fs::File,
+    registry_lock: Option<fs::File>,
     session_file: PathBuf,
     log: PathBuf,
     signalled: Instant,
     marker: &'static str,
 }
 
+/// When the stop reaches a [`CommittedHandoff`], and whether the plugin
+/// registry lock stays held so startup cannot reach the event loop.
+struct HandoffStop {
+    hold_registry_lock: bool,
+    signal: SignalAt,
+}
+
+enum SignalAt {
+    /// SIGTERM right before `committed`.
+    BeforeCommit,
+    /// SIGTERM this long after `committed`.
+    AfterCommit(Duration),
+    /// No SIGTERM until the test calls [`CommittedHandoff::signal`].
+    ByTheTest,
+}
+
 impl CommittedHandoff {
     fn start(base: &Path, before_commit: impl FnOnce(&Path)) -> Self {
+        Self::start_with(
+            base,
+            before_commit,
+            HandoffStop {
+                hold_registry_lock: true,
+                signal: SignalAt::BeforeCommit,
+            },
+        )
+    }
+
+    fn start_with(base: &Path, before_commit: impl FnOnce(&Path), stop: HandoffStop) -> Self {
         use std::os::unix::io::RawFd;
 
         let config_home = base.join("config");
@@ -1752,21 +1779,43 @@ impl CommittedHandoff {
         );
         assert_eq!(read_handoff_line(&mut source), "ready");
 
-        let registry_lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(app_dir.join(".plugins.lock"))
-            .unwrap();
-        registry_lock.lock().unwrap();
+        let registry_lock = stop.hold_registry_lock.then(|| {
+            let registry_lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(app_dir.join(".plugins.lock"))
+                .unwrap();
+            registry_lock.lock().unwrap();
+            registry_lock
+        });
         before_commit(&app_dir);
 
         let pid = import.child.id() as libc::pid_t;
-        let signalled = Instant::now();
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-        source.write_all(b"committed\n").unwrap();
-        assert_eq!(read_handoff_line(&mut source), "owned");
+        let signalled = match stop.signal {
+            SignalAt::BeforeCommit => {
+                let signalled = Instant::now();
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+                source.write_all(b"committed\n").unwrap();
+                assert_eq!(read_handoff_line(&mut source), "owned");
+                signalled
+            }
+            SignalAt::AfterCommit(delay) => {
+                source.write_all(b"committed\n").unwrap();
+                let committed = Instant::now();
+                assert_eq!(read_handoff_line(&mut source), "owned");
+                thread::sleep(delay.saturating_sub(committed.elapsed()));
+                let signalled = Instant::now();
+                assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+                signalled
+            }
+            SignalAt::ByTheTest => {
+                source.write_all(b"committed\n").unwrap();
+                assert_eq!(read_handoff_line(&mut source), "owned");
+                Instant::now()
+            }
+        };
         Self {
             import,
             _source: source,
@@ -1778,6 +1827,12 @@ impl CommittedHandoff {
             signalled,
             marker,
         }
+    }
+
+    fn signal(&mut self) {
+        self.signalled = Instant::now();
+        let pid = self.import.child.id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     }
 
     fn session(&self) -> String {
@@ -1869,6 +1924,108 @@ fn sigterm_before_a_handoff_commit_whose_save_keeps_failing_exits_with_an_error(
     assert!(
         exited_after <= Duration::from_secs(14),
         "handoff import exited {exited_after:?} after SIGTERM, past the save bound"
+    );
+    handoff.finish(&base);
+}
+
+/// codex ir4j-r4: the save keeps failing, the plugin lock is free and the
+/// stop arrives 5 s after `committed`, while the save is still retried. The
+/// save bound runs out, startup goes on and the event loop takes the stop
+/// over before the startup stop thread's deadline. The obligation to write the
+/// transferred session must survive that takeover: the import must not end
+/// as a success with the transferred workspace on no disk.
+#[test]
+fn sigterm_while_a_handoff_save_keeps_failing_and_the_event_loop_takes_over_exits_with_an_error() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let mut handoff = CommittedHandoff::start_with(
+        &base,
+        |app_dir| {
+            fs::create_dir_all(app_dir.join("session.json.tmp").join("blocker")).unwrap();
+        },
+        HandoffStop {
+            hold_registry_lock: false,
+            signal: SignalAt::AfterCommit(Duration::from_secs(5)),
+        },
+    );
+    let status = wait_for_import_exit(
+        &mut handoff.import,
+        handoff.signalled,
+        Duration::from_secs(45),
+    );
+    let exited_after = handoff.signalled.elapsed();
+    let session = handoff.session();
+    let log = fs::read_to_string(&handoff.log).unwrap_or_default();
+    assert!(
+        !session.contains(handoff.marker),
+        "the save was meant to fail throughout; session file:\n{session}"
+    );
+    assert!(
+        log.contains("handoff import server started"),
+        "startup must reach the event loop for this case:\n{log}"
+    );
+    assert!(
+        !status.success(),
+        "the import exited successfully {exited_after:?} after SIGTERM although the transferred session was never written ({status:?})"
+    );
+    // The exit, not the save bound, must name the loss.
+    assert!(
+        log.contains("the handed-over session is lost"),
+        "the log must name the lost transfer at the exit:\n{log}"
+    );
+    assert!(
+        exited_after <= STARTUP_STOP_EXIT_BOUND,
+        "handoff import exited {exited_after:?} after SIGTERM, past the bound"
+    );
+    handoff.finish(&base);
+}
+
+/// codex ir4j-r4, the other outcome: the save fails through the whole save
+/// bound, then the cause goes away while the event loop runs. Its own save
+/// writes the transferred session, so the stop that follows ends the import
+/// as a success with the transferred workspace on disk.
+#[test]
+fn a_handoff_save_that_fails_past_its_bound_and_then_succeeds_in_the_event_loop_exits_cleanly() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let mut handoff = CommittedHandoff::start_with(
+        &base,
+        |app_dir| {
+            fs::create_dir_all(app_dir.join("session.json.tmp").join("blocker")).unwrap();
+        },
+        HandoffStop {
+            hold_registry_lock: false,
+            signal: SignalAt::ByTheTest,
+        },
+    );
+    let app_dir = handoff.session_file.parent().unwrap().to_path_buf();
+    wait_for_log_line(
+        &handoff.log,
+        "was not written within the handoff save bound",
+        Duration::from_secs(20),
+    );
+    wait_for_log_line(
+        &handoff.log,
+        "handoff import server started",
+        Duration::from_secs(10),
+    );
+    fs::remove_dir_all(app_dir.join("session.json.tmp")).unwrap();
+    handoff.signal();
+    let status = wait_for_import_exit(
+        &mut handoff.import,
+        handoff.signalled,
+        Duration::from_secs(45),
+    );
+    let exited_after = handoff.signalled.elapsed();
+    let session = handoff.session();
+    assert!(
+        session.contains(handoff.marker),
+        "the transferred workspace was not written by the event loop (exit {status:?} {exited_after:?} after SIGTERM); session file:\n{session}"
+    );
+    assert!(status.success(), "exit status {status:?}");
+    assert!(
+        exited_after <= STARTUP_STOP_EXIT_BOUND,
+        "handoff import exited {exited_after:?} after SIGTERM, past the bound"
     );
     handoff.finish(&base);
 }

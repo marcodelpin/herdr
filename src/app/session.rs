@@ -112,6 +112,26 @@ impl App {
         saved
     }
 
+    /// A live handoff transferred this session and the source no longer
+    /// saves it: until a write reaches the disk, it exists nowhere else.
+    pub(crate) fn owe_transferred_session(&mut self) {
+        if !self.policy.persist_session {
+            return;
+        }
+        match self.session_writer.lock() {
+            Ok(mut writer) => writer.owe_transferred_session(),
+            Err(err) => err.into_inner().owe_transferred_session(),
+        }
+    }
+
+    /// Whether a session transferred by a live handoff is still not on disk.
+    pub(crate) fn transferred_session_unsaved(&self) -> bool {
+        match self.session_writer.lock() {
+            Ok(writer) => writer.owes_transferred_session(),
+            Err(err) => err.into_inner().owes_transferred_session(),
+        }
+    }
+
     pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
         if !self.policy.persist_session
             || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)

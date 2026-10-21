@@ -467,6 +467,9 @@ fn build_handoff_import_server(
 /// up exits with status 1 instead of as a success (ADR-0014 invariant I6).
 #[cfg(unix)]
 fn save_transferred_session(startup_stop: &StartupStop, app: &mut app::App, save_by: Instant) {
+    // Held by the session writer, so it outlives startup: the event loop
+    // cannot end the process as a success while it is owed.
+    app.owe_transferred_session();
     loop {
         let Err(err) = app.try_save_session_now() else {
             startup_stop.saved();

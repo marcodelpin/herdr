@@ -751,6 +751,16 @@ impl HeadlessServer {
         if self.app.policy.persist_session {
             self.app.save_session_on_shutdown();
         }
+        // A live handoff's session that no write has reached the disk with
+        // exists nowhere else: never a success (ADR-0014 invariant I6).
+        if self.app.transferred_session_unsaved() {
+            tracing::error!(
+                "server stopped and the transferred session was not written; exiting with an error, the handed-over session is lost"
+            );
+            return Err(io::Error::other(
+                "the session transferred by the live handoff was not written",
+            ));
+        }
 
         info!("headless server exiting");
         Ok(())
