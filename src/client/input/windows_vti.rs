@@ -4468,4 +4468,33 @@ mod tests {
             ]
         );
     }
+
+    /// codex f5251-r2 finding 3: text held after a dropped OSC header must not
+    /// be overtaken by a native key record (`a\r` must not become `\ra`).
+    #[test]
+    fn review_r2_3_semantic_enter_does_not_overtake_held_osc_candidate_text() {
+        let mut translator = WindowsInputTranslator::default();
+        for record in "\x1b]4;50;".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+        }
+        assert!(translator.idle().is_empty());
+        let mut events = translator.translate(key_char('a'));
+        events.extend(translator.translate(key_vk_with_unicode(0x0d, '\r', 0)));
+
+        let codes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::protocol::ClientInputEvent::Key { code, .. } => Some(code.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                crate::protocol::ClientKeyCode::Char('a'),
+                crate::protocol::ClientKeyCode::Enter
+            ],
+            "{events:?}"
+        );
+    }
 }
