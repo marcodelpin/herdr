@@ -28,9 +28,9 @@ fn typed_event_bytes(event: &RawInputEvent) -> Option<Vec<u8>> {
     match event {
         RawInputEvent::Key(key) => Some(key.vt_bytes().unwrap_or_default().to_vec()),
         RawInputEvent::Text(text) => Some(text.as_str().as_bytes().to_vec()),
-        RawInputEvent::Paste(text) => Some(
-            [BRACKETED_PASTE_START, text.as_bytes(), BRACKETED_PASTE_END].concat(),
-        ),
+        RawInputEvent::Paste(text) => {
+            Some([BRACKETED_PASTE_START, text.as_bytes(), BRACKETED_PASTE_END].concat())
+        }
         _ => None,
     }
 }
@@ -188,4 +188,151 @@ fn review_r3_1_interruption_emits_escape_found_after_held_text() {
         "{events:?}"
     );
     assert!(!framer.byte_framer.has_pending_input());
+}
+
+/// The bytes the direct-graphics filter keeps while a response is awaited
+/// (`client::direct_graphics::InputFilter`): a trailing prefix of the kitty
+/// response introducer `ESC _ G`, released once no response is awaited.
+struct GraphicsFilterModel {
+    pending: Vec<u8>,
+    interested_until: u64,
+}
+
+impl GraphicsFilterModel {
+    fn push(&mut self, bytes: &[u8], now: u64) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        if now >= self.interested_until {
+            return std::mem::take(&mut self.pending);
+        }
+        let keep = (1..3)
+            .rev()
+            .find(|len| self.pending.ends_with(&b"\x1b_G"[..*len]))
+            .unwrap_or(0);
+        let emit = self.pending.len() - keep;
+        self.pending.drain(..emit).collect()
+    }
+
+    fn flush_if_inactive(&mut self, now: u64) -> Option<Vec<u8>> {
+        (!self.pending.is_empty() && now >= self.interested_until)
+            .then(|| std::mem::take(&mut self.pending))
+    }
+}
+
+/// The idle turns of the Unix reader (`client/input.rs`) with no further
+/// input until `until`: one wait per turn from `reader_idle_wait`, then the
+/// graphics filter's release or the framer's flush. Returns the time each
+/// chunk was sent.
+fn unix_reader_idle_turns(
+    framer: &mut RawInputByteFramer,
+    filter: &mut GraphicsFilterModel,
+    base: Instant,
+    mut now: u64,
+    mut idle_flush_at: Option<u64>,
+    until: u64,
+) -> Vec<(u64, Vec<u8>)> {
+    let mut sent = Vec::new();
+    while now < until {
+        let idle_ms = idle_flush_at
+            .filter(|_| framer.has_pending_input())
+            .map(|at| at.saturating_sub(now) as i32);
+        let framer_wait = match (idle_ms, framer.held_input_release_ms()) {
+            (Some(idle), Some(release)) => Some(idle.min(release)),
+            (idle, release) => idle.or(release),
+        };
+        let Some((wait, framer_due)) = reader_idle_wait(framer_wait, !filter.pending.is_empty())
+        else {
+            break;
+        };
+        now += wait.max(0) as u64;
+        framer.set_test_clock(base + Duration::from_millis(now));
+        let chunks = if let Some(data) = filter.flush_if_inactive(now) {
+            let chunks = framer.push(&data);
+            idle_flush_at = Some(now + framer.idle_flush_timeout_ms(false) as u64);
+            chunks
+        } else if framer_due {
+            idle_flush_at = None;
+            framer.flush_timeout()
+        } else {
+            Vec::new()
+        };
+        sent.extend(chunks.into_iter().map(|chunk| (now, chunk)));
+    }
+    sent
+}
+
+/// r3-2 (codex review f5251-r3, `client/input.rs:181`): while the
+/// direct-graphics filter keeps an ESC for an awaited response, the reader
+/// polled only the filter, so bytes the framer held waited for the response
+/// window (here until 4650 ms) instead of their own bound. With one wait per
+/// turn, `a` and ESC held after a dropped OSC header are released by their
+/// tail deadline and no later than the pending-input backstop.
+#[test]
+fn review_r3_2_graphics_wait_does_not_starve_held_input() {
+    let base = Instant::now();
+    let mut framer = RawInputByteFramer::with_host_input_policy(false);
+    framer.set_test_clock(base);
+    framer.host_color_query_sent();
+    let mut filter = GraphicsFilterModel {
+        pending: Vec::new(),
+        interested_until: 0,
+    };
+
+    // An OSC 4 header arrives and its reply stops: dropped at the idle wait.
+    let mut sent = Vec::new();
+    let chunks = framer.push(b"\x1b]4;50;");
+    sent.extend(chunks.into_iter().map(|chunk| (0, chunk)));
+    let idle = framer.idle_flush_timeout_ms(false) as u64;
+    sent.extend(unix_reader_idle_turns(
+        &mut framer,
+        &mut filter,
+        base,
+        0,
+        Some(idle),
+        600,
+    ));
+    assert!(!framer.has_pending_input(), "the header is dropped");
+
+    // `a` and ESC are typed and held as a possible reply tail.
+    framer.set_test_clock(base + Duration::from_millis(600));
+    let chunks = framer.push(&filter.push(b"a\x1b", 600));
+    sent.extend(chunks.into_iter().map(|chunk| (600, chunk)));
+    assert!(framer.has_pending_input(), "a and ESC are held");
+
+    // A direct-graphics response is awaited from 700 to 4650 ms, and the
+    // filter keeps an ESC that may start it.
+    filter.interested_until = 4650;
+    framer.set_test_clock(base + Duration::from_millis(700));
+    let chunks = framer.push(&filter.push(b"\x1b", 700));
+    sent.extend(chunks.into_iter().map(|chunk| (700, chunk)));
+    assert!(!filter.pending.is_empty(), "the filter keeps the ESC");
+
+    sent.extend(unix_reader_idle_turns(
+        &mut framer,
+        &mut filter,
+        base,
+        700,
+        None,
+        2_200,
+    ));
+    let bound = 600 + PENDING_INPUT_AGE_LIMIT.as_millis() as u64;
+    let released: Vec<u64> = sent
+        .iter()
+        .filter(|(_, chunk)| chunk.as_slice() == b"a" || chunk.as_slice() == b"\x1b")
+        .map(|(at, _)| *at)
+        .collect();
+    assert_eq!(
+        unix_typed_events(
+            &sent
+                .iter()
+                .map(|(_, chunk)| chunk.clone())
+                .collect::<Vec<_>>()
+        ),
+        vec![b"a".to_vec(), b"\x1b".to_vec()],
+        "sent by 2200 ms: {sent:?}"
+    );
+    assert!(
+        released.iter().all(|at| *at <= bound),
+        "held input released after its {bound} ms bound: {sent:?}"
+    );
+    assert!(!framer.has_pending_input());
 }
