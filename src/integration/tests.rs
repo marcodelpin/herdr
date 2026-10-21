@@ -1132,7 +1132,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 12);
+    assert_eq!(claude.expected_version, 13);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1141,7 +1141,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(12));
+    assert_eq!(status.installed_version, Some(13));
     assert_eq!(status.state, IntegrationStatusKind::Current);
 
     std::env::remove_var("HOME");
@@ -1204,7 +1204,7 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 12);
+    assert_eq!(claude.expected_version, 13);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -5251,5 +5251,220 @@ fn grok_dir_honors_grok_home_after_config_dir_seam() {
 
     std::env::remove_var(GROK_HOME_ENV_VAR);
     clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+// herdr-d98u: the server field is u32, so the claude hook forwards CLAUDE_PID
+// only as a decimal pid in 1..=4294967295 and otherwise omits agent_pid; the
+// report itself must still land either way.
+#[cfg(unix)]
+fn run_claude_sh_hook_with_claude_pid(claude_pid: Option<&str>) -> Option<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // a short fixed prefix: temp_dir() on macOS can push a socket path past sun_path
+    let socket_path = PathBuf::from(format!(
+        "/tmp/herdr-d98u-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(CLAUDE_HOOK_ASSET)
+        .arg("herdr-agent-state.sh")
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env_remove("CURSOR_VERSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match claude_pid {
+        Some(pid) => command.env("CLAUDE_PID", pid),
+        None => command.env_remove("CLAUDE_PID"),
+    };
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"SessionStart","session_id":"claude-session","source":"startup"}"#)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut request = None;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let _ = stream.write_all(b"{}\n");
+                request = Some(serde_json::from_str::<Value>(&line).unwrap());
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if child.try_wait().unwrap().is_some() {
+                    // the hook exited: one last accept for a connection that raced the exit
+                    if let Ok((stream, _)) = listener.accept() {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut line = String::new();
+                        BufReader::new(&stream).read_line(&mut line).unwrap();
+                        request = serde_json::from_str::<Value>(&line).ok();
+                    }
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("accept failed: {err}"),
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = fs::remove_file(&socket_path);
+    assert!(
+        output.status.success(),
+        "hook failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    request.map(|request| request["params"].clone())
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_sh_hook_bounds_claude_pid_to_u32_and_still_reports() {
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success()),
+        "the claude hook needs python3; without it this test would prove nothing"
+    );
+    for (claude_pid, expected) in [
+        (Some("4242"), Some(4242_u64)),
+        (Some("1"), Some(1)),
+        (Some("4294967295"), Some(4_294_967_295)),
+        (Some("4294967296"), None),
+        (Some("99999999999999999999"), None),
+        (Some("0"), None),
+        (Some("-5"), None),
+        (Some("+7"), None),
+        (Some(" 7"), None),
+        (Some("7x"), None),
+        (Some(""), None),
+        (None, None),
+    ] {
+        let params = run_claude_sh_hook_with_claude_pid(claude_pid)
+            .unwrap_or_else(|| panic!("CLAUDE_PID={claude_pid:?}: no report reached the socket"));
+        assert_eq!(
+            params["agent_session_id"], "claude-session",
+            "CLAUDE_PID={claude_pid:?}: {params}"
+        );
+        assert_eq!(
+            params.get("agent_pid").and_then(Value::as_u64),
+            expected,
+            "CLAUDE_PID={claude_pid:?}: {params}"
+        );
+        if expected.is_none() {
+            assert!(
+                params.get("agent_pid").is_none(),
+                "CLAUDE_PID={claude_pid:?}: {params}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_windows_hook_bounds_claude_pid_to_u32_and_still_reports() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let installed = install_claude().unwrap();
+
+    let fake_herdr = base.join("herdr-capture.ps1");
+    fs::write(
+        &fake_herdr,
+        "$capture = $env:HERDR_TEST_CAPTURE\n[System.IO.File]::WriteAllText($capture, ($args -join \"`n\"), [System.Text.UTF8Encoding]::new($false))\n",
+    )
+    .unwrap();
+
+    for (index, (claude_pid, expected)) in [
+        ("4242", Some("4242")),
+        ("4294967295", Some("4294967295")),
+        ("4294967296", None),
+        ("0", None),
+        ("-5", None),
+        ("+7", None),
+        (" 7", None),
+        ("7x", None),
+        ("abc", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let capture = base.join(format!("args-{index}.txt"));
+        let mut child = Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&installed.hook_path)
+            .arg("session")
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w1:p2")
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_CAPTURE", &capture)
+            .env("CLAUDE_PID", claude_pid)
+            .env_remove("CURSOR_VERSION")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "CLAUDE_PID={claude_pid:?}: hook failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args: Vec<String> = fs::read_to_string(&capture)
+            .unwrap_or_else(|err| panic!("CLAUDE_PID={claude_pid:?}: no report: {err}"))
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == "report-agent-session"),
+            "CLAUDE_PID={claude_pid:?}: {args:?}"
+        );
+        let forwarded = args
+            .iter()
+            .position(|arg| arg == "--agent-pid")
+            .map(|index| args[index + 1].as_str());
+        assert_eq!(forwarded, expected, "CLAUDE_PID={claude_pid:?}: {args:?}");
+    }
+
+    if let Some(home) = previous_home {
+        std::env::set_var("HOME", home);
+    } else {
+        std::env::remove_var("HOME");
+    }
     let _ = fs::remove_dir_all(base);
 }

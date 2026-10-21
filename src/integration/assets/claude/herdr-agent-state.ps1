@@ -2,7 +2,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=12
+# HERDR_INTEGRATION_VERSION=13
 
 param([string]$Action = "")
 
@@ -50,8 +50,11 @@ try {
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
     }
-    if ($env:CLAUDE_PID) {
-        $args += @("--agent-pid", "$($env:CLAUDE_PID)")
+    # herdr's --agent-pid is a u32 pid: forward only plain decimal digits in
+    # 1..=4294967295 and omit anything else, so the report itself still lands.
+    $agentPid = [uint64]0
+    if ($env:CLAUDE_PID -cmatch '\A[0-9]{1,10}\z' -and [uint64]::TryParse($env:CLAUDE_PID, [ref]$agentPid) -and $agentPid -ge 1 -and $agentPid -le 4294967295) {
+        $args += @("--agent-pid", "$agentPid")
     }
     if ($payload.cwd -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.cwd)) {
         $args += @("--agent-session-cwd", "$($payload.cwd)")

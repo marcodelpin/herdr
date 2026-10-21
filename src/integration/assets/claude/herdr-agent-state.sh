@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=12
+# HERDR_INTEGRATION_VERSION=13
 
 set -eu
 
@@ -67,12 +67,11 @@ if not isinstance(session_start_source, str) or not session_start_source:
     session_start_source = None
 agent_pid_raw = os.environ.get("CLAUDE_PID")
 agent_pid = None
-if agent_pid_raw is not None:
-    try:
-        parsed_pid = int(agent_pid_raw)
-    except (TypeError, ValueError):
-        parsed_pid = None
-    if parsed_pid is not None and parsed_pid >= 0:
+# herdr's agent_pid is a u32 pid: forward only plain decimal digits in
+# 1..=4294967295 and omit anything else, so the report itself still lands.
+if agent_pid_raw and agent_pid_raw.isascii() and agent_pid_raw.isdigit():
+    parsed_pid = int(agent_pid_raw)
+    if 1 <= parsed_pid <= 4294967295:
         agent_pid = parsed_pid
 raw_cwd = hook_input.get("cwd")
 agent_session_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
