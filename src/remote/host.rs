@@ -465,6 +465,7 @@ mod tests {
 
     struct FakeHost {
         listening: bool,
+        listen_result: RefCell<Option<io::Error>>,
         generation: Option<u32>,
         effective: Endpoint,
         unit: UnitState,
@@ -480,6 +481,7 @@ mod tests {
         fn new(effective: Endpoint, unit: UnitState) -> Self {
             Self {
                 listening: false,
+                listen_result: RefCell::new(None),
                 generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
                 effective,
                 unit,
@@ -495,7 +497,10 @@ mod tests {
 
     impl RemoteHost for FakeHost {
         fn server_listening(&self) -> io::Result<bool> {
-            Ok(self.listening)
+            self.listen_result
+                .borrow_mut()
+                .take()
+                .map_or(Ok(self.listening), Err)
         }
         fn running_endpoint_generation(&self) -> io::Result<Option<u32>> {
             Ok(self.generation)
@@ -645,6 +650,34 @@ mod tests {
         ensure_remote_server_running_with(&host).unwrap();
         assert_eq!((host.unit_starts.get(), host.spawns.get()), (0, 0));
         assert!(host.waits.borrow().is_empty());
+    }
+
+    #[test]
+    fn entry_listening_probe_error_refuses_and_starts_nothing() {
+        // A failed probe is not "nobody listening": neither the unit nor a direct spawn may start.
+        for unit in [UnitState::Installed, UnitState::Absent] {
+            let host = FakeHost::new(default_endpoint(), unit);
+            *host.listen_result.borrow_mut() = Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "probe of the client socket failed",
+            ));
+            let err = ensure_remote_server_running_with(&host).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "{unit:?}: {err}"
+            );
+            assert_eq!(
+                (
+                    host.unit_queries.get(),
+                    host.unit_starts.get(),
+                    host.spawns.get()
+                ),
+                (0, 0, 0),
+                "{unit:?}"
+            );
+            assert!(host.waits.borrow().is_empty(), "{unit:?}");
+        }
     }
 
     #[test]

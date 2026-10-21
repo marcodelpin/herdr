@@ -21,7 +21,8 @@
 # 0.9.5 port (bd herdr-ih1r), branch fix/waz6-on-adopt-0.9.5 on d1f563df, the build dcc runs: the
 # same three commits, with is_server_listening now returning io::Result (an error is not "nobody
 # listening", so the bridge fails instead of starting a server) and the session tests' env lock
-# now being the shared config env lock.
+# now being the shared config env lock. A 24th test and its mutant pin that error path (codex
+# hih1r-r1 noted it had no test).
 name: Fork waz6 bridge never spawns beside the unit
 
 on:
@@ -73,7 +74,7 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          expected=23
+          expected=24
           [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
@@ -185,6 +186,10 @@ jobs:
             file: src/client/endpoint/supervisor.rs
             perl: 's/    reported.unwrap_or\(handshake_error\)/    let _ = reported; \/* MUTANT *\/\n    handshake_error/'
             expect: "bridge_failure_replaces_the_bare_handshake_error"
+          - name: listening probe error read as not listening
+            file: src/remote/host.rs
+            perl: 's/if host\.server_listening\(\)\? \{/if host.server_listening().unwrap_or(false) \/* MUTANT *\/ {/'
+            expect: "entry_listening_probe_error_refuses_and_starts_nothing"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
