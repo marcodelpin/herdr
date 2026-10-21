@@ -4159,13 +4159,15 @@ mod tests {
         let changed = cwd.join("Changed");
         fs::create_dir(&changed).expect("create changed cwd");
         let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        // Both children are named by absolute path on purpose: the native shell, and on a
+        // 64-bit reader the x86 SysWOW64 shell, whose cwd lives only in its x86 PEB.
         let shells = [
             windows.join("System32").join("cmd.exe"),
             #[cfg(target_pointer_width = "64")]
             windows.join("SysWOW64").join("cmd.exe"),
         ];
         let mut observations = Vec::new();
-        for shell in shells {
+        for (index, shell) in shells.into_iter().enumerate() {
             let mut child = Command::new(&shell)
                 .args(["/D", "/Q", "/K"])
                 .current_dir(super::normalize_cwd_for_launch_platform(&launch_cwd))
@@ -4185,22 +4187,38 @@ mod tests {
                 }
             };
             let initial = observe(&cwd);
+            // The marker is written only after `cd` succeeded, so the cwd read below is judged
+            // against a shell that has really moved. Under a loaded runner the x86 shell has
+            // taken more than 5 s to run the line (herdr-l4p5); that latency is the shell's,
+            // and it gets its own generous wait and its own failure message.
+            let cd_done = cwd.join(format!("cd-done-{index}"));
             use std::io::Write;
             writeln!(
                 child.stdin.as_ref().unwrap(),
-                "cd /d \"{}\"\r",
-                changed.display()
+                "cd /d \"{}\" && echo done> \"{}\"\r",
+                changed.display(),
+                cd_done.display()
             )
             .expect("change cmd cwd");
+            let cd_deadline = Instant::now() + Duration::from_secs(60);
+            while !cd_done.is_file() && Instant::now() < cd_deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let shell_ran_cd = cd_done.is_file();
             let after_cd = observe(&changed);
             let pane_cwd = super::pane_process_cwd(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            observations.push((shell, initial, after_cd, pane_cwd));
+            observations.push((shell, initial, shell_ran_cd, after_cd, pane_cwd));
         }
         let _ = fs::remove_dir_all(&cwd);
-        for (shell, initial, after_cd, pane_cwd) in observations {
+        for (shell, initial, shell_ran_cd, after_cd, pane_cwd) in observations {
             assert_eq!(initial, Some(cwd.clone()), "{} launch cwd", shell.display());
+            assert!(
+                shell_ran_cd,
+                "{} did not run cd within 60 s (shell latency, not the cwd reader)",
+                shell.display()
+            );
             assert_eq!(
                 after_cd,
                 Some(changed.clone()),
