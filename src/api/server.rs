@@ -50,7 +50,7 @@ const API_ADMISSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// explicit error within one `CONNECTION_POLL_INTERVAL`, and a connection
 /// waiting for the app answers for itself within one `SHUTDOWN_POLL_INTERVAL`.
 /// Whatever is still in flight at expiry is abandoned and logged.
-const API_SHUTDOWN_DRAIN_TIMEOUT: Duration =
+pub(crate) const API_SHUTDOWN_DRAIN_TIMEOUT: Duration =
     STREAM_WRITE_TIMEOUT.saturating_add(Duration::from_secs(2));
 
 pub struct ServerHandle {
@@ -82,7 +82,44 @@ impl ServerHandle {
     /// its reply or an explicit error. Call only once the app loop no longer
     /// handles requests: from here on connection threads answer for themselves.
     pub(crate) fn drain_for_shutdown(&self) {
-        let deadline = Instant::now() + API_SHUTDOWN_DRAIN_TIMEOUT;
+        self.shutdown_control()
+            .drain_for_shutdown_by(Instant::now() + API_SHUTDOWN_DRAIN_TIMEOUT);
+    }
+
+    /// What a stop needs to drain this server from another thread, before the
+    /// event loop that owns the handle runs (herdr-ir4j).
+    pub(crate) fn shutdown_control(&self) -> ApiShutdownControl {
+        ApiShutdownControl {
+            path: self.path.clone(),
+            identity: self.identity.clone(),
+            running: Arc::clone(&self.running),
+            drain: Arc::clone(&self.drain),
+        }
+    }
+}
+
+/// The shutdown drain of one API server, usable from any thread.
+#[derive(Clone)]
+pub(crate) struct ApiShutdownControl {
+    path: PathBuf,
+    identity: SocketFileIdentity,
+    running: Arc<AtomicBool>,
+    drain: Arc<ApiDrain>,
+}
+
+impl ApiShutdownControl {
+    /// Unlinks the socket path if it is still this server's.
+    pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
+        remove_socket_file_if_owned(&self.path, &self.identity)
+    }
+
+    /// [`ServerHandle::drain_for_shutdown`] with its deadline given. Drains of
+    /// one server run one at a time and all end by the deadline of the first:
+    /// a later caller finds the work done, or waits for it, and never extends
+    /// the bound counted from the first stop.
+    pub(crate) fn drain_for_shutdown_by(&self, deadline: Instant) {
+        let mut turn = self.drain.serialize_shutdown();
+        let deadline = turn.deadline(deadline);
         announce_api_shutdown(&self.running, &self.drain);
 
         let acknowledge_by = deadline.min(Instant::now() + API_ADMISSION_CLOSE_TIMEOUT);
@@ -578,6 +615,15 @@ fn retired_pane_graphics_method_error(line: &str, id: &str) -> Option<ErrorRespo
             message: format!("unknown method: {method}"),
         },
     })
+}
+
+/// Probes the API socket path the way the bind will, before it: removes a
+/// stale socket, fails with `AddrInUse` when a server answers there. Server
+/// startup runs it while a stop still ends the process at once, because the
+/// probe connects and can wait on a listener that stopped accepting
+/// (herdr-ir4j, ADR-0014).
+pub(crate) fn prepare_api_socket_path() -> std::io::Result<()> {
+    prepare_socket_path(&socket_path())
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {

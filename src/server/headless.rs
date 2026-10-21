@@ -82,6 +82,7 @@ mod native_graphics;
 mod notifications;
 mod render;
 mod retained_surface;
+mod startup_stop;
 mod surface_interest;
 
 // Producers can refill even a bounded channel while it is being drained.
@@ -93,6 +94,7 @@ pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
 #[cfg(unix)]
 use lifecycle::wait_for_old_public_sockets_to_close;
+pub(crate) use startup_stop::StartupStop;
 
 use crate::protocol::MAX_GRAPHICS_FRAME_SIZE;
 
@@ -310,6 +312,22 @@ fn spawn_windows_client_accept_thread(
     })
 }
 
+/// Routes SIGINT and SIGTERM (a console control event on Windows) to
+/// `server_stop` and `startup_stop` from now on, once per process. Call it
+/// inside the server's Tokio runtime, after `startup_stop` started its
+/// thread and before anything of startup can accept a connection: until the
+/// event loop runs, `startup_stop` acts on the signal (herdr-ir4j, ADR-0014).
+/// If the handler cannot be installed the default disposition stays, and a
+/// signal ends the process as it did before.
+pub(crate) fn install_server_signal_handling(server_stop: &ServerStop, startup_stop: &StartupStop) {
+    let server_stop = server_stop.clone();
+    let startup_stop = startup_stop.clone();
+    crate::platform::spawn_server_signal_monitor(move |signal| {
+        server_stop.request(ShutdownReason::Signal(signal));
+        startup_stop.signalled();
+    });
+}
+
 impl HeadlessServer {
     /// Creates and starts the headless server.
     ///
@@ -412,12 +430,9 @@ impl HeadlessServer {
     pub async fn run(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
-        let server_stop = self.server_stop.clone();
-        let quit_notify = self.server_event_tx.clone();
-        crate::platform::spawn_server_signal_monitor(move |signal| {
-            server_stop.request(ShutdownReason::Signal(signal));
-            let _ = quit_notify.try_send(ServerEvent::QuitSignal);
-        });
+        // Stop signals are routed here by bootstrap, which installed their
+        // handler at process start and hands the stop over to this loop
+        // before calling it (ADR-0014).
         let quit_notify = self.server_event_tx.clone();
         let _host_shutdown = crate::platform::HostShutdownMonitor::start(
             self.host_shutdown_requested.clone(),
