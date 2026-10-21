@@ -15,7 +15,12 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+mod console_stop;
+#[cfg(test)]
+mod console_stop_tests;
 mod notifications;
+
+pub(crate) use console_stop::spawn_server_signal_monitor;
 pub(crate) use notifications::{
     foreground_desktop_notification_host, maybe_activate_desktop_notification,
     show_actionable_desktop_notification, show_desktop_notification,

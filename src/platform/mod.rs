@@ -122,7 +122,7 @@ impl std::fmt::Display for ServerQuitSignal {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn spawn_server_signal_monitor(
     on_quit: impl Fn(ServerQuitSignal) + Send + Sync + 'static,
 ) {
