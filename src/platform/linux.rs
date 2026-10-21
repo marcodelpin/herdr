@@ -90,6 +90,14 @@ struct ProcGroupMember {
     state: char,
 }
 
+/// The systemd --user manager's runtime directory, derived from the effective uid and never from the
+/// caller's environment (bd herdr-waz6); `None` when that manager is not running.
+pub(crate) fn user_manager_runtime_dir() -> Option<PathBuf> {
+    // SAFETY: geteuid takes no pointers and has no preconditions.
+    let dir = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+    dir.join("systemd/private").exists().then_some(dir)
+}
+
 pub(crate) fn launch_executable() -> std::io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
 
