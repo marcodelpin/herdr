@@ -38,7 +38,10 @@
 //!   pending-input bound, and the stream drains;
 //! - I4' a semantic key never overtakes a byte that can reach the pane: after
 //!   `flush_interrupted` only colour-reply bytes or an unterminated paste are
-//!   pending.
+//!   pending;
+//! - I5 a pump idle drops bytes only once the newest pending byte is
+//!   `PUMP_IDLE_QUIET` old, or at a named deadline, and the oracle allows a
+//!   drop after a cut only when the cut was quiet.
 
 use super::*;
 use std::time::Instant;
@@ -65,6 +68,9 @@ const BURST: u64 = 10;
 const AGE_LIMIT: u64 = 1_500;
 /// `MAX_DISCARDED_CONTROL_TAIL_BYTES`.
 const REPORT_BYTES: usize = 128;
+/// `PUMP_IDLE_QUIET`: an idle release drops bytes only once the newest
+/// pending byte is this old (ADR-0013 D2, I5).
+const QUIET: u64 = 10;
 /// Windows pump idle tick.
 const WINDOWS_TICK_MS: u64 = 10;
 /// The Windows default-colour reply window the harness opens at 0 ms.
@@ -140,6 +146,10 @@ enum Cond {
     /// Byte `first` reached the framer after the default-colour window had
     /// closed and its expiry was processed.
     AfterDefaultColorWindow { first: usize },
+    /// A cut before one of the bytes `after` was quiet: that byte reached the
+    /// framer at least `QUIET` after the byte before it, so an idle release
+    /// between them could drop what was pending (ADR-0013 D2).
+    QuietCut { after: Vec<usize> },
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +398,21 @@ fn deferred(when: Cond, then: Rule, otherwise: Rule) -> Rule {
     }
 }
 
+/// `OneOf(always)` plus each `gated` alternative whose condition held in the
+/// run, decided after it (ADR-0013 D6).
+fn one_of_gated(always: Vec<Vec<Vec<u8>>>, gated: &[(Cond, Vec<Vec<u8>>)]) -> Rule {
+    let Some(((when, alternative), rest)) = gated.split_first() else {
+        return Rule::OneOf(always);
+    };
+    let mut with = always.clone();
+    with.push(alternative.clone());
+    deferred(
+        when.clone(),
+        one_of_gated(with, rest),
+        one_of_gated(always, rest),
+    )
+}
+
 /// What a token that was cut but not interrupted may become (ADR-0012 D3,
 /// ADR-0013 D4, D6). `start` is the input offset of its first byte.
 fn cut_token_rule(
@@ -448,8 +473,12 @@ fn cut_token_rule(
             }
             if first.at >= 3 && first.gap < REPORT_SPAN && later < REPORT_SPAN {
                 // Whole, or the prefix dropped at its timeout and the tail
-                // after it.
-                return one(Rule::OneOf(vec![vec![bytes.to_vec()], Vec::new()]));
+                // after it: only after a quiet cut (codex f5251-r5 finding 3).
+                let after = cuts.iter().map(|cut| start + cut.at).collect();
+                return one(one_of_gated(
+                    vec![vec![bytes.to_vec()]],
+                    &[(Cond::QuietCut { after }, Vec::new())],
+                ));
             }
             spread()
         }
@@ -571,13 +600,17 @@ fn cut_token_rule(
 /// dropped it (three bytes or more); what was held after `b` is emitted as
 /// input when the record comes (#4048), except an unfinished X10 tail on the
 /// pump, which is dropped (ADR-0013 D4): at the record, or at its deadline
-/// at a later cut `j`, the bytes after `j` then arriving with no context.
+/// at a later cut `j`, the bytes after `j` then arriving with no context. A
+/// prefix dropped at a cut before the record was dropped by an idle release,
+/// so only after a quiet cut (codex f5251-r5 finding 3). `start` is the input
+/// offset of the token's first byte.
 fn interrupted_report_rule(
     kind: Kind,
     bytes: &[u8],
     cuts: &[Cut],
     at: usize,
     config: &Config,
+    start: usize,
 ) -> Vec<Unit> {
     let mut boundaries: Vec<usize> = cuts
         .iter()
@@ -588,6 +621,7 @@ fn interrupted_report_rule(
     boundaries.sort_unstable();
     boundaries.dedup();
     let mut alternatives = Vec::new();
+    let mut gated = Vec::new();
     for &b in &boundaries {
         let prefix: Vec<Vec<u8>> = if b <= 2 {
             vec![bytes[..b].to_vec()]
@@ -596,7 +630,12 @@ fn interrupted_report_rule(
         };
         let mut typed = prefix.clone();
         typed.extend(bytes[b..at].iter().map(|byte| vec![*byte]));
-        alternatives.push(typed);
+        if (3..at).contains(&b) {
+            let after = vec![start + b];
+            gated.push((Cond::QuietCut { after }, typed));
+        } else {
+            alternatives.push(typed);
+        }
         if kind == Kind::X10 && config.driver == Driver::WindowsPump && b <= 2 {
             for &j in boundaries.iter().filter(|j| **j > b && **j < bytes.len()) {
                 let mut dropped = prefix.clone();
@@ -608,7 +647,7 @@ fn interrupted_report_rule(
     alternatives.dedup();
     let mut units = vec![Unit {
         bytes: bytes[..at].to_vec(),
-        rule: Rule::OneOf(alternatives),
+        rule: one_of_gated(alternatives, &gated),
     }];
     units.extend(per_byte(&bytes[at..], Rule::Keep));
     units
@@ -890,7 +929,7 @@ fn generate(rng: &mut Rng, stream: Stream) -> Case {
                     units
                 }
                 Kind::Key | Kind::Sgr | Kind::X10 => {
-                    interrupted_report_rule(kind, &bytes, &cuts, at, &config)
+                    interrupted_report_rule(kind, &bytes, &cuts, at, &config, token_start)
                 }
                 // A reply prefix longer than ESC stays pending through the
                 // record (ADR-0013 D1) and takes its uninterrupted rule. A
@@ -1230,8 +1269,38 @@ impl<'a> Harness<'a> {
         Ok(())
     }
 
+    /// The bytes the framer still holds, from the harness's own record.
+    fn pending_len(&self) -> usize {
+        self.framer.buffer.len().min(self.framed.len())
+    }
+
+    /// A pump idle tick or an immediate flush. I5 (ADR-0013 D2), measured
+    /// from the harness's own record: it drops bytes only once the newest
+    /// pending byte is `QUIET` old, or when the oldest one reached a named
+    /// deadline (`REPORT_TAIL_LIMIT` or more). A continuation byte whose
+    /// lead was dropped can never become input and goes at once.
     fn flush(&mut self) -> Result<(), String> {
+        let pending = self.pending_len();
+        let since = |index: usize| self.now - self.framed[index].1;
+        let quiet = pending == 0 || since(self.framed.len() - 1) >= QUIET;
+        let deadline = pending > 0 && since(self.framed.len() - pending) >= REPORT_SPAN;
+        let orphan = self
+            .framer
+            .buffer
+            .first()
+            .is_some_and(|byte| (0x80..=0xbf).contains(byte));
         let chunks = self.framer.flush_timeout();
+        let emitted: usize = chunks.iter().map(Vec::len).sum();
+        let dropped = pending
+            .saturating_sub(self.pending_len())
+            .saturating_sub(emitted);
+        if dropped > 0 && !quiet && !deadline && !orphan {
+            return Err(format!(
+                "I5: {dropped} bytes dropped at {} ms, {} ms after the newest pending byte arrived",
+                self.now,
+                since(self.framed.len() - 1)
+            ));
+        }
         self.settle("after flush_timeout", chunks)
     }
 
@@ -1466,6 +1535,12 @@ impl<'a> Harness<'a> {
             Cond::AfterDefaultColorWindow { first } => {
                 framed(first).is_some_and(|at| at >= self.default_window_end + 2 * WINDOWS_TICK_MS)
             }
+            Cond::QuietCut { ref after } => after.iter().any(|&offset| {
+                match (offset.checked_sub(1).and_then(framed), framed(offset)) {
+                    (Some(before), Some(at)) => at >= before + QUIET,
+                    _ => false,
+                }
+            }),
         }
     }
 
@@ -1698,6 +1773,7 @@ fn oracle_bounds_match_the_adr() {
     assert_eq!(BURST, ORPHAN_TAIL_BURST.as_millis() as u64);
     assert_eq!(AGE_LIMIT, PENDING_INPUT_AGE_LIMIT.as_millis() as u64);
     assert_eq!(REPORT_BYTES, MAX_DISCARDED_CONTROL_TAIL_BYTES);
+    assert_eq!(QUIET, PUMP_IDLE_QUIET.as_millis() as u64);
 }
 
 fn unit(bytes: &[u8], rule: Rule) -> Unit {
@@ -2001,7 +2077,7 @@ fn oracle_interrupted_report_is_not_blanket_either() {
         disambiguation: false,
         graphics_wait: None,
     };
-    let units = interrupted_report_rule(Kind::Sgr, bytes, &cuts, 4, &config);
+    let units = interrupted_report_rule(Kind::Sgr, bytes, &cuts, 4, &config, 0);
     assert!(units.iter().all(|unit| unit.rule != Rule::Either));
     let mut expected = units[..1].to_vec();
     expected.push(unit(&[SEMANTIC], Rule::KeepEvent));
