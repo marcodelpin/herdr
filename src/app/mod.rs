@@ -142,6 +142,9 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    /// herdr-3cr r3: dedupe keys of the deferred agent resumes started so
+    /// far, so a native fallback cannot resume a session a second time.
+    started_agent_resume_keys: std::collections::HashSet<String>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -656,6 +659,7 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            started_agent_resume_keys: std::collections::HashSet::new(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

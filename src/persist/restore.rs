@@ -543,8 +543,7 @@ fn restore_tab(
                     .is_some()
             })
             .and_then(|session| session.agent_session_cwd.as_deref())
-            .map(PathBuf::from)
-            .filter(|agent_cwd| agent_cwd.is_dir());
+            .and_then(crate::agent_resume::usable_agent_cwd);
 
         // codex ar-r4 (P2 #1): `agent_cwd_override` only ADMITS a pane past
         // this gate on the HYPOTHESIS that it will take the DEFERRED
@@ -971,10 +970,9 @@ fn reported_resume_dir(
 ) -> PathBuf {
     session
         .and_then(|session| session.agent_session_cwd.as_deref())
-        .map(PathBuf::from)
         // herdr-3cr: a relative agent cwd would resolve against the server's
         // working directory, not the pane's, so it names no known directory.
-        .filter(|agent_cwd| agent_cwd.is_absolute() && agent_cwd.is_dir())
+        .and_then(crate::agent_resume::usable_agent_cwd)
         .unwrap_or_else(|| pane_cwd.to_path_buf())
 }
 
@@ -1647,6 +1645,117 @@ mod tests {
         };
         let pane_dir = std::path::Path::new("/pane-3cr-relative");
         assert_eq!(reported_resume_dir(Some(&session), pane_dir), pane_dir);
+    }
+
+    // herdr-3cr r3 (codex h3cr-r2b P2-2): pane A's own directory is gone
+    // and its agent cwd is the relative ".", which the launch never uses.
+    // Admission must apply the same rule, so A is unavailable before it can
+    // reserve session S, and pane B (same S, an absolute existing agent
+    // cwd) keeps the resume.
+    #[tokio::test]
+    async fn agent_restore_3cr_r3_relative_agent_cwd_does_not_admit_a_pane() {
+        let cwd = std::env::current_dir().unwrap();
+        let missing_pane_cwd = cwd.join("__herdr_3cr_r3_missing_pane_cwd__");
+        assert!(!missing_pane_cwd.exists());
+        let root = nrr_r3_temp_dir("3cr-r3-relative");
+        let pane_b_cwd = root.join("pane-b");
+        let agent_cwd = root.join("agent");
+        std::fs::create_dir_all(&pane_b_cwd).unwrap();
+        std::fs::create_dir_all(&agent_cwd).unwrap();
+        let session =
+            |agent_session_cwd: String| super::super::snapshot::PaneAgentSessionSnapshot {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "3cr-r3-claude-session".into(),
+                agent_session_cwd: Some(agent_session_cwd),
+            };
+        let pane = |cwd: PathBuf, label: &str, agent_session_cwd: String| {
+            super::super::snapshot::PaneSnapshot {
+                cwd,
+                label: Some(label.into()),
+                agent_name: None,
+                managed_agent_kind: None,
+                agent_session: Some(session(agent_session_cwd)),
+                launch_argv: None,
+                agent_resume: None,
+            }
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(10)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([
+                        (10, pane(missing_pane_cwd.clone(), "a", ".".into())),
+                        (
+                            20,
+                            pane(pane_b_cwd.clone(), "b", agent_cwd.display().to_string()),
+                        ),
+                    ]),
+                    zoomed: false,
+                    focused: Some(10),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let by_label = |label: &str| {
+            terminals
+                .values()
+                .find(|t| t.manual_label.as_deref() == Some(label))
+                .expect("pane should restore")
+        };
+        let a = by_label("a");
+        assert!(a.pending_agent_resume_plan.is_none());
+        assert!(
+            a.restore_error.is_some(),
+            "a relative agent cwd names no directory, so A's missing cwd makes it unavailable"
+        );
+        let b = by_label("b");
+        assert!(
+            b.pending_agent_resume_plan.is_some(),
+            "B can resume S and must not lose it to A"
+        );
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        assert!(runtimes.get(&b.id).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn nrr_r3_temp_dir(tag: &str) -> std::path::PathBuf {

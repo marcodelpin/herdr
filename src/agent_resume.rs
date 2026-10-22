@@ -70,6 +70,17 @@ pub fn resume_dir_identity(dir: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.components().collect())
 }
 
+/// herdr-3cr r3 (codex h3cr-r2b P2-2): the one rule for whether an agent's
+/// reported cwd names a directory restore may use. Cold-restore admission,
+/// the reported command's reservation and the deferred launch all call it,
+/// so a pane is never admitted (and never reserves a session) on a cwd the
+/// launch then refuses. A relative cwd is rejected: it would resolve against
+/// the server's working directory, not the directory the agent ran in.
+pub fn usable_agent_cwd(cwd: &str) -> Option<std::path::PathBuf> {
+    let path = Path::new(cwd);
+    (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
+}
+
 /// Restore types the command into the pane's shell, so the executable must be a
 /// bare command name: shells disagree on how to invoke a quoted path.
 pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
