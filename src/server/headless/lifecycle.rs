@@ -360,6 +360,7 @@ impl HeadlessServer {
     }
 
     pub(super) fn finish_live_handoff_shutdown(&mut self) {
+        self.handed_over = true;
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.policy.persist_session = false;

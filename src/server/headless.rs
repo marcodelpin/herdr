@@ -247,6 +247,9 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    /// Set once a live handoff committed: the session, its save and the
+    /// obligation to write it belong to the replacement (ADR-0018 D3).
+    handed_over: bool,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
@@ -448,6 +451,7 @@ impl HeadlessServer {
             #[cfg(test)]
             host_shutdown_probe: crate::platform::host_shutdown_in_progress,
             handoff_in_progress: false,
+            handed_over: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
             should_quit,
@@ -752,8 +756,11 @@ impl HeadlessServer {
             self.app.save_session_on_shutdown();
         }
         // A live handoff's session that no write has reached the disk with
-        // exists nowhere else: never a success (ADR-0014 invariant I6).
-        if self.app.transferred_session_unsaved() {
+        // exists nowhere else: never a success (ADR-0014 invariant I6). A
+        // server that handed the session on owes nothing: the replacement took
+        // the session and the obligation, so this one takes no session writer
+        // lock and reports no loss (ADR-0018 D3; herdr-3gmf, herdr-to89).
+        if !self.handed_over && self.app.transferred_session_unsaved() {
             tracing::error!(
                 "server stopped and the transferred session was not written; exiting with an error, the handed-over session is lost"
             );
