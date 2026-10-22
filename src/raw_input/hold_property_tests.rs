@@ -365,6 +365,27 @@ const fn key_record(vk: u16, scan: u16, unicode: u16, state: u32) -> WindowsKeyR
     }
 }
 
+/// The record, sometimes with a repeat count of 2 or 3: the console folds
+/// auto-repeat into one record, which the pump stages and replays as one
+/// (codex f5251-r6; ADR-0013 amendment 2, D4).
+fn with_repeats(rng: &mut Rng, record: WindowsKeyRecord) -> WindowsKeyRecord {
+    let repeat_count = if rng.chance(1, 3) {
+        rng.range(2, 3) as u16
+    } else {
+        1
+    };
+    WindowsKeyRecord {
+        repeat_count,
+        ..record
+    }
+}
+
+/// What a nested key record types, in the notation of the expectations:
+/// `NESTED` and its character, once per repeat.
+fn nested_keys(record: WindowsKeyRecord) -> Vec<u8> {
+    [NESTED, record.unicode as u8].repeat(usize::from(record.repeat_count.max(1)))
+}
+
 fn released(record: WindowsKeyRecord) -> WindowsKeyRecord {
     WindowsKeyRecord {
         key_down: false,
@@ -542,9 +563,10 @@ fn frame_then_control_record(rng: &mut Rng, case: &mut Case) {
     };
     case.expected.push(Unit { bytes: frame, rule });
     let record = control_record(rng);
+    let record = with_repeats(rng, record);
     case.push_nested(record_gap(rng), record);
     case.expected.push(Unit {
-        bytes: vec![NESTED, record.unicode as u8],
+        bytes: nested_keys(record),
         rule: Rule::KeepEvent,
     });
     if rng.chance(1, 2) {
@@ -566,16 +588,21 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     });
     let mut keys = Vec::new();
     for index in 0..3 {
-        let record = if index == 0 {
-            x10_button_record(rng)
-        } else {
-            printable_record(rng)
+        let record = match index {
+            0 => x10_button_record(rng),
+            1 => printable_record(rng),
+            // A record the report takes only in part: it goes with the
+            // report whole (ADR-0013 amendment 2, D4).
+            _ => {
+                let record = printable_record(rng);
+                with_repeats(rng, record)
+            }
         };
         case.push_nested(record_gap(rng), record);
         if rng.chance(1, 3) {
             case.push_nested(rng.range(0, 5), released(record));
         }
-        keys.push(vec![NESTED, record.unicode as u8]);
+        keys.push(nested_keys(record));
     }
     case.expected.push(Unit {
         bytes: keys.concat(),
@@ -885,9 +912,8 @@ fn cut_token_rule(
             // ADR-0013 amendment 1, D4: the byte that disproves the frame
             // ends it. Whole in the framer, the frame is dropped; cut, its
             // prefix may have gone out as a key and its tail been typed. A
-            // control byte is typed on the Unix reader and dropped with the
-            // frame on the pump (a raw one is lost there: the declared
-            // residual, as the pump replays only a staged key record).
+            // raw control byte is no staged record, so it starts the next
+            // token and is typed on every driver (amendment 2, D4).
             let control = bytes.len() > 3 && disproves_x10_payload(bytes[bytes.len() - 1]);
             let frame = bytes.len() - usize::from(control);
             let mut units = per_byte(
@@ -899,12 +925,7 @@ fn cut_token_rule(
                 },
             );
             if control {
-                let rule = match (config.driver, first) {
-                    (Driver::UnixReader, _) => Rule::Keep,
-                    (Driver::WindowsPump, None) => Rule::Drop,
-                    (Driver::WindowsPump, Some(_)) => Rule::Either,
-                };
-                units.extend(per_byte(&bytes[frame..], rule));
+                units.extend(per_byte(&bytes[frame..], Rule::Keep));
             }
             units
         }
@@ -1046,7 +1067,7 @@ fn mark_released_prefix_tails(case: &mut Case) {
             continue;
         }
         if unit.bytes.first() == Some(&NESTED) {
-            // Nested key records: one input byte each, two in the stream.
+            // Nested key records: one input byte per repeat, two in the stream.
             scan = Scan::None;
             candidates.clear();
             offset += unit.bytes.len() / 2;
@@ -1156,7 +1177,7 @@ impl Case {
     /// none.
     fn push_nested(&mut self, gap: u64, record: WindowsKeyRecord) {
         let bytes = if record.key_down {
-            vec![record.unicode as u8]
+            vec![record.unicode as u8; usize::from(record.repeat_count.max(1))]
         } else {
             Vec::new()
         };
@@ -1476,14 +1497,20 @@ fn pump_event_bytes(event: &ClientInputEvent) -> Option<Vec<u8>> {
             source: ClientKeySource::WindowsConsole { .. },
             ..
         } => None,
-        ClientInputEvent::Key { source, .. } => Some(match source {
+        ClientInputEvent::Key {
+            source,
+            repeat_count,
+            ..
+        } => Some(match source {
             ClientKeySource::Vt { bytes } => bytes.clone(),
             ClientKeySource::WindowsConsole { record }
                 if record.virtual_key_code == NATIVE_RECORD.virtual_key_code =>
             {
                 vec![SEMANTIC]
             }
-            ClientKeySource::WindowsConsole { record } => vec![NESTED, record.unicode as u8],
+            ClientKeySource::WindowsConsole { record } => {
+                [NESTED, record.unicode as u8].repeat(usize::from((*repeat_count).max(1)))
+            }
             ClientKeySource::Synthesized => Vec::new(),
         }),
         ClientInputEvent::TextCommit(text) => Some(text.as_bytes().to_vec()),

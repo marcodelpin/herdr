@@ -100,12 +100,14 @@ fn typed_runs(events: &[RawInputEvent]) -> Vec<Vec<u8>> {
 /// Same class as codex f5251-r5 finding 1 (ADR-0013 amendment 1, D4): a byte
 /// from 0x01 to 0x1f is never X10 payload. It ends an `ESC [ M` frame, in the
 /// buffer or after a released prefix. An ESC starts the next token, so the
-/// key after a broken report keeps its ESC; any other such byte is typed on
-/// the Unix reader and dropped with the frame on the pump, which replays the
-/// key record it staged for it. NUL stays payload (xterm's coordinate past
-/// its limit). Before, a frame in the buffer took six bytes whatever they
-/// were (since upstream), and the pump dropped a disproving ESC with the tail
-/// of a released prefix.
+/// key after a broken report keeps its ESC; any other such raw byte is
+/// typed, on the pump too: only a key record the pump staged goes with the
+/// frame, by record (ADR-0013 amendment 2; the translator tests
+/// `review_r6_*` cover staged records). NUL stays payload (xterm's
+/// coordinate past its limit). Before, a frame in the buffer took six bytes
+/// whatever they were (since upstream), the pump dropped a disproving ESC
+/// with the tail of a released prefix, and amendment 1 dropped a raw control
+/// byte with the frame by its class.
 #[test]
 fn review_r5_1b_control_byte_ends_an_x10_frame() {
     // (pump, released prefix or none, rest, what reaches the pane)
@@ -115,9 +117,9 @@ fn review_r5_1b_control_byte_ends_an_x10_frame() {
         (false, b"", b"\x1b[M!\x1b[A", &[b"\x1b[A"]),
         (true, b"", b"\x1b[M!\x1b[A", &[b"\x1b[A"]),
         (false, b"", b"\x1b[M\rab", &[b"\rab"]),
-        (true, b"", b"\x1b[M\rab", &[b"ab"]),
+        (true, b"", b"\x1b[M\rab", &[b"\rab"]),
         (false, b"", b"\x1b\x1b[M\rab", &[b"\x1b", b"\rab"]),
-        (true, b"", b"\x1b\x1b[M\rab", &[b"\x1b", b"ab"]),
+        (true, b"", b"\x1b\x1b[M\rab", &[b"\x1b", b"\rab"]),
         (false, b"", b"\x1b[M \x00!x", &[b"x"]),
         (true, b"", b"\x1b[M \x00!x", &[b"x"]),
         (true, b"\x1b", b"[M\x1b[A", &[b"\x1b", b"\x1b[A"]),

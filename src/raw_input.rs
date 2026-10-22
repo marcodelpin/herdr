@@ -165,6 +165,19 @@ impl RawInputFramer {
         self.events(chunks)
     }
 
+    /// Pushes one key record the pump staged for an X10 frame, as one
+    /// record whatever its repeat count (ADR-0013 amendment 2, D4).
+    pub(crate) fn push_staged_record(&mut self, data: &[u8]) -> Vec<RawInputEvent> {
+        let chunks = self.byte_framer.push_staged_record(data);
+        self.events(chunks)
+    }
+
+    /// The pump's X10 candidate ended: it accepted the report or replayed
+    /// its staged records.
+    pub(crate) fn end_staged_records(&mut self) {
+        self.byte_framer.end_staged_records();
+    }
+
     #[cfg(any(windows, test))]
     pub(crate) fn holds_host_default_color_escape(&self) -> bool {
         self.byte_framer.buffer.as_slice() == [ESC]
@@ -261,6 +274,12 @@ pub(crate) struct RawInputByteFramer {
     /// The Windows pump drives this framer (ADR-0013 D2, D4).
     #[cfg(any(windows, test))]
     pump_policy: bool,
+    /// The key records the pump staged for an X10 frame and will replay if
+    /// the frame is no report: (start, end) offsets in the pushed stream,
+    /// each one record with every repeat. Their bytes leave the framer only
+    /// inside a mouse report, never typed (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    staged_records: VecDeque<(u64, u64)>,
     host_color_replies_awaited: u16,
     #[cfg(any(windows, test))]
     host_default_color_query_issued: bool,
@@ -454,16 +473,17 @@ fn disproves_x10_payload(byte: u8) -> bool {
 
 /// How much of an `ESC [ M` frame at the front of `buffer` to drop when a
 /// byte X10 payload cannot carry ends it before its six bytes: the frame
-/// before that byte, and on the `pump` the byte too unless it is ESC, since
-/// the pump replays the key record it staged for it (ADR-0013 amendment 1,
-/// D4). An ESC starts the next token.
-fn disproved_x10_frame_len(buffer: &[u8], pump: bool) -> Option<usize> {
+/// before that byte. The byte is no part of the frame: a raw byte starts the
+/// next token, and the bytes of a key record the pump staged go with that
+/// record (`drop_staged_record_at_front`), whatever their class (ADR-0013
+/// amendment 2, D4).
+fn disproved_x10_frame_len(buffer: &[u8]) -> Option<usize> {
     let payload = buffer.strip_prefix(b"\x1b[M")?;
     let index = payload
         .iter()
         .take(3)
         .position(|byte| disproves_x10_payload(*byte))?;
-    Some(3 + index + usize::from(pump && payload[index] != ESC))
+    Some(3 + index)
 }
 
 impl HoldAfter {
@@ -575,13 +595,13 @@ fn classify_report_continuation(
             let disproved = payload.iter().position(|byte| disproves_x10_payload(*byte));
             if released && pump {
                 // The frame is the report's or the key records the pump
-                // staged for it. A byte that disproves it ends the frame: an
-                // ESC starts the next token, any other byte is dropped with
-                // the frame, so the pump replays the staged keys and the
-                // framer never also types them (ADR-0013 amendment 1, D4).
+                // staged for it. A byte that disproves it ends the frame and
+                // is no part of it: a raw byte starts the next token, and a
+                // staged record's bytes are dropped by record, so the pump
+                // replays that record once and the framer never also types
+                // it (ADR-0013 amendment 2, D4).
                 if let Some(index) = disproved {
-                    let end = 3 + index + usize::from(payload[index] != ESC);
-                    return Verdict::Drop(end - prefix.len());
+                    return Verdict::Drop(3 + index - prefix.len());
                 }
                 return if report.len() < X10_LEN {
                     Verdict::Hold
@@ -814,6 +834,18 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.push_bytes(data, false)
+    }
+
+    /// Pushes the bytes of one key record the pump staged for an X10 frame,
+    /// every repeat of it: they decide the frame as bytes, and leave the
+    /// framer by record (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    pub(crate) fn push_staged_record(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.push_bytes(data, true)
+    }
+
+    fn push_bytes(&mut self, data: &[u8], staged_record: bool) -> Vec<Vec<u8>> {
         // Bounds are checked before the new bytes can be classified with the
         // old ones (ADR-0012 D2).
         let mut chunks = self.release_due();
@@ -825,6 +857,14 @@ impl RawInputByteFramer {
         self.drop_abandoned_host_color_reply();
         self.buffer.extend_from_slice(data);
         self.record_arrival(data.len());
+        #[cfg(any(windows, test))]
+        if staged_record {
+            let end = self.pushed;
+            self.staged_records
+                .push_back((end - data.len() as u64, end));
+        }
+        #[cfg(not(any(windows, test)))]
+        let _ = staged_record;
         chunks.extend(self.push_extended());
         let now = self.now();
         self.partial_host_color_reply_read_at =
@@ -900,6 +940,42 @@ impl RawInputByteFramer {
                 .arrivals
                 .back()
                 .is_none_or(|(_, at)| now.saturating_duration_since(*at) >= PUMP_IDLE_QUIET)
+    }
+
+    /// The pump's X10 candidate ended (accepted or replayed): no byte pushed
+    /// so far is a staged record any more (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    pub(crate) fn end_staged_records(&mut self) {
+        self.staged_records.clear();
+    }
+
+    /// A staged key record at the front of `buffer` was no part of a
+    /// pending frame: the frame before it was decided (dropped, or taken as
+    /// a mouse report that ended inside the record). The pump replays the
+    /// record, or took it as the report's, so its bytes, every repeat, are
+    /// dropped here whole and never typed. A byte is judged by the record it
+    /// came in, not by its class (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    fn drop_staged_record_at_front(&mut self) -> bool {
+        let front = self.pushed.saturating_sub(self.buffer.len() as u64);
+        while self
+            .staged_records
+            .front()
+            .is_some_and(|(_, end)| *end <= front)
+        {
+            self.staged_records.pop_front();
+        }
+        let Some(&(start, end)) = self.staged_records.front() else {
+            return false;
+        };
+        if self.buffer.is_empty() || start > front {
+            return false;
+        }
+        let len = ((end - front) as usize).min(self.buffer.len());
+        tracing::debug!(len, "dropping a staged key record the pump replays");
+        self.buffer.drain(..len);
+        self.staged_records.pop_front();
+        true
     }
 
     /// The open context of a released `ESC` / `ESC [` holds an incomplete X10
@@ -1843,6 +1919,10 @@ impl RawInputByteFramer {
             if !self.resolve_tail_hold() {
                 break;
             }
+            #[cfg(any(windows, test))]
+            if self.drop_staged_record_at_front() {
+                continue;
+            }
 
             if let Some(family) = self.discard_until {
                 #[cfg(any(windows, test))]
@@ -1937,9 +2017,9 @@ impl RawInputByteFramer {
 
             // A byte X10 payload cannot carry ends an `ESC [ M` frame: it is
             // dropped as an incomplete report, and the byte starts the next
-            // token, or on the pump goes with the frame unless it is ESC
-            // (ADR-0013 amendment 1, D4).
-            if let Some(len) = disproved_x10_frame_len(&self.buffer, self.pump_policy()) {
+            // token, or goes with its staged record (ADR-0013 amendment 2,
+            // D4).
+            if let Some(len) = disproved_x10_frame_len(&self.buffer) {
                 tracing::debug!(len, "dropping X10 frame a control byte ended");
                 self.buffer.drain(..len);
                 continue;
@@ -2444,7 +2524,7 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
     // its own key (ADR-0013 amendment 1, D4).
     if buffer.starts_with(b"\x1b\x1b[M")
         && ((buffer.len() >= 7 && parse_default_mouse(&buffer[1..7]).is_some())
-            || disproved_x10_frame_len(&buffer[1..], false).is_some())
+            || disproved_x10_frame_len(&buffer[1..]).is_some())
     {
         return Some(1);
     }

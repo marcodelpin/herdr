@@ -548,8 +548,16 @@ impl WindowsInputPump {
                 } else if let Some(record) =
                     nested_record.filter(|_| self.framer.has_pending_default_mouse_sequence())
                 {
+                    // The pump replays a staged record whose key produced
+                    // events, so the framer takes it as one record: its bytes,
+                    // every repeat, are never typed (ADR-0013 amendment 2, D4).
+                    let replayed = !events.is_empty();
                     self.stage_default_mouse_key(record, &win32_paste_bytes, events);
-                    let raw_events = self.framer.push(&win32_paste_bytes);
+                    let raw_events = if replayed {
+                        self.framer.push_staged_record(&win32_paste_bytes)
+                    } else {
+                        self.framer.push(&win32_paste_bytes)
+                    };
                     self.process_raw_events(raw_events)
                 } else {
                     let raw_events = if events.is_empty() {
@@ -614,6 +622,7 @@ impl WindowsInputPump {
         if self.default_mouse_candidate.active && !self.framer.has_pending_default_mouse_sequence()
         {
             self.default_mouse_candidate.active = false;
+            self.framer.end_staged_records();
             if accepted_default_mouse {
                 self.default_mouse_candidate.events.clear();
                 self.consumed_default_mouse_keys
