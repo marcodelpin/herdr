@@ -1101,6 +1101,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
       - name: Prefetch Zig packages (fetch retried; never a test)
         uses: ./.github/actions/zig-fetch-retry
         with:
@@ -1119,9 +1122,6 @@ jobs:
           sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build musl-tools
-
-      - name: Remove Zig caches
-        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
       - name: Build
         run: cargo build --release --locked --target x86_64-unknown-linux-musl

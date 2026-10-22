@@ -262,17 +262,17 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Prefetch Zig packages (fetch retried; never a test)
-        uses: ./.github/actions/zig-fetch-retry
-        with:
-          rust-target: x86_64-pc-windows-msvc
-
       - name: Remove Zig caches
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: x86_64-pc-windows-msvc
 
       - name: Build
         run: cargo build --release --locked --target x86_64-pc-windows-msvc

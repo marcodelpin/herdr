@@ -13,10 +13,14 @@
 # the same `zig build` that build.rs runs (same arguments, a throwaway --prefix): the
 # packages land in the Zig global cache and the compiled library in the vendored
 # .zig-cache, both of which the later build.rs run reuses. An attempt is retried ONLY
-# when its error is located in a build.zig.zon, which is where zig reports a failed
-# package download (DNS, connect, HTTP status); a compile error, a hash mismatch or any
-# other failure fails the step at once. No cargo build and no test runs here: the
-# verdict steps that follow run exactly once.
+# when EVERY error line in its log is a recognised transient fetch error located in a
+# build.zig.zon (zig 0.16.0 texts: "unable to connect to server", "HTTP request failed",
+# "HTTP response read failure", "bad HTTP response code" 408/429/5xx). Any other error
+# line anywhere in the log (a hash mismatch, a manifest syntax error, a 404, a compile
+# error) fails the step at once, even beside a DNS error on another dependency, so a
+# later attempt can never turn an integrity failure green. No cargo build and no test
+# runs here: the verdict steps that follow run exactly once. Offline suite:
+# test-fetch.sh in this directory.
 #
 # Environment:
 #   ZIG_FETCH_ATTEMPTS         total attempts (default 4)
@@ -82,6 +86,10 @@ if [ -n "${LIBGHOSTTY_VT_ZIG_SYSTEM_DIR:-}" ]; then
   args+=(--system "$LIBGHOSTTY_VT_ZIG_SYSTEM_DIR")
 fi
 
+# A transient fetch error as zig 0.16.0 prints it: at the dependency's entry in a
+# build.zig.zon. A 4xx other than 408/429 is permanent (wrong URL), so it is fatal.
+retryable='build\.zig\.zon:[0-9]+:[0-9]+: error: (unable to connect to server: |HTTP request failed: |HTTP response read failure: |bad HTTP response code: .(408|429|5[0-9][0-9]) )'
+
 echo "zig-fetch-retry: fetching libghostty-vt packages for $zig_target via zig build (up to $attempts attempts)"
 attempt=1
 while :; do
@@ -92,13 +100,16 @@ while :; do
     echo "zig-fetch-retry: packages fetched on attempt $attempt/$attempts"
     exit 0
   fi
-  # zig reports a failed package download at the dependency's entry in a build.zig.zon.
-  cause=$(grep -E 'build\.zig\.zon:[0-9]+:[0-9]+: error:' "$log" | grep -v 'hash mismatch' | head -n 1 | tr -d '\r')
-  if [ -z "$cause" ]; then
-    other=$(grep -m1 'error:' "$log" | tr -d '\r')
-    echo "::error::zig-fetch-retry: zig build failed (rc=$rc) for a reason other than a package fetch; not retried. ${other:-no error line}"
+  # Every diagnostic line of the attempt, then the ones that are NOT a recognised
+  # transient fetch error. One fatal line rejects the attempt outright.
+  errors=$(tr -d '\r' < "$log" | grep -E '(^|: )error: ')
+  fatal=$(printf '%s\n' "$errors" | grep -v -E "$retryable" | grep -v '^$')
+  if [ -z "$errors" ] || [ -n "$fatal" ]; then
+    first=$(printf '%s\n' "$fatal" | head -n 1)
+    echo "::error::zig-fetch-retry: zig build failed (rc=$rc) for a reason other than a transient package fetch; not retried. ${first:-no error line}"
     exit 1
   fi
+  cause=$(printf '%s\n' "$errors" | head -n 1)
   if [ "$attempt" -ge "$attempts" ]; then
     echo "::error::zig-fetch-retry: package fetch failed on all $attempts attempts; no test ran. Last cause: $cause"
     exit 1
