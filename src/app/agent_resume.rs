@@ -29,7 +29,9 @@ pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std
         .as_ref()
         .and_then(|session| session.cwd.as_deref())
         .map(std::path::Path::new)
-        .filter(|cwd| cwd.is_dir())
+        // herdr-3cr: same rule as restore's `reported_resume_dir` - a
+        // relative agent cwd would resolve against the server's directory.
+        .filter(|cwd| cwd.is_absolute() && cwd.is_dir())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| terminal.cwd.clone())
 }
@@ -54,7 +56,11 @@ fn deferred_resume_plan_in(
 ) -> Result<crate::agent_resume::AgentResumePlan, crate::agent_resume::AgentResumePlan> {
     match plan.launch_dir.as_deref() {
         None => return Ok(plan),
-        Some(reserved) if reserved == cwd => return Ok(plan),
+        // herdr-3cr: the reserved dir is a `resume_dir_identity`, so the
+        // launch dir is compared in the same form.
+        Some(reserved) if reserved == crate::agent_resume::resume_dir_identity(cwd) => {
+            return Ok(plan)
+        }
         Some(_) => {}
     }
     terminal
@@ -1139,6 +1145,64 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    // herdr-3cr (codex h3cr-r1 P2-4): restore reserves a reported command for
+    // the directory it names, whatever spelling the report used; the
+    // deferred launch must accept any spelling of that same directory (a
+    // symlink, a trailing slash) and keep the reported command, while a
+    // genuinely different directory still falls back to the saved id.
+    #[cfg(unix)]
+    #[test]
+    fn agent_restore_3cr_deferred_launch_accepts_an_alias_of_the_reserved_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-3cr-launch-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = root.join("project");
+        let other = root.join("other");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let link = root.join("project-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let reported = crate::agent_resume::ReportedAgentResume {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
+        };
+        let mut terminal =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), real.clone());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-3cr").unwrap(),
+            cwd: Some(link.display().to_string()),
+        });
+
+        let plan = reported.plan(&link);
+        for launch in [real.clone(), link.clone(), real.join(".")] {
+            let resolved = deferred_resume_plan_in(&terminal, plan.clone(), &launch)
+                .expect("an alias of the reserved dir keeps the plan");
+            assert_eq!(
+                resolved.argv,
+                reported.argv,
+                "launch in {} is the reserved dir",
+                launch.display()
+            );
+        }
+        let resolved = deferred_resume_plan_in(&terminal, plan, &other)
+            .expect("the saved id still names a session");
+        assert_ne!(
+            resolved.argv, reported.argv,
+            "another directory never runs the reported command"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

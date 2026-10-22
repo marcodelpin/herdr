@@ -45,6 +45,7 @@ impl ReportedAgentResume {
     /// The same command can name different sessions in different directories,
     /// for example `agent --continue`, so the directory is part of its identity.
     pub fn plan(&self, cwd: &Path) -> AgentResumePlan {
+        let dir = resume_dir_identity(cwd);
         AgentResumePlan {
             agent: self.agent.clone(),
             argv: self.argv.clone(),
@@ -52,12 +53,21 @@ impl ReportedAgentResume {
                 "{}\u{0}{}\u{0}{}\u{0}argv\u{0}{}",
                 self.source,
                 self.agent,
-                cwd.display(),
+                dir.display(),
                 self.argv.join("\u{0}")
             ),
-            launch_dir: Some(cwd.to_path_buf()),
+            launch_dir: Some(dir),
         }
     }
+}
+
+/// herdr-3cr (codex h3cr-r1 P2-4): one spelling per directory for a reported
+/// resume command's identity, so `/d`, `/d/`, `/d/.` and a symlink to `/d`
+/// reserve the same dedupe key and match the same launch directory. An
+/// existing directory resolves to its canonical path; one that cannot be
+/// resolved keeps its lexical components (trailing slashes and `.` dropped).
+pub fn resume_dir_identity(dir: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.components().collect())
 }
 
 /// Restore types the command into the pane's shell, so the executable must be a

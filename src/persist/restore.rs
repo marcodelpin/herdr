@@ -972,7 +972,9 @@ fn reported_resume_dir(
     session
         .and_then(|session| session.agent_session_cwd.as_deref())
         .map(PathBuf::from)
-        .filter(|agent_cwd| agent_cwd.is_dir())
+        // herdr-3cr: a relative agent cwd would resolve against the server's
+        // working directory, not the pane's, so it names no known directory.
+        .filter(|agent_cwd| agent_cwd.is_absolute() && agent_cwd.is_dir())
         .unwrap_or_else(|| pane_cwd.to_path_buf())
 }
 
@@ -1571,6 +1573,80 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&agent_cwd);
+    }
+
+    // herdr-3cr (codex h3cr-r1 P2-4): directory aliases must not evade the
+    // reported-resume de-duplication. `/d`, `/d/`, `/d/.` and a symlink to
+    // `/d` all run the command in the same directory, so only the first pane
+    // may get the plan.
+    #[cfg(unix)]
+    #[test]
+    fn agent_restore_3cr_reported_resume_dedupes_across_directory_aliases() {
+        let root = nrr_r3_temp_dir("3cr-alias");
+        let real = root.join("project");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("project-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let spellings = [
+            real.display().to_string(),
+            format!("{}/", real.display()),
+            format!("{}/.", real.display()),
+            link.display().to_string(),
+        ];
+        let resume = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
+        };
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+        };
+        let mut planned = Vec::new();
+        for (index, spelling) in spellings.iter().enumerate() {
+            let session = super::super::snapshot::PaneAgentSessionSnapshot {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: format!("session-{index}"),
+                agent_session_cwd: Some(spelling.clone()),
+            };
+            let pane = root.join(format!("pane-{index}"));
+            let startup = pane_restore_startup(
+                Some(&session),
+                Some(&resume),
+                &pane,
+                None,
+                &mut agent_restore,
+            );
+            if startup.restore_plan.is_some() {
+                planned.push(spelling.clone());
+            }
+        }
+        assert_eq!(
+            planned,
+            vec![spellings[0].clone()],
+            "every spelling names one directory, so only the first pane resumes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // herdr-3cr (codex h3cr-r1 P2-4): a relative agent cwd would be resolved
+    // against the server's working directory, not the pane's, so it is not
+    // used: the reported command is reserved for the pane cwd.
+    #[test]
+    fn agent_restore_3cr_relative_agent_cwd_is_not_the_reported_resume_dir() {
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "codex-session".into(),
+            agent_session_cwd: Some(".".into()),
+        };
+        let pane_dir = std::path::Path::new("/pane-3cr-relative");
+        assert_eq!(reported_resume_dir(Some(&session), pane_dir), pane_dir);
     }
 
     fn nrr_r3_temp_dir(tag: &str) -> std::path::PathBuf {
