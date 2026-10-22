@@ -45,7 +45,14 @@ refused="$zon:22:20: error: unable to connect to server: ConnectionRefused"
 mismatch="$zon:9:21: error: hash mismatch: manifest declares N-V-__8AAAA but the fetched package has N-V-__8AAAB"
 notfound="$zon:14:20: error: bad HTTP response code: '404 Not Found'"
 unavailable="$zon:14:20: error: bad HTTP response code: '503 Service Unavailable'"
-reqfail="$zon:14:20: error: HTTP request failed: ConnectionResetByPeer"
+reqfail="$zon:14:20: error: HTTP request failed: WriteFailed"
+readreset="$zon:14:20: error: HTTP response read failure: ConnectionResetByPeer"
+timeout="$zon:14:20: error: unable to connect to server: Timeout"
+# Permanent causes behind the same wrapper prefixes (zig 0.16.0 std.http.Client.RequestError
+# and std.crypto.tls.Client.ReadError): a prefix alone never makes a cause transient.
+nohost="$zon:14:20: error: unable to connect to server: UriMissingHost"
+badscheme="$zon:14:20: error: unable to connect to server: UnsupportedUriScheme"
+badmac="$zon:22:20: error: HTTP response read failure: TlsBadRecordMac"
 fingerprint="$zon:1:2: error: invalid fingerprint: 0x0; if this is a new or forked package, use this value: 0x6705a76eea54dde9"
 compile="/r/vendor/libghostty-vt/src/lib_vt.zig:10:5: error: use of undeclared identifier 'foo'"
 
@@ -85,7 +92,9 @@ run_case refused-then-success 0 2 4 "$refused"
 run_case two-deps-dns-then-success 0 2 4 "$(printf '%s\n%s' "$dns" "$refused")"
 run_case http-503-then-success 0 2 4 "$unavailable"
 run_case http-request-failed-then-success 0 2 4 "$reqfail"
+run_case read-reset-then-success 0 2 4 "$readreset"
 run_case dns-every-attempt 1 4 4 "$dns" "$dns" "$dns" "$dns"
+run_case timeout-every-attempt 1 4 4 "$timeout" "$timeout" "$timeout" "$timeout"
 run_case success-first-attempt 0 1 4 -
 
 # Not retried: a fatal diagnostic anywhere in the attempt's log fails the step at once.
@@ -96,6 +105,10 @@ run_case hash-mismatch-beside-dns 1 1 4 "$(printf '%s\n%s' "$dns" "$mismatch")"
 run_case compile-error-beside-dns 1 1 4 "$(printf '%s\n%s' "$dns" "$compile")"
 run_case compile-error 1 1 4 "$compile"
 run_case no-error-line 1 1 4 "Segmentation fault"
+run_case uri-missing-host 1 1 4 "$nohost"
+run_case unsupported-uri-scheme 1 1 4 "$badscheme"
+run_case tls-bad-record-mac 1 1 4 "$badmac"
+run_case dns-beside-tls-bad-record-mac 1 1 4 "$(printf '%s\n%s' "$dns" "$badmac")"
 
 # A later attempt that turns fatal stops the loop there.
 run_case dns-then-hash-mismatch 1 2 4 "$dns" "$(printf '%s\n%s' "$refused" "$mismatch")"
