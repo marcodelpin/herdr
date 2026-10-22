@@ -6,6 +6,13 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+/// What a case expects to reach the pane, one entry per typed run.
+type Delivered<'a> = &'a [&'a [u8]];
+
+/// A colour reply case: header, tail, the input that ends the reply, and
+/// what reaches the pane.
+type ReplyCase<'a> = (&'a [u8], &'a [u8], &'a [u8], Delivered<'a>);
+
 /// A pump byte framer under a virtual clock, with the Windows default-colour
 /// query sent at 0 ms (one-second reply window).
 fn pump_framer_with_default_color_query() -> (RawInputByteFramer, Instant) {
@@ -102,7 +109,7 @@ fn typed_runs(events: &[RawInputEvent]) -> Vec<Vec<u8>> {
 #[test]
 fn review_r5_1b_control_byte_ends_an_x10_frame() {
     // (pump, released prefix or none, rest, what reaches the pane)
-    let cases: [(bool, &[u8], &[u8], &[&[u8]]); 12] = [
+    let cases: [(bool, &[u8], &[u8], Delivered<'_>); 12] = [
         (false, b"", b"\x1b[M\x1b[A", &[b"\x1b[A"]),
         (true, b"", b"\x1b[M\x1b[A", &[b"\x1b[A"]),
         (false, b"", b"\x1b[M!\x1b[A", &[b"\x1b[A"]),
@@ -274,7 +281,7 @@ fn review_r5_2c_escape_aborts_a_truncated_control_string() {
 #[test]
 fn review_r5_2e_unterminated_colour_reply_tail_is_not_typed() {
     // (header, tail, the input that ends the reply, what reaches the pane)
-    let cases: [(&[u8], &[u8], &[u8], &[&[u8]]); 8] = [
+    let cases: [ReplyCase<'_>; 8] = [
         (
             b"\x1b]4;171;rgb:b397/69a",
             b"b/5249",
