@@ -400,6 +400,29 @@ impl HoldAfter {
         len
     }
 
+    /// How many leading bytes of `tail` to drop as the unfinished rest of a
+    /// colour reply when this context ends: the reply-shaped part after an
+    /// interruption, since what was held cannot be typed after the record;
+    /// otherwise only once what was dropped before it and that part spell the
+    /// reply through its `rgb:` marker, which typing does not (ADR-0013
+    /// amendment 1, D1).
+    fn reply_tail_len(&self, tail: &[u8], interrupted: bool) -> usize {
+        let len = self.reply_shaped_len(tail);
+        if interrupted || len == 0 {
+            return len;
+        }
+        let before: &[u8] = match self {
+            HoldAfter::OscHeader { header, .. } => header,
+            _ => &[ESC],
+        };
+        let reply = [before, &tail[..len]].concat();
+        if reply.windows(4).any(|window| window == b"rgb:") {
+            len
+        } else {
+            0
+        }
+    }
+
     /// The bytes a released context sent to the pane as a key.
     fn released_prefix(&self) -> &'static [u8] {
         match self {
@@ -1355,11 +1378,14 @@ impl RawInputByteFramer {
             tracing::debug!(len, "dropping unfinished X10 report tail");
             self.buffer.drain(..len);
         }
-        // What a kept colour reply context held is not input (ADR-0013 D1).
-        if let Some(hold) = expired_hold.as_ref().filter(|hold| hold.interrupted) {
-            let len = hold.after.reply_shaped_len(&self.buffer);
-            tracing::debug!(len, "dropping unfinished colour reply tail at its deadline");
-            self.buffer.drain(..len);
+        // What a colour reply context held is not input once it spells the
+        // reply, or after an interruption (ADR-0013 D1).
+        if let Some(hold) = &expired_hold {
+            let len = hold.after.reply_tail_len(&self.buffer, hold.interrupted);
+            if len > 0 {
+                tracing::debug!(len, "dropping unfinished colour reply tail at its deadline");
+                self.buffer.drain(..len);
+            }
         }
         if let Some(hold) = &expired_hold {
             tracing::debug!(
@@ -1778,11 +1804,7 @@ impl RawInputByteFramer {
             _ => false,
         };
         let prefix = hold.after.released_prefix();
-        let reply_shaped = if hold.interrupted {
-            hold.after.reply_shaped_len(&self.buffer)
-        } else {
-            0
-        };
+        let reply_shaped = hold.after.reply_tail_len(&self.buffer, hold.interrupted);
         match classify_held_tail(&hold.after, &self.buffer, burst, self.pump_policy()) {
             // The deadline follows from the held bytes' arrival.
             Verdict::Hold => false,
@@ -1805,8 +1827,8 @@ impl RawInputByteFramer {
                 true
             }
             Verdict::Emit => {
-                // After a semantic key, the reply-shaped bytes before the
-                // byte that ended the reply are not typed (ADR-0013 D1).
+                // The reply-shaped bytes before the byte that ended the reply
+                // are not typed (ADR-0013 D1).
                 self.buffer.drain(..reply_shaped);
                 self.tail_hold = None;
                 true
