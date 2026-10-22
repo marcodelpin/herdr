@@ -4994,4 +4994,120 @@ mod tests {
         );
         assert!(!summary.iter().any(|entry| entry == "mouse"), "{summary:?}");
     }
+
+    /// A key record whose key types no character (Up), serialized in
+    /// win32-input-mode, with the given repeat count.
+    fn up_record(repeat_count: u16) -> WindowsKeyRecord {
+        WindowsKeyRecord {
+            key_down: true,
+            repeat_count,
+            virtual_key_code: 0x26,
+            virtual_scan_code: 0x48,
+            unicode: 0,
+            control_key_state: 0,
+        }
+    }
+
+    /// Raw `ESC [ M`, then the given serialized key records, then raw
+    /// `C d 2` completing the report, with no idle between the inputs, then
+    /// idle ticks to the end of every hold.
+    fn x10_report_around_records(
+        records: &[WindowsKeyRecord],
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+            events.extend(translator.translate(record));
+        }
+        for record in records.iter().copied() {
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        for record in win32_input_mode_encoded_raw_bytes(b"Cd2") {
+            events.extend(translator.translate(record));
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex f5251-r7 finding 1 (ADR-0013 amendment 3, D4): a staged key
+    /// record that contributes no byte to the X10 report stays semantic
+    /// input. Raw `ESC [ M`, serialized Up, raw `C d 2`: the report takes
+    /// none of Up's bytes (it has none), so Up reaches the pane, then the
+    /// Mouse event. Before, the accepted report cleared every staged event
+    /// and only the Mouse event came out. Repeated Up records, and one Up
+    /// with repeat count 2, survive the same way.
+    #[test]
+    fn review_r7_1_staged_record_without_bytes_survives_the_report() {
+        for (records, expected) in [
+            (vec![up_record(1)], vec!["Upx1", "mouse"]),
+            (vec![up_record(2)], vec!["Upx2", "mouse"]),
+            (
+                vec![up_record(1), up_record(1)],
+                vec!["Upx1", "Upx1", "mouse"],
+            ),
+        ] {
+            let events = x10_report_around_records(&records);
+            assert_eq!(
+                event_summary_with_repeats(&events),
+                expected,
+                "{records:?}: {events:?}"
+            );
+        }
+    }
+
+    /// codex f5251-r7 finding 1: Up staged between the payload records of
+    /// the report. The records that type `C`, `d` and `2` go with the
+    /// report; Up, which gave it no byte, is still typed, once per repeat,
+    /// before the Mouse event.
+    #[test]
+    fn review_r7_1_staged_record_without_bytes_between_payload_records() {
+        let shift_c = (67, 46, 67, 16, 1);
+        let up = (0x26, 0x48, 0, 0, 1);
+        let up_twice = (0x26, 0x48, 0, 0, 2);
+        let d = (68, 32, 100, 0, 1);
+        let two = (50, 3, 50, 0, 1);
+        for (released, payload, expected) in [
+            (false, vec![up, shift_c, d, two], vec!["Upx1", "mouse"]),
+            (
+                true,
+                vec![up, shift_c, d, two],
+                vec!["Escx1", "Upx1", "mouse"],
+            ),
+            (
+                false,
+                vec![shift_c, up_twice, d, two],
+                vec!["Upx2", "mouse"],
+            ),
+            (
+                true,
+                vec![shift_c, up, d, up, two],
+                vec!["Escx1", "Upx1", "Upx1", "mouse"],
+            ),
+        ] {
+            let events = x10_frame_with_staged_records(released, &payload);
+            assert_eq!(
+                event_summary_with_repeats(&events),
+                expected,
+                "released {released}, {payload:?}: {events:?}"
+            );
+        }
+    }
+
+    /// The rejected frame keeps arrival order: a staged Up, then a staged
+    /// Enter whose CR disproves the frame, replay as Up then Enter.
+    #[test]
+    fn review_r7_1_staged_record_without_bytes_replays_in_order_when_rejected() {
+        let up = (0x26, 0x48, 0, 0, 1);
+        let enter = (13, 28, 13, 0, 1);
+        let events = x10_frame_with_staged_records(false, &[up, enter]);
+        assert_eq!(
+            event_summary_with_repeats(&events),
+            vec!["Upx1", "Enterx1"],
+            "{events:?}"
+        );
+    }
 }

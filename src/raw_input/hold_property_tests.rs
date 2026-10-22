@@ -574,11 +574,22 @@ fn frame_then_control_record(rng: &mut Rng, case: &mut Case) {
     }
 }
 
+/// A press whose key types no character: an arrow key. Its nested record
+/// has no payload bytes, so an X10 report never takes it (codex f5251-r7
+/// finding 1; ADR-0013 amendment 3, D4).
+fn silent_record(rng: &mut Rng) -> WindowsKeyRecord {
+    let (vk, scan) = *rng.pick(&[(0x25, 0x4b), (0x26, 0x48), (0x27, 0x4d), (0x28, 0x50)]);
+    key_record(vk, scan, 0, 0)
+}
+
 /// Pump: raw `ESC [ M`, then the three payload bytes of an X10 report as
 /// nested key records the pump stages for it, sometimes each followed by
 /// its release. The report is accepted and its keys consumed, or, when the
 /// frame was dropped at a quiet idle before it completed, every key reaches
-/// the pane once, in order (ADR-0013 D4).
+/// the pane once, in order (ADR-0013 D4). One time in two a record that
+/// types no character (an arrow, sometimes repeated) is staged before one
+/// of the payload records: the report takes none of its bytes, so it
+/// reaches the pane either way (ADR-0013 amendment 3, D4).
 fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let first_gap = gap(rng);
     case.push_raw(&[(first_gap, b"\x1b[M")], Kind::X10);
@@ -586,8 +597,24 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
         bytes: b"\x1b[M".to_vec(),
         rule: Rule::Drop,
     });
+    let silent = if rng.chance(1, 2) {
+        let at = rng.below(3) as usize;
+        let record = silent_record(rng);
+        Some((at, with_repeats(rng, record)))
+    } else {
+        None
+    };
     let mut keys = Vec::new();
+    let mut kept = Vec::new();
     for index in 0..3 {
+        if let Some((_, record)) = silent.filter(|(at, _)| *at == index) {
+            case.push_nested(record_gap(rng), record);
+            if rng.chance(1, 3) {
+                case.push_nested(rng.range(0, 5), released(record));
+            }
+            keys.push(nested_keys(record));
+            kept.push(nested_keys(record));
+        }
         let record = match index {
             0 => x10_button_record(rng),
             1 => printable_record(rng),
@@ -606,7 +633,7 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     }
     case.expected.push(Unit {
         bytes: keys.concat(),
-        rule: Rule::OneOf(vec![Vec::new(), keys]),
+        rule: Rule::OneOf(vec![kept, keys]),
     });
 }
 
@@ -1067,10 +1094,15 @@ fn mark_released_prefix_tails(case: &mut Case) {
             continue;
         }
         if unit.bytes.first() == Some(&NESTED) {
-            // Nested key records: one input byte per repeat, two in the stream.
+            // Nested key records: one input byte per repeat, two in the
+            // stream; a key that types no character has no input byte.
             scan = Scan::None;
             candidates.clear();
-            offset += unit.bytes.len() / 2;
+            offset += unit
+                .bytes
+                .chunks(2)
+                .filter(|pair| pair.get(1).is_some_and(|ch| *ch != 0))
+                .count();
             continue;
         }
         let len = unit.bytes.len();
@@ -1173,10 +1205,10 @@ impl Case {
     }
 
     /// Appends a nested key record. Its input is the character the pump
-    /// pushes when it stages the record for an X10 report; a release has
-    /// none.
+    /// pushes when it stages the record for an X10 report; a release, and
+    /// a key that types no character, have none.
     fn push_nested(&mut self, gap: u64, record: WindowsKeyRecord) {
-        let bytes = if record.key_down {
+        let bytes = if record.key_down && record.unicode != 0 {
             vec![record.unicode as u8; usize::from(record.repeat_count.max(1))]
         } else {
             Vec::new()
@@ -2676,7 +2708,9 @@ fn oracle_interrupted_report_is_not_blanket_either() {
 /// case: colour replies cut off before their terminator, X10 frames a
 /// control byte or the next ESC ends, nested key records staged behind an
 /// X10 frame (a control key, or report payload), and nested records on
-/// their own.
+/// their own. codex f5251-r7 finding 1: nested records that type no
+/// character, staged behind an X10 frame (they have no input bytes, so
+/// they are counted from the reads).
 #[derive(Debug, Default)]
 struct ExtendedCoverage {
     unterminated_colors: usize,
@@ -2685,10 +2719,19 @@ struct ExtendedCoverage {
     staged_control_keys: usize,
     staged_report_keys: usize,
     standalone_keys: usize,
+    staged_silent_keys: usize,
 }
 
 impl ExtendedCoverage {
     fn count(&mut self, case: &Case) {
+        self.staged_silent_keys += case
+            .reads
+            .iter()
+            .filter(|read| {
+                read.nested
+                    .is_some_and(|record| record.key_down && record.unicode == 0)
+            })
+            .count();
         let ends: Vec<usize> = case
             .token_starts
             .iter()
@@ -2779,6 +2822,7 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_control_keys,
         staged_report_keys,
         standalone_keys,
+        staged_silent_keys,
     } = extended;
     for count in [
         unterminated_colors,
@@ -2787,6 +2831,7 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_control_keys,
         staged_report_keys,
         standalone_keys,
+        staged_silent_keys,
     ] {
         assert!(count > 1_000, "{extended:?}");
     }
