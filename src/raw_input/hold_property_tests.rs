@@ -76,6 +76,8 @@ const LEFT_CTRL_PRESSED: u32 = 0x0008;
 const SHIFT_PRESS: WindowsKeyRecord = key_record(0x10, 0x2a, 0, SHIFT_PRESSED);
 /// Mixed into the seed of the extended stream, so its draws are its own.
 const EXTENDED_SALT: u64 = 0x00e7_0000_0000;
+/// Mixed into the seed of the silent-record draws of an X10 report.
+const SILENT_SALT: u64 = 0x0051_1e00_0000_0000;
 
 // The ADR bounds table, restated so the oracle does not read the framer's
 // own deadlines (`oracle_bounds_match_the_adr` ties them together).
@@ -597,10 +599,19 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
         bytes: b"\x1b[M".to_vec(),
         rule: Rule::Drop,
     });
-    let silent = if rng.chance(1, 2) {
-        let at = rng.below(3) as usize;
-        let record = silent_record(rng);
-        Some((at, with_repeats(rng, record)))
+    // The silent record draws from its own generator, seeded from the case
+    // so far, so the cases of every stream stay the ones the earlier rounds
+    // measured.
+    let mut side = Rng(case
+        .input
+        .iter()
+        .fold(SILENT_SALT ^ case.reads.len() as u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        }));
+    let silent = if side.chance(1, 2) {
+        let at = side.below(3) as usize;
+        let record = silent_record(&mut side);
+        Some((at, with_repeats(&mut side, record)))
     } else {
         None
     };
@@ -608,9 +619,9 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let mut kept = Vec::new();
     for index in 0..3 {
         if let Some((_, record)) = silent.filter(|(at, _)| *at == index) {
-            case.push_nested(record_gap(rng), record);
-            if rng.chance(1, 3) {
-                case.push_nested(rng.range(0, 5), released(record));
+            case.push_nested(record_gap(&mut side), record);
+            if side.chance(1, 3) {
+                case.push_nested(side.range(0, 5), released(record));
             }
             keys.push(nested_keys(record));
             kept.push(nested_keys(record));

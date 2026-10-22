@@ -376,7 +376,11 @@ struct WindowsInputPump {
 #[derive(Default)]
 struct DefaultMouseCandidate {
     active: bool,
-    events: Vec<crate::protocol::ClientInputEvent>,
+    /// The staged events in arrival order, each with whether its record
+    /// pushed bytes the report can take (a release: whether its press did).
+    /// An accepted report consumes only those; a record that pushed none
+    /// (an arrow key) stays semantic input (ADR-0013 amendment 3, D4).
+    events: Vec<(crate::protocol::ClientInputEvent, bool)>,
     unreleased_keys: Vec<WindowsKeyRecord>,
 }
 
@@ -551,6 +555,8 @@ impl WindowsInputPump {
                     // The pump replays a staged record whose key produced
                     // events, so the framer takes it as one record: its bytes,
                     // every repeat, are never typed (ADR-0013 amendment 2, D4).
+                    // A record with no bytes gives the report nothing, so an
+                    // accepted report leaves its events (amendment 3, D4).
                     let replayed = !events.is_empty();
                     self.stage_default_mouse_key(record, &win32_paste_bytes, events);
                     let raw_events = if replayed {
@@ -623,16 +629,21 @@ impl WindowsInputPump {
         {
             self.default_mouse_candidate.active = false;
             self.framer.end_staged_records();
-            if accepted_default_mouse {
-                self.default_mouse_candidate.events.clear();
+            let staged = std::mem::take(&mut self.default_mouse_candidate.events);
+            let mut staged: Vec<_> = if accepted_default_mouse {
                 self.consumed_default_mouse_keys
                     .append(&mut self.default_mouse_candidate.unreleased_keys);
+                staged
+                    .into_iter()
+                    .filter(|(_, has_report_bytes)| !has_report_bytes)
+                    .map(|(event, _)| event)
+                    .collect()
             } else {
-                let mut staged = std::mem::take(&mut self.default_mouse_candidate.events);
                 self.default_mouse_candidate.unreleased_keys.clear();
-                staged.append(&mut output);
-                output = staged;
-            }
+                staged.into_iter().map(|(event, _)| event).collect()
+            };
+            staged.append(&mut output);
+            output = staged;
         }
         output
     }
@@ -643,7 +654,16 @@ impl WindowsInputPump {
         raw_bytes: &[u8],
         events: Vec<crate::protocol::ClientInputEvent>,
     ) {
-        self.default_mouse_candidate.events.extend(events);
+        // A release goes with its press: it belongs to the report when the
+        // press pushed bytes the report can take.
+        let has_report_bytes = if record.key_down {
+            !raw_bytes.is_empty()
+        } else {
+            matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_some()
+        };
+        self.default_mouse_candidate
+            .events
+            .extend(events.into_iter().map(|event| (event, has_report_bytes)));
         self.stage_default_mouse_record(record, raw_bytes);
     }
 
