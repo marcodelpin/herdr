@@ -782,16 +782,29 @@ pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
     (result == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
+/// Linux pins a process through a pidfd.
+pub(super) const PIDFD_SUPPORTED: bool = true;
+
 /// A pidfd for `pid`: it becomes readable when the process exits, and it
-/// cannot follow a reused pid. None before Linux 5.3 or when the process is gone.
-pub(super) fn open_pidfd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+/// cannot follow a reused pid. `Ok(None)` when the process is already gone or
+/// the kernel predates pidfd_open (Linux 5.3); an error when a live process
+/// could not be pinned, for example with no descriptor left (EMFILE), which a
+/// caller must not read as an exit (codex t6kr-r4 P2-3).
+pub(super) fn open_pidfd(pid: u32) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     use std::os::fd::FromRawFd as _;
 
-    let pid = libc::pid_t::try_from(pid).ok()?;
+    let pid = libc::pid_t::try_from(pid).map_err(std::io::Error::other)?;
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    let fd = RawFd::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOSYS) => Ok(None),
+            _ => Err(err),
+        };
+    }
+    let fd = RawFd::try_from(fd).map_err(std::io::Error::other)?;
     // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
-    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
 }
 
 pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {

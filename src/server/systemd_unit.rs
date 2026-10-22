@@ -144,9 +144,30 @@ pub(crate) fn probe() -> io::Result<Supervision> {
     Ok(Supervision::Supervised(UnitLead { unit, notifier }))
 }
 
+/// Reads the main pid of a unit this server led, after the lead is gone.
+pub(crate) struct MainPidReader {
+    unit: UnitRef,
+}
+
+impl MainPidReader {
+    pub(crate) fn describe(&self) -> String {
+        self.unit.describe()
+    }
+
+    pub(crate) fn main_pid(&self) -> io::Result<u32> {
+        self.unit.state().map(|state| state.main_pid)
+    }
+}
+
 impl UnitLead {
     pub(crate) fn describe(&self) -> String {
         self.unit.describe()
+    }
+
+    pub(crate) fn main_pid_reader(&self) -> MainPidReader {
+        MainPidReader {
+            unit: self.unit.clone(),
+        }
     }
 
     /// ADR-0018 D2 steps 3-4: asks systemd to take `pid` as the unit's main
@@ -393,23 +414,83 @@ impl Notifier {
         }
         let socket = UnixDatagram::unbound()?;
         socket.connect(std::path::Path::new(address))?;
+        // codex t6kr-r4 P2-4: a manager that stops reading fills its queue, and
+        // a blocking send would then wait forever. Every send waits for room
+        // within the deadline of the notification it belongs to.
+        socket.set_nonblocking(true)?;
         let notifier = Self { socket };
-        notifier.barrier()?;
+        notifier.barrier(Instant::now() + BARRIER_TIMEOUT)?;
         Ok(notifier)
     }
 
+    /// `MAINPID=` and its barrier, both within one BARRIER_TIMEOUT.
     fn send_main_pid(&self, pid: u32) -> io::Result<()> {
-        self.socket.send(format!("MAINPID={pid}\n").as_bytes())?;
-        self.barrier()
+        let deadline = Instant::now() + BARRIER_TIMEOUT;
+        send_until(
+            &self.socket,
+            format!("MAINPID={pid}\n").as_bytes(),
+            None,
+            deadline,
+        )?;
+        self.barrier(deadline)
     }
 
     /// `BARRIER=1` with the write end of a pipe: the manager closes it once it
     /// has processed every message it received before.
-    fn barrier(&self) -> io::Result<()> {
+    fn barrier(&self, deadline: Instant) -> io::Result<()> {
         let (read_end, write_end) = cloexec_pipe()?;
-        send_with_fd(&self.socket, b"BARRIER=1\n", write_end.as_raw_fd())?;
+        send_until(
+            &self.socket,
+            b"BARRIER=1\n",
+            Some(write_end.as_raw_fd()),
+            deadline,
+        )?;
         drop(write_end);
-        wait_for_hangup(&read_end, BARRIER_TIMEOUT)
+        wait_for_hangup(&read_end, deadline)
+    }
+}
+
+/// Sends one datagram on the nonblocking notification socket, waiting for
+/// room in the manager's queue until `deadline`.
+fn send_until(
+    socket: &UnixDatagram,
+    payload: &[u8],
+    fd: Option<libc::c_int>,
+    deadline: Instant,
+) -> io::Result<()> {
+    loop {
+        let sent = match fd {
+            Some(fd) => send_with_fd(socket, payload, fd),
+            None => socket.send(payload).map(|_| ()),
+        };
+        match sent {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err),
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the systemd manager did not take a notification within {} ms",
+                    BARRIER_TIMEOUT.as_millis()
+                ),
+            ));
+        }
+        let mut poll_fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        if unsafe { libc::poll(&mut poll_fd, 1, millis) } < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -455,15 +536,14 @@ fn send_with_fd(socket: &UnixDatagram, payload: &[u8], fd: libc::c_int) -> io::R
         (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::c_int, fd);
     }
-    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, 0) };
+    let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_DONTWAIT) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-fn wait_for_hangup(read_end: &OwnedFd, timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
+fn wait_for_hangup(read_end: &OwnedFd, deadline: Instant) -> io::Result<()> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let mut poll_fd = libc::pollfd {
@@ -488,7 +568,7 @@ fn wait_for_hangup(read_end: &OwnedFd, timeout: Duration) -> io::Result<()> {
                 io::ErrorKind::TimedOut,
                 format!(
                     "the systemd manager did not answer a notification barrier within {} ms",
-                    timeout.as_millis()
+                    BARRIER_TIMEOUT.as_millis()
                 ),
             ));
         }

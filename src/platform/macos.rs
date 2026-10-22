@@ -993,8 +993,10 @@ pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
 }
 
 /// macOS has no pidfd; a local stop waits on the server's sockets only.
-pub(super) fn open_pidfd(_pid: u32) -> Option<std::os::fd::OwnedFd> {
-    None
+pub(super) const PIDFD_SUPPORTED: bool = false;
+
+pub(super) fn open_pidfd(_pid: u32) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    Ok(None)
 }
 
 pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {

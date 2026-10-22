@@ -727,7 +727,11 @@ fn an_unreadable_answer_rolls_the_main_pid_back_through_the_import_server() {
 /// the panes it had just handed on.
 #[test]
 fn a_rollback_the_import_server_never_answered_refuses_later_handoffs() {
-    let fx = start_supervised(Policy::AcceptThenHide, true, &[(IMPORT_FAIL_ENV, "on_abort")]);
+    let fx = start_supervised(
+        Policy::AcceptThenHide,
+        true,
+        &[(IMPORT_FAIL_ENV, "on_abort")],
+    );
     let response = request(&fx.api_socket, handoff_request());
     assert!(
         response.get("error").is_some(),
@@ -745,7 +749,10 @@ fn a_rollback_the_import_server_never_answered_refuses_later_handoffs() {
         response.get("error").is_some(),
         "a handoff while systemd names the dead import server must be refused: {response}"
     );
-    assert!(!process_gone(fx.old_pid), "the old server must keep running");
+    assert!(
+        !process_gone(fx.old_pid),
+        "the old server must keep running"
+    );
     wait_for_api(&fx.api_socket, Duration::from_secs(10));
     fx.assert_panes_kept();
     assert_eq!(fx.manager.main(), dead_import);
@@ -762,7 +769,10 @@ fn a_stop_signal_during_the_decision_is_forwarded_to_the_replacement() {
     let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
     fx.wait_decision_held();
     let replacement = fx.manager.main();
-    assert_ne!(replacement, fx.old_pid, "systemd must name the import server");
+    assert_ne!(
+        replacement, fx.old_pid,
+        "systemd must name the import server"
+    );
     // The read-back is held: the old server is deciding.
     assert_eq!(
         unsafe { libc::kill(fx.old_pid as libc::pid_t, libc::SIGTERM) },

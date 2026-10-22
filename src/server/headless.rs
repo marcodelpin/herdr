@@ -250,6 +250,13 @@ pub struct HeadlessServer {
     /// Set once a live handoff committed: the session, its save and the
     /// obligation to write it belong to the replacement (ADR-0018 D3).
     handed_over: bool,
+    /// codex t6kr-r4 P1-2: an import server that systemd may still name as the
+    /// unit's main process after a rollback it never confirmed. It stays
+    /// unreaped (its exit could not reach systemd while this server lives
+    /// anyway, and a reap would hide it for good), and every later handoff is
+    /// refused until systemd names this server again.
+    #[cfg(unix)]
+    unconfirmed_import_main: Option<(u32, crate::server::systemd_unit::MainPidReader)>,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
@@ -452,6 +459,8 @@ impl HeadlessServer {
             host_shutdown_probe: crate::platform::host_shutdown_in_progress,
             handoff_in_progress: false,
             handed_over: false,
+            #[cfg(unix)]
+            unconfirmed_import_main: None,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
             should_quit,

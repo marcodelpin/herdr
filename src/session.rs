@@ -278,23 +278,48 @@ fn stop_socket_with_timeout(
         "method": "server.stop",
         "params": {}
     });
-    let stream = crate::ipc::connect_local_stream(&socket_path).map_err(|err| {
-        format!(
-            "{label} is not running or cannot be reached at {}: {err}",
-            socket_path.display()
-        )
-    })?;
-    // herdr-eys1: a stop is complete when the server process is gone, not when
-    // its sockets stop answering. After a live handoff systemd SIGKILLs the main
-    // process as soon as ExecStop returns, which would cut the server's teardown
-    // short (its panes) and end the unit as failed.
-    let server_process = pin_server_process(&stream);
-    let stop_response = send_stop_request(stream, &request, deadline)?;
-    if let Some(response) = stop_response {
-        if let Some(error) = response.get("error") {
-            return Err(error.to_string());
+    let mut retried_for_handoff = false;
+    let server_process = loop {
+        let stream = match crate::ipc::connect_local_stream(&socket_path) {
+            Ok(stream) => stream,
+            // A handoff was deciding: its new owner (or the old server, after
+            // an abort) binds the socket path again within the deadline.
+            Err(_) if retried_for_handoff && Instant::now() < deadline => {
+                std::thread::sleep(STOP_WAIT_POLL.min(time_until(deadline)));
+                continue;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "{label} is not running or cannot be reached at {}: {err}",
+                    socket_path.display()
+                ))
+            }
+        };
+        // herdr-eys1: a stop is complete when the server process is gone, not
+        // when its sockets stop answering. After a live handoff systemd
+        // SIGKILLs the main process as soon as ExecStop returns, which would
+        // cut the server's teardown short (its panes) and end the unit as
+        // failed.
+        let server_process = pin_server_process(&stream);
+        let stop_response = send_stop_request(stream, &request, deadline)?;
+        let Some(error) = stop_response
+            .as_ref()
+            .and_then(|response| response.get("error"))
+        else {
+            break server_process;
+        };
+        // codex t6kr-r4 P1-1 (ADR-0018 D2 step 1): a server deciding a live
+        // handoff refuses the stop; the socket path already belongs to the
+        // server that owns the stop now, so the retried stop reaches it.
+        if error.get("code").and_then(serde_json::Value::as_str) == Some(STOP_HANDOFF_IN_PROGRESS)
+            && Instant::now() < deadline
+        {
+            retried_for_handoff = true;
+            std::thread::sleep(STOP_WAIT_POLL.min(time_until(deadline)));
+            continue;
         }
-    }
+        return Err(error.to_string());
+    };
     if !wait_until_stopped_until(&stopped_socket_paths, deadline) {
         let reachable = reachable_socket_paths(&stopped_socket_paths);
         return Err(format!(
@@ -307,17 +332,32 @@ fn stop_socket_with_timeout(
                 .join(", ")
         ));
     }
-    if let Some(process) = server_process {
-        if !server_process_exited_until(&process, deadline) {
-            return Err(format!(
+    match server_process {
+        Ok(Some(process)) => match process.wait_for_exit_until(deadline) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
                 "{label} closed its sockets but its process {} did not exit within {}ms",
                 process.pid(),
                 timeout.as_millis()
-            ));
-        }
+            )),
+            Err(err) => Err(format!(
+                "{label} closed its sockets but its process {} could not be observed: {err}",
+                process.pid()
+            )),
+        },
+        // The platform cannot pin a process (macOS, Windows), or the process
+        // was already gone when the stop connected.
+        Ok(None) => Ok(()),
+        // codex t6kr-r4 P2-3: a live process that could not be pinned has not
+        // been seen to exit; reporting success would let systemd SIGKILL it.
+        Err(err) => Err(format!(
+            "{label} closed its sockets, but its process could not be pinned to wait for its exit: {err}"
+        )),
     }
-    Ok(())
 }
+
+/// The `server.stop` error of a server that is deciding a live handoff.
+const STOP_HANDOFF_IN_PROGRESS: &str = "server_handoff_in_progress";
 
 #[cfg(test)]
 thread_local! {
@@ -326,21 +366,14 @@ thread_local! {
     static PIN_UNAVAILABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn pin_server_process(stream: &LocalStream) -> Option<crate::platform::PinnedProcess> {
+fn pin_server_process(
+    stream: &LocalStream,
+) -> std::io::Result<Option<crate::platform::PinnedProcess>> {
     #[cfg(test)]
     if PIN_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
-        return None;
+        return Ok(None);
     }
     crate::platform::pin_local_stream_peer(stream)
-}
-
-/// Whether the pinned server process exited by `deadline`. A process that
-/// cannot be waited on does not hold the stop.
-fn server_process_exited_until(
-    process: &crate::platform::PinnedProcess,
-    deadline: Instant,
-) -> bool {
-    process.wait_for_exit_until(deadline).unwrap_or(true)
 }
 
 pub fn delete_session(name: &str) -> Result<SessionInfo, String> {
@@ -876,10 +909,19 @@ mod tests {
     fn assert_local_stop_waits_for_the_server_exit() {
         let (stopped, exited) = stop_fake_server("stop-waits-for-exit", "linger");
         assert_eq!(stopped, Ok(()));
-        assert!(
-            exited,
-            "the stop returned while the server process was still running"
-        );
+        if server_process_can_be_pinned() {
+            assert!(
+                exited,
+                "the stop returned while the server process was still running"
+            );
+        }
+    }
+
+    /// Whether this platform's local stop waits for the server process to exit
+    /// (a pidfd on Linux); elsewhere it waits on the sockets only.
+    #[cfg(unix)]
+    fn server_process_can_be_pinned() -> bool {
+        cfg!(target_os = "linux") && !PIN_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get)
     }
 
     #[cfg(unix)]
@@ -907,7 +949,7 @@ mod tests {
     fn a_stop_refused_during_a_handoff_decision_is_retried_at_the_new_owner() {
         let (stopped, exited) = stop_fake_server("stop-retries-handoff", "handoff-busy");
         assert_eq!(stopped, Ok(()));
-        if !PIN_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) && cfg!(target_os = "linux") {
+        if server_process_can_be_pinned() {
             assert!(exited, "the retried stop must wait for the server's exit");
         }
     }
@@ -925,7 +967,10 @@ mod tests {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
         // The lowest free descriptor goes to the stop's connection; nothing is
         // left for the pidfd. nextest runs this test in a process of its own.
         let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();

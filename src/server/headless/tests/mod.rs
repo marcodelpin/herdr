@@ -135,6 +135,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         handoff_in_progress: false,
         handed_over: false,
         #[cfg(unix)]
+        unconfirmed_import_main: None,
+        #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
         should_quit,
         server_stop,

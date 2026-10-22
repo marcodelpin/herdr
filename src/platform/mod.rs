@@ -159,8 +159,10 @@ impl PinnedProcess {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn pin_local_stream_peer(_stream: &crate::ipc::LocalStream) -> Option<PinnedProcess> {
-    None
+pub(crate) fn pin_local_stream_peer(
+    _stream: &crate::ipc::LocalStream,
+) -> std::io::Result<Option<PinnedProcess>> {
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

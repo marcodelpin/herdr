@@ -20,6 +20,25 @@ pub(super) fn wait_for_live_handoff_response_write(
     }
 }
 
+/// Ends and reaps an earlier import server by pid; its `Child` handle was
+/// dropped when the handoff that spawned it returned.
+#[cfg(unix)]
+fn reap_import_child(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let mut status = 0;
+    loop {
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if reaped >= 0 || std::io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break;
+        }
+    }
+}
+
 impl HeadlessServer {
     #[cfg(unix)]
     pub(super) fn perform_live_handoff(
@@ -27,6 +46,11 @@ impl HeadlessServer {
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
         info!("starting live handoff");
+        if let Err(err) = self.resolve_unconfirmed_import_main() {
+            self.handoff_in_progress = false;
+            warn!(err = %err, "live handoff refused");
+            return Err(err);
+        }
         // ADR-0018 D1: a server that leads a systemd unit moves the unit's main
         // pid before it commits, or the unit ends every pane together with it.
         let supervision = match crate::server::systemd_unit::probe() {
@@ -286,7 +310,7 @@ impl HeadlessServer {
         use crate::server::systemd_unit::HandOver;
 
         if !self.server_stop.close_intake_for_handoff() {
-            self.abort_import(stream, import_child, None, true);
+            self.abort_import(lead, stream, import_child, None, true);
             return Err(io::Error::other(
                 "live handoff aborted: a stop arrived before the decision; the old server keeps the panes and stops",
             ));
@@ -314,24 +338,64 @@ impl HeadlessServer {
                 ),
             ),
         };
-        self.abort_import(stream, import_child, rollback, main_is_self);
+        let resolved = self.abort_import(lead, stream, import_child, rollback, main_is_self);
+        let unresolved = if resolved {
+            String::new()
+        } else {
+            format!(
+                "; systemd may still name the import server pid {import_pid} as the main process, so further handoffs are refused until it names this server again (restart the unit)"
+            )
+        };
         Err(io::Error::other(format!(
-            "live handoff aborted: {reason}; the old server keeps the panes"
+            "live handoff aborted: {reason}; the old server keeps the panes{unresolved}"
         )))
+    }
+
+    /// codex t6kr-r4 P1-2: while systemd may name an earlier import server as
+    /// main process, a handoff would read "another process is main", go on
+    /// unsupervised, and the exit of this server would hand that import
+    /// server's end to systemd, which then ends the unit with every pane just
+    /// handed on. Refuse until systemd names this server again.
+    #[cfg(unix)]
+    fn resolve_unconfirmed_import_main(&mut self) -> io::Result<()> {
+        let Some((pid, reader)) = self.unconfirmed_import_main.take() else {
+            return Ok(());
+        };
+        match reader.main_pid() {
+            Ok(main) if main == std::process::id() => {
+                info!(pid, unit = %reader.describe(), "systemd names this server as main process again; reaping the earlier import server");
+                reap_import_child(pid);
+                Ok(())
+            }
+            answer => {
+                let answer = match answer {
+                    Ok(main) => format!("systemd names pid {main}"),
+                    Err(err) => err.to_string(),
+                };
+                let err = io::Error::other(format!(
+                    "live handoff refused: an earlier handoff could not confirm that {} has this server as its main process again ({answer}); the import server pid {pid} may still be the main process; restart the unit",
+                    reader.describe()
+                ));
+                self.unconfirmed_import_main = Some((pid, reader));
+                Err(err)
+            }
+        }
     }
 
     /// Tells the import server the handoff is off, takes over a stop it
     /// received, and reaps it only once this server is known to be the unit's
     /// main process again (a reap would hide the import server's end from
     /// systemd if systemd still named it).
+    /// Returns whether this server is known to be the main process again.
     #[cfg(unix)]
     fn abort_import(
         &mut self,
+        lead: &crate::server::systemd_unit::UnitLead,
         stream: &mut std::os::unix::net::UnixStream,
         import_child: &mut std::process::Child,
         rollback_main_pid: Option<u32>,
         main_is_self: bool,
-    ) {
+    ) -> bool {
         let reply = crate::server::handoff::send_abort(stream, rollback_main_pid)
             .and_then(|()| crate::server::handoff::wait_aborted(stream));
         self.server_stop.reopen_intake();
@@ -351,12 +415,22 @@ impl HeadlessServer {
         };
         if main_confirmed {
             crate::server::handoff::cleanup_failed_import_child(import_child);
-        } else {
-            warn!(
-                pid = import_child.id(),
-                "systemd may still name the import server as main process; leaving it unreaped so systemd sees its real end"
-            );
+            return true;
         }
+        // The rollback was not confirmed (the import server did not answer):
+        // ask systemd once more before this server serves again.
+        let reader = lead.main_pid_reader();
+        if reader.main_pid().ok() == Some(std::process::id()) {
+            crate::server::handoff::cleanup_failed_import_child(import_child);
+            return true;
+        }
+        warn!(
+            pid = import_child.id(),
+            unit = %reader.describe(),
+            "systemd may still name the import server as main process; leaving it unreaped and refusing further handoffs until systemd names this server again"
+        );
+        self.unconfirmed_import_main = Some((import_child.id(), reader));
+        false
     }
 
     pub(super) fn finish_live_handoff_shutdown(&mut self) {

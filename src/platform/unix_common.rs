@@ -368,18 +368,26 @@ impl PinnedProcess {
 }
 
 /// Pins the process on the other end of a connected local stream: the one
-/// that called listen() on the socket. None when it cannot be named or pinned,
-/// or when it is this process.
-pub(crate) fn pin_local_stream_peer(stream: &crate::ipc::LocalStream) -> Option<PinnedProcess> {
+/// that called listen() on the socket. `Ok(None)` when the platform cannot pin
+/// a process, when the process is already gone, or when it is this process. An
+/// error when a live process could not be named or pinned: that is not an
+/// exit, and a stop must not report one (codex t6kr-r4 P2-3).
+pub(crate) fn pin_local_stream_peer(
+    stream: &crate::ipc::LocalStream,
+) -> std::io::Result<Option<PinnedProcess>> {
     use std::os::fd::{AsFd as _, AsRawFd as _};
 
-    let crate::ipc::LocalStream::UdSocket(socket) = stream;
-    let pid = super::socket_peer_pid(socket.as_fd().as_raw_fd())?;
-    if pid == std::process::id() {
-        return None;
+    if !super::PIDFD_SUPPORTED {
+        return Ok(None);
     }
-    let pidfd = super::open_pidfd(pid)?;
-    Some(PinnedProcess { pid, pidfd })
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let pid = super::socket_peer_pid(socket.as_fd().as_raw_fd()).ok_or_else(|| {
+        std::io::Error::other("the process serving the socket could not be named")
+    })?;
+    if pid == std::process::id() {
+        return Ok(None);
+    }
+    Ok(super::open_pidfd(pid)?.map(|pidfd| PinnedProcess { pid, pidfd }))
 }
 
 // The disposition is process-wide. Under cfg(test) the unit tests share one

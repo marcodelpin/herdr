@@ -19,8 +19,11 @@ pub(super) fn socket_peer_pid(_fd: std::os::fd::RawFd) -> Option<u32> {
 }
 
 #[cfg(unix)]
-pub(super) fn open_pidfd(_pid: u32) -> Option<std::os::fd::OwnedFd> {
-    None
+pub(super) const PIDFD_SUPPORTED: bool = false;
+
+#[cfg(unix)]
+pub(super) fn open_pidfd(_pid: u32) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    Ok(None)
 }
 
 #[cfg(unix)]
