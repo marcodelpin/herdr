@@ -4846,4 +4846,143 @@ mod tests {
             assert_eq!(event_summary(&events), expected, "{tail:?}: {events:?}");
         }
     }
+
+    /// What reached the pane, one entry per event, with a key's repeat count.
+    fn event_summary_with_repeats(events: &[crate::protocol::ClientInputEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                crate::protocol::ClientInputEvent::Key {
+                    code, repeat_count, ..
+                } => format!("{code:?}x{repeat_count}"),
+                crate::protocol::ClientInputEvent::TextCommit(text) => format!("text:{text:?}"),
+                crate::protocol::ClientInputEvent::Paste { text } => format!("paste:{text:?}"),
+                crate::protocol::ClientInputEvent::Mouse { .. } => "mouse".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// An `ESC [ M` frame, released (a serialized ESC released at an idle
+    /// tick, then serialized `[M` 290 ms later) or buffered (serialized
+    /// `ESC [ M` in one burst), then nested Win32 key records the pump
+    /// stages as its possible X10 payload, then idle ticks to the end of
+    /// every hold.
+    fn x10_frame_with_staged_records(
+        released: bool,
+        payload: &[(u16, u16, u16, u32, u16)],
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        if released {
+            for record in win32_input_mode_encoded_raw_bytes(b"\x1b") {
+                events.extend(translator.translate(record));
+            }
+            events.extend(translator.idle());
+            advance(&mut translator, 290);
+            for record in win32_input_mode_encoded_raw_bytes(b"[M") {
+                events.extend(translator.translate(record));
+            }
+        } else {
+            for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+                events.extend(translator.translate(record));
+            }
+        }
+        for (vk, scan, unicode, mods, repeat_count) in payload.iter().copied() {
+            advance(&mut translator, 1);
+            let record = WindowsKeyRecord {
+                key_down: true,
+                repeat_count,
+                virtual_key_code: vk,
+                virtual_scan_code: scan,
+                unicode,
+                control_key_state: mods,
+            };
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex f5251-r6 finding 1 (ADR-0013 amendment 2, D4): a staged key
+    /// record is one record whatever its repeat count. A nested Enter with
+    /// repeat count 2 expands into two CRs; the first disproves the X10
+    /// frame, and the framer drops the whole record, so the pump's replay
+    /// of the staged Enter (repeat count 2) is the only Enter. Before, the
+    /// framer dropped one CR and typed the other: Enter x2, then Enter x1.
+    #[test]
+    fn review_r6_1_repeated_staged_record_is_dropped_whole() {
+        let enter_twice = (13, 28, 13, 0, 2);
+        let space = (32, 57, 32, 0, 1);
+        for (released, payload, expected) in [
+            (true, vec![enter_twice], vec!["Escx1", "Enterx2"]),
+            (false, vec![enter_twice], vec!["Enterx2"]),
+            (
+                true,
+                vec![space, enter_twice],
+                vec!["Escx1", "Char(' ')x1", "Enterx2"],
+            ),
+            (
+                false,
+                vec![space, enter_twice],
+                vec!["Char(' ')x1", "Enterx2"],
+            ),
+        ] {
+            let events = x10_frame_with_staged_records(released, &payload);
+            assert_eq!(
+                event_summary_with_repeats(&events),
+                expected,
+                "released {released}, {payload:?}: {events:?}"
+            );
+        }
+    }
+
+    /// ADR-0013 amendment 2, D4: a staged record the X10 frame takes only in
+    /// part goes with the frame whole. The payload `C d` then a `2` record
+    /// with repeat count 3 (`222`): the first `2` completes the report, the
+    /// pump takes the staged keys as the report's, and the two other `2`s
+    /// of that record are dropped with it, never typed after the Mouse
+    /// event.
+    #[test]
+    fn review_r6_partial_staged_record_goes_with_its_frame() {
+        let shift_c = (67, 46, 67, 16, 1);
+        let d = (68, 32, 100, 0, 1);
+        let two_thrice = (50, 3, 50, 0, 3);
+        for (released, expected) in [(true, vec!["Escx1", "mouse"]), (false, vec!["mouse"])] {
+            let payload = [shift_c, d, two_thrice];
+            let events = x10_frame_with_staged_records(released, &payload);
+            assert_eq!(
+                event_summary_with_repeats(&events),
+                expected,
+                "released {released}, {payload:?}: {events:?}"
+            );
+        }
+    }
+
+    /// ADR-0013 amendment 2, D4: only a staged record is the pump's to
+    /// replay. A raw control byte that disproves a buffered `ESC [ M` frame
+    /// is no record: it ends the frame and starts the next token, as on the
+    /// Unix reader. Before, the pump framer dropped it with the frame by its
+    /// byte class (`ESC [ M CR a b` gave `ab`, codex f5251-r6).
+    #[test]
+    fn review_r6_raw_control_byte_after_buffered_x10_frame_is_typed() {
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M\rab") {
+            events.extend(translator.translate(record));
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        let summary = event_summary_with_repeats(&events);
+        assert!(
+            summary.first().is_some_and(|first| first == "Enterx1"),
+            "{summary:?}: {events:?}"
+        );
+        assert!(!summary.iter().any(|entry| entry == "mouse"), "{summary:?}");
+    }
 }
