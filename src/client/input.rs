@@ -25,6 +25,8 @@ use super::ClientLoopEvent;
 
 #[cfg(any(windows, test))]
 pub(super) mod windows_vti;
+#[cfg(test)]
+pub(crate) use windows_vti::PumpUnderTest;
 
 // ---------------------------------------------------------------------------
 // Stdin reader thread
@@ -158,31 +160,31 @@ fn unix_stdin_reader_loop(
         pending_mode = framer.has_pending_input().then_some(sgr_pixels);
     }
 
+    // Every wait of the reader is one wait: the framer's idle flush, its
+    // release time and the graphics filter's poll, whichever is first. The
+    // schedule runs the framer side of every wake (ADR-0013 D3).
+    let mut schedule = crate::raw_input::ReaderSchedule::default();
     while !should_quit.load(Ordering::Acquire) {
-        if direct_filter.has_pending()
-            && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
-                == Some(false)
-        {
-            let released = direct_response
-                .lock()
-                .ok()
-                .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher));
-            if let Some(data) = released {
-                if event_tx
-                    .blocking_send(ClientLoopEvent::StdinInput(data))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            continue;
-        }
-        // A bounded hold must end even if no further input arrives.
-        if let Some(wait_ms) = framer.held_input_release_ms() {
+        if let Some((wait_ms, framer_due)) = schedule.wait(&framer, direct_filter.has_pending()) {
             if stdin_read_ready(&reader, wait_ms) == Some(false) {
                 let sgr_pixels =
                     pending_mode.unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
-                let chunks = framer.flush_timeout();
+                // Bytes the graphics filter kept for a response no longer
+                // awaited are input, behind what the framer still holds.
+                let released = if direct_filter.has_pending() {
+                    direct_response
+                        .lock()
+                        .ok()
+                        .and_then(|mut matcher| direct_filter.flush_if_inactive(&mut matcher))
+                } else {
+                    None
+                };
+                let chunks = schedule.on_idle(
+                    &mut framer,
+                    released,
+                    framer_due,
+                    host_mouse_capture_active.load(Ordering::Acquire),
+                );
                 if !framer.has_pending_input() {
                     pending_mode = None;
                 }
@@ -221,7 +223,7 @@ fn unix_stdin_reader_loop(
                     &direct_response,
                     &direct_response_active,
                 );
-                let chunks = if let Some((raw_chunks, responses)) = filtered {
+                let raw_chunks = if let Some((raw_chunks, responses)) = filtered {
                     for response in responses {
                         if event_tx
                             .blocking_send(ClientLoopEvent::DirectGraphicsResponse(response))
@@ -231,12 +233,16 @@ fn unix_stdin_reader_loop(
                         }
                     }
                     raw_chunks
-                        .into_iter()
-                        .flat_map(|chunk| framer.push(&chunk))
-                        .collect()
                 } else {
-                    framer.push(&scratch[..n])
+                    vec![scratch[..n].to_vec()]
                 };
+                // A read the graphics filter kept whole still runs the
+                // framer's deadlines and idle flush (ADR-0013 D3).
+                let chunks = schedule.on_read(
+                    &mut framer,
+                    raw_chunks,
+                    host_mouse_capture_active.load(Ordering::Acquire),
+                );
                 if !framer.has_pending_input() {
                     pending_mode = None;
                 }
@@ -249,46 +255,14 @@ fn unix_stdin_reader_loop(
                 ) {
                     return;
                 }
-
-                let timeout_ms =
-                    framer.idle_flush_timeout_ms(host_mouse_capture_active.load(Ordering::Acquire));
-                if stdin_read_ready(&reader, timeout_ms) == Some(false) {
-                    let had_pending = framer.has_pending_input();
-                    let chunks = framer.flush_timeout();
-                    let held_escape = had_pending && chunks.is_empty();
-                    let sgr_pixels = pending_mode
-                        .unwrap_or_else(|| host_sgr_pixels_active.load(Ordering::Acquire));
-                    if !framer.has_pending_input() {
-                        pending_mode = None;
-                    }
-                    if !send_unix_input_chunks(
-                        chunks,
-                        &event_tx,
-                        &mut pending_palette,
-                        sgr_pixels,
-                        last_geometry,
-                    ) || !flush_unix_palette_input(&event_tx, &mut pending_palette)
-                    {
-                        return;
-                    }
-                    if held_escape
-                        && stdin_read_ready(&reader, framer.held_input_flush_timeout_ms())
-                            == Some(false)
-                    {
-                        let chunks = framer.flush_timeout();
-                        if !framer.has_pending_input() {
-                            pending_mode = None;
-                        }
-                        if !send_unix_input_chunks(
-                            chunks,
-                            &event_tx,
-                            &mut pending_palette,
-                            sgr_pixels,
-                            last_geometry,
-                        ) {
-                            return;
-                        }
-                    }
+                // Palette replies still collected go out at the idle flush.
+                if !framer.has_pending_input()
+                    && !pending_palette.is_empty()
+                    && stdin_read_ready(&reader, crate::raw_input::RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+                        == Some(false)
+                    && !flush_unix_palette_input(&event_tx, &mut pending_palette)
+                {
+                    return;
                 }
             }
             Err(err) => {
