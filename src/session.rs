@@ -288,7 +288,7 @@ fn stop_socket_with_timeout(
     // its sockets stop answering. After a live handoff systemd SIGKILLs the main
     // process as soon as ExecStop returns, which would cut the server's teardown
     // short (its panes) and end the unit as failed.
-    let server_process = crate::platform::pin_local_stream_peer(&stream);
+    let server_process = pin_server_process(&stream);
     let stop_response = send_stop_request(stream, &request, deadline)?;
     if let Some(response) = stop_response {
         if let Some(error) = response.get("error") {
@@ -317,6 +317,21 @@ fn stop_socket_with_timeout(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: behaves as a platform that cannot pin the server process
+    /// (macOS has no pidfd), so its stop path runs on Linux too.
+    static PIN_UNAVAILABLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn pin_server_process(stream: &LocalStream) -> Option<crate::platform::PinnedProcess> {
+    #[cfg(test)]
+    if PIN_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
+        return None;
+    }
+    crate::platform::pin_local_stream_peer(stream)
 }
 
 /// Whether the pinned server process exited by `deadline`. A process that
@@ -745,44 +760,69 @@ mod tests {
     #[cfg(unix)]
     const FAKE_STOP_SERVER_SOCKET: &str = "HERDR_TEST_FAKE_STOP_SERVER_SOCKET";
     #[cfg(unix)]
+    const FAKE_STOP_SERVER_MODE: &str = "HERDR_TEST_FAKE_STOP_SERVER_MODE";
+    #[cfg(unix)]
     const FAKE_STOP_SERVER_LINGER: Duration = Duration::from_millis(800);
 
-    /// A no-op as a test of its own. Re-executed by
-    /// `a_local_stop_returns_only_after_the_server_process_exited` as a server
-    /// process that answers one stop, removes its socket at once and exits
-    /// FAKE_STOP_SERVER_LINGER later, as a server still tearing down its panes.
+    /// Reads one request line; the parent's readiness probes connect and close
+    /// without one.
+    #[cfg(unix)]
+    fn fake_stop_server_next_stop(
+        listener: &std::os::unix::net::UnixListener,
+    ) -> std::os::unix::net::UnixStream {
+        for stream in listener.incoming() {
+            let stream = stream.unwrap();
+            let mut request = String::new();
+            if BufReader::new(&stream).read_line(&mut request).unwrap_or(0) == 0 {
+                continue;
+            }
+            assert!(request.contains("server.stop"), "{request}");
+            return stream;
+        }
+        unreachable!("incoming() never ends")
+    }
+
+    /// A no-op as a test of its own. Re-executed by the local stop tests as a
+    /// server process that answers one stop, removes its socket at once and
+    /// exits FAKE_STOP_SERVER_LINGER later, as a server still tearing down its
+    /// panes. In mode `handoff-busy` it first plays a server deciding a live
+    /// handoff (codex t6kr-r4 P1-1): the stop that reached it on a connection
+    /// made before the handoff is refused with `server_handoff_in_progress`
+    /// once the replacement owns the socket path, and the replacement (this
+    /// same process, on a new listener) answers the retried stop.
     #[cfg(unix)]
     #[test]
     fn fake_stop_server_process() {
         let Some(socket_path) = std::env::var_os(FAKE_STOP_SERVER_SOCKET) else {
             return;
         };
-        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        for stream in listener.incoming() {
-            let stream = stream.unwrap();
-            let mut request = String::new();
-            // The parent's readiness probes connect and close without a line.
-            if BufReader::new(&stream).read_line(&mut request).unwrap_or(0) == 0 {
-                continue;
-            }
-            assert!(request.contains("server.stop"), "{request}");
-            (&stream)
-                .write_all(b"{\"id\":\"cli:session:stop\",\"result\":{}}\n")
+        let mut listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        if std::env::var(FAKE_STOP_SERVER_MODE).as_deref() == Ok("handoff-busy") {
+            let deciding = fake_stop_server_next_stop(&listener);
+            std::fs::remove_file(&socket_path).unwrap();
+            let replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            drop(listener);
+            listener = replacement;
+            (&deciding)
+                .write_all(
+                    b"{\"id\":\"cli:session:stop\",\"error\":{\"code\":\"server_handoff_in_progress\",\"message\":\"retry the stop\"}}\n",
+                )
                 .unwrap();
-            break;
+            drop(deciding);
         }
+        let stream = fake_stop_server_next_stop(&listener);
+        (&stream)
+            .write_all(b"{\"id\":\"cli:session:stop\",\"result\":{}}\n")
+            .unwrap();
+        drop(stream);
         drop(listener);
         std::fs::remove_file(&socket_path).unwrap();
         std::thread::sleep(FAKE_STOP_SERVER_LINGER);
     }
 
-    /// herdr-eys1: after a live handoff systemd SIGKILLs the main process as
-    /// soon as ExecStop (`herdr server stop`) returns, so a local stop must not
-    /// return while the server process still runs after its sockets are gone.
     #[cfg(unix)]
-    #[test]
-    fn a_local_stop_returns_only_after_the_server_process_exited() {
-        let socket_path = unique_test_path("stop-waits-for-exit");
+    fn spawn_fake_stop_server(name: &str, mode: &str) -> (std::process::Child, PathBuf) {
+        let socket_path = unique_test_path(name);
         let mut server = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -790,6 +830,7 @@ mod tests {
                 "--nocapture",
             ])
             .env(FAKE_STOP_SERVER_SOCKET, &socket_path)
+            .env(FAKE_STOP_SERVER_MODE, mode)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -804,23 +845,110 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        (server, socket_path)
+    }
 
+    /// Runs a local stop against a fake server and returns the stop's result
+    /// and whether the server process had exited when the stop returned.
+    #[cfg(unix)]
+    fn stop_fake_server(name: &str, mode: &str) -> (Result<(), String>, bool) {
+        let (mut server, socket_path) = spawn_fake_stop_server(name, mode);
         let stopped = stop_socket_with_timeout(
             socket_path.clone(),
             vec![socket_path.clone()],
             Duration::from_secs(10),
             "server",
         );
-        let exited = server.try_wait().unwrap();
-        if exited.is_none() {
+        let exited = server.try_wait().unwrap().is_some();
+        if !exited {
             let _ = server.kill();
-            let _ = server.wait();
         }
+        let _ = server.wait();
+        (stopped, exited)
+    }
 
+    /// herdr-eys1: after a live handoff systemd SIGKILLs the main process as
+    /// soon as ExecStop (`herdr server stop`) returns, so a local stop must not
+    /// return while the server process still runs after its sockets are gone.
+    /// Where the server process cannot be pinned the stop waits on its sockets
+    /// only, and returns while the server may still run.
+    #[cfg(unix)]
+    fn assert_local_stop_waits_for_the_server_exit() {
+        let (stopped, exited) = stop_fake_server("stop-waits-for-exit", "linger");
         assert_eq!(stopped, Ok(()));
         assert!(
-            exited.is_some(),
+            exited,
             "the stop returned while the server process was still running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_stop_returns_only_after_the_server_process_exited() {
+        assert_local_stop_waits_for_the_server_exit();
+    }
+
+    /// codex t6kr-r4 P2-5: the exit-wait test as macOS runs it. macOS has no
+    /// pidfd, so the stop cannot wait for the process; the test must hold
+    /// there under normal scheduling, not only on Linux.
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_wait_test_holds_where_the_server_process_cannot_be_pinned() {
+        PIN_UNAVAILABLE_FOR_TEST.with(|unavailable| unavailable.set(true));
+        assert_local_stop_waits_for_the_server_exit();
+    }
+
+    /// codex t6kr-r4 P1-1: systemd's ExecStop can connect to the old server
+    /// before a live handoff releases the socket path and be answered only once
+    /// the old server is deciding, with `server_handoff_in_progress`. The stop
+    /// must reach whichever server owns the socket path then, not fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_refused_during_a_handoff_decision_is_retried_at_the_new_owner() {
+        let (stopped, exited) = stop_fake_server("stop-retries-handoff", "handoff-busy");
+        assert_eq!(stopped, Ok(()));
+        if !PIN_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) && cfg!(target_os = "linux") {
+            assert!(exited, "the retried stop must wait for the server's exit");
+        }
+    }
+
+    /// codex t6kr-r4 P2-3: when the stop cannot pin the server process because
+    /// the connection took the last descriptor (pidfd_open fails with EMFILE),
+    /// it must not report success while the server process still runs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_process_that_cannot_be_pinned_does_not_end_the_stop_as_a_success() {
+        use std::os::fd::AsRawFd as _;
+
+        let (mut server, socket_path) = spawn_fake_stop_server("stop-pin-emfile", "linger");
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+        // The lowest free descriptor goes to the stop's connection; nothing is
+        // left for the pidfd. nextest runs this test in a process of its own.
+        let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+        let tight = libc::rlimit {
+            rlim_cur: lowest_free as libc::rlim_t + 1,
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &tight) }, 0);
+        let stopped = stop_socket_with_timeout(
+            socket_path.clone(),
+            vec![socket_path.clone()],
+            Duration::from_secs(10),
+            "server",
+        );
+        let exited = server.try_wait().unwrap().is_some();
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        if !exited {
+            let _ = server.kill();
+        }
+        let _ = server.wait();
+        assert!(
+            stopped.is_err() || exited,
+            "the stop reported success while the server process was still running"
         );
     }
 

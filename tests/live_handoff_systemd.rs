@@ -25,7 +25,8 @@ use support::{
 
 const UNIT_CGROUP: &str = "0::/test.slice/herdr-test.service\n";
 const UNIT_CONTROL_GROUP: &str = "/test.slice/herdr-test.service";
-const DECISION_DELAY_ENV: &str = "HERDR_TEST_HANDOFF_DECISION_DELAY_MS";
+const DECISION_RELEASE_ENV: &str = "HERDR_TEST_HANDOFF_DECISION_RELEASE";
+const IMPORT_FAIL_ENV: &str = "HERDR_TEST_HANDOFF_IMPORT_FAIL";
 
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
@@ -408,6 +409,12 @@ impl FakeManager {
         self.state.lock().unwrap().main
     }
 
+    /// Answers `show` readably again after `AcceptThenHide` hid it.
+    fn reveal(&self) {
+        let state = self.state.lock().unwrap();
+        write_show(&self.show_file, &state, false);
+    }
+
     fn saw_main_pid(&self, sender: u32, pid: Option<u32>) -> bool {
         self.state
             .lock()
@@ -523,9 +530,25 @@ struct Supervised {
     old_pid: u32,
     pane_id: String,
     shell_pid: u32,
+    decision_release: PathBuf,
+}
+
+/// A supervised server whose handoff decision holds after `MAINPID=` until the
+/// test releases it (codex t6kr-r4 P2-6: an acknowledged gate, not a sleep).
+fn start_supervised_gated(policy: Policy) -> Supervised {
+    start_supervised_with(policy, true, &[], true)
 }
 
 fn start_supervised(policy: Policy, notify: bool, extra_env: &[(&str, &str)]) -> Supervised {
+    start_supervised_with(policy, notify, extra_env, false)
+}
+
+fn start_supervised_with(
+    policy: Policy,
+    notify: bool,
+    extra_env: &[(&str, &str)],
+    gated: bool,
+) -> Supervised {
     let base = unique_test_dir();
     let _ = fs::remove_dir_all(&base);
     let config_home = base.join("config");
@@ -534,12 +557,17 @@ fn start_supervised(policy: Policy, notify: bool, extra_env: &[(&str, &str)]) ->
     let manager = FakeManager::start(&base.join("manager"), policy);
     let notify_socket = manager.socket_path.display().to_string();
     let show_file = manager.show_file.display().to_string();
+    let decision_release = base.join("decision-release");
+    let decision_release_text = decision_release.display().to_string();
     let mut env = vec![
         ("HERDR_TEST_SYSTEMD_CGROUP", UNIT_CGROUP),
         ("HERDR_TEST_SYSTEMD_SHOW_FILE", show_file.as_str()),
     ];
     if notify {
         env.push(("NOTIFY_SOCKET", notify_socket.as_str()));
+    }
+    if gated {
+        env.push((DECISION_RELEASE_ENV, decision_release_text.as_str()));
     }
     env.extend_from_slice(extra_env);
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &env);
@@ -558,10 +586,37 @@ fn start_supervised(policy: Policy, notify: bool, extra_env: &[(&str, &str)]) ->
         old_pid,
         pane_id,
         shell_pid,
+        decision_release,
     }
 }
 
 impl Supervised {
+    /// Waits until `needle` has appeared `count` times in the server log.
+    fn wait_log(&self, needle: &str, count: usize, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while server_log(&self.config_home).matches(needle).count() < count {
+            assert!(
+                Instant::now() < deadline,
+                "{what} never happened:\n{}",
+                server_log(&self.config_home)
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until the old server holds its decision, after `MAINPID=` was sent.
+    fn wait_decision_held(&self) {
+        self.wait_log(
+            "handoff decision held for a test",
+            1,
+            "the hold of the handoff decision",
+        );
+    }
+
+    fn release_decision(&self) {
+        fs::write(&self.decision_release, b"").unwrap();
+    }
+
     fn assert_panes_kept(&self) {
         assert!(
             !process_gone(self.shell_pid),
@@ -587,6 +642,7 @@ impl Drop for Supervised {
                 }
             }
         }
+        let _ = fs::write(&self.decision_release, b"");
         self.server.take();
         cleanup_test_base(&self.base);
     }
@@ -661,32 +717,63 @@ fn an_unreadable_answer_rolls_the_main_pid_back_through_the_import_server() {
     fx.assert_panes_kept();
 }
 
+/// codex t6kr-r4 P1-2: systemd took the import server as main process, the
+/// read-back failed, and the import server died before it answered the
+/// rollback. The old server keeps the panes, but systemd still names the dead
+/// import server, which the old server holds unreaped (its exit cannot reach
+/// systemd while the old server lives). A later handoff must not read that as
+/// "another process is main" and go on unsupervised: the old server's exit
+/// would hand the import server's failure to systemd and end the unit with
+/// the panes it had just handed on.
+#[test]
+fn a_rollback_the_import_server_never_answered_refuses_later_handoffs() {
+    let fx = start_supervised(Policy::AcceptThenHide, true, &[(IMPORT_FAIL_ENV, "on_abort")]);
+    let response = request(&fx.api_socket, handoff_request());
+    assert!(
+        response.get("error").is_some(),
+        "the handoff must not complete: {response}"
+    );
+    wait_for_api(&fx.api_socket, Duration::from_secs(10));
+    fx.assert_panes_kept();
+    let dead_import = fx.manager.main();
+    assert_ne!(dead_import, fx.old_pid, "systemd took the import server");
+    // systemd answers again, and still names the dead import server.
+    fx.manager.reveal();
+
+    let response = request(&fx.api_socket, handoff_request());
+    assert!(
+        response.get("error").is_some(),
+        "a handoff while systemd names the dead import server must be refused: {response}"
+    );
+    assert!(!process_gone(fx.old_pid), "the old server must keep running");
+    wait_for_api(&fx.api_socket, Duration::from_secs(10));
+    fx.assert_panes_kept();
+    assert_eq!(fx.manager.main(), dead_import);
+}
+
 /// codex t6kr-r3 #2 and #3 (ADR-0018 D2 step 5 and D3): a stop signal that
 /// reaches the old server while it decides is forwarded to the replacement,
 /// which saves the session and stops; nothing is left behind that could stop a
 /// fresh server started later on the same socket.
 #[test]
 fn a_stop_signal_during_the_decision_is_forwarded_to_the_replacement() {
-    let fx = start_supervised(Policy::Accept, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let fx = start_supervised_gated(Policy::Accept);
     let api_socket = fx.api_socket.clone();
     let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let replacement = loop {
-        let main = fx.manager.main();
-        if main != fx.old_pid {
-            break main;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the old server never handed the main pid over"
-        );
-        thread::sleep(Duration::from_millis(10));
-    };
-    // The read-back is still pending: the old server is deciding.
+    fx.wait_decision_held();
+    let replacement = fx.manager.main();
+    assert_ne!(replacement, fx.old_pid, "systemd must name the import server");
+    // The read-back is held: the old server is deciding.
     assert_eq!(
         unsafe { libc::kill(fx.old_pid as libc::pid_t, libc::SIGTERM) },
         0
     );
+    fx.wait_log(
+        "held as a late stop",
+        1,
+        "the old server holding the stop signal",
+    );
+    fx.release_decision();
     assert_ok(&handoff.join().expect("handoff thread"));
     wait_gone(fx.old_pid, Duration::from_secs(5), "the old server");
     wait_gone(
@@ -715,18 +802,14 @@ fn a_stop_signal_during_the_decision_is_forwarded_to_the_replacement() {
 /// abort reply, and the old server, which kept the panes, saves and stops.
 #[test]
 fn a_stop_received_by_the_import_server_before_an_abort_stops_the_old_server() {
-    let fx = start_supervised(Policy::Ignore, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let fx = start_supervised_gated(Policy::Ignore);
     let api_socket = fx.api_socket.clone();
     let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !fx.manager.saw_main_pid(fx.old_pid, None) {
-        assert!(
-            Instant::now() < deadline,
-            "the old server never asked for the hand-over"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fx.wait_decision_held();
+    assert!(fx.manager.saw_main_pid(fx.old_pid, None));
+    // The import server owns the socket path while the old server decides.
     assert_ok(&request(&fx.api_socket, stop_request()));
+    fx.release_decision();
     assert_error_contains(
         &handoff.join().expect("handoff thread"),
         "did not take the import server",
@@ -779,8 +862,19 @@ fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let pid = server.child.process_id().expect("server pid");
-    create_workspace(&api_socket);
-    assert_ne!(saved_workspace_count(&config_home), Some(1));
+    // codex t6kr-r4 P2-6: an ordinary autosave (5 s after a change) may write
+    // the workspace first when this test is descheduled. That is no failure of
+    // the server: add workspaces until the newest one is not yet on disk, so
+    // only the final save can have written it.
+    let mut workspaces = 0;
+    loop {
+        create_workspace(&api_socket);
+        workspaces += 1;
+        if saved_workspace_count(&config_home) != Some(workspaces) {
+            break;
+        }
+        assert!(workspaces < 5, "every workspace was autosaved at once");
+    }
 
     assert_ok(&request(&api_socket, stop_request()));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -798,7 +892,7 @@ fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
     }
     assert_eq!(
         saved,
-        Some(1),
+        Some(workspaces),
         "the final save must be on disk when the api socket stops answering"
     );
     wait_gone(pid, Duration::from_secs(10), "the server");
@@ -812,12 +906,15 @@ fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
 /// commits, saves the session and stops; the old server exits as handed over.
 #[test]
 fn an_api_stop_during_a_decision_that_commits_stops_the_replacement_with_a_final_save() {
-    let fx = start_supervised(Policy::Accept, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let fx = start_supervised_gated(Policy::Accept);
     let api_socket = fx.api_socket.clone();
     let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
+    fx.wait_decision_held();
     let replacement = wait_for_main_pid_moved(&fx.manager, fx.old_pid);
-    // The read-back is still pending: the old server is deciding.
+    // The read-back is held: the old server is deciding, the import server
+    // owns the socket path and records the stop before the commit.
     assert_ok(&request(&fx.api_socket, stop_request()));
+    fx.release_decision();
     assert_ok(&handoff.join().expect("handoff thread"));
     wait_gone(fx.old_pid, Duration::from_secs(5), "the old server");
     wait_gone(
@@ -839,21 +936,21 @@ fn an_api_stop_during_a_decision_that_commits_stops_the_replacement_with_a_final
 /// then applies the held stop: a final save, and no server is left running.
 #[test]
 fn a_stop_signal_during_a_decision_that_aborts_stops_the_old_server_with_a_final_save() {
-    let fx = start_supervised(Policy::Ignore, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let fx = start_supervised_gated(Policy::Ignore);
     let api_socket = fx.api_socket.clone();
     let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !fx.manager.saw_main_pid(fx.old_pid, None) {
-        assert!(
-            Instant::now() < deadline,
-            "the old server never asked for the hand-over"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    fx.wait_decision_held();
+    assert!(fx.manager.saw_main_pid(fx.old_pid, None));
     assert_eq!(
         unsafe { libc::kill(fx.old_pid as libc::pid_t, libc::SIGTERM) },
         0
     );
+    fx.wait_log(
+        "held as a late stop",
+        1,
+        "the old server holding the stop signal",
+    );
+    fx.release_decision();
     assert_error_contains(
         &handoff.join().expect("handoff thread"),
         "did not take the import server",

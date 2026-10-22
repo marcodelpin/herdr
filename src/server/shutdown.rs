@@ -64,6 +64,7 @@ impl ServerStop {
             return;
         };
         if let StopIntake::Closed { late } = &mut *intake {
+            tracing::info!(%reason, "a stop arrived during the handoff decision; held as a late stop");
             late.get_or_insert(reason);
             return;
         }

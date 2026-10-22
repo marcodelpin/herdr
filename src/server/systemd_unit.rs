@@ -27,6 +27,10 @@ pub(crate) const TEST_CGROUP_ENV_VAR: &str = "HERDR_TEST_SYSTEMD_CGROUP";
 pub(crate) const TEST_SHOW_FILE_ENV_VAR: &str = "HERDR_TEST_SYSTEMD_SHOW_FILE";
 /// Test knob: milliseconds to wait between the hand-over and its read-back.
 pub(crate) const TEST_DECISION_DELAY_ENV_VAR: &str = "HERDR_TEST_HANDOFF_DECISION_DELAY_MS";
+/// Test hook: holds the decision after `MAINPID=` was sent until this file
+/// exists (capped at 60 s). The hold is acknowledged in the server log, so a
+/// test acts inside the decision without depending on scheduling.
+pub(crate) const TEST_DECISION_RELEASE_ENV_VAR: &str = "HERDR_TEST_HANDOFF_DECISION_RELEASE";
 
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(5);
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
@@ -203,6 +207,17 @@ pub(crate) fn send_main_pid_rollback(pid: u32) -> io::Result<()> {
 }
 
 fn test_decision_delay() {
+    if let Some(release) = std::env::var_os(TEST_DECISION_RELEASE_ENV_VAR)
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        let until = Instant::now() + Duration::from_secs(60);
+        tracing::info!("handoff decision held for a test");
+        while Instant::now() < until && !release.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::info!("handoff decision hold released");
+    }
     let Some(millis) = std::env::var(TEST_DECISION_DELAY_ENV_VAR)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -632,6 +647,60 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex t6kr-r4 P2-4: a manager that stops reading after the probe
+    /// barrier must not hold the hand-over past the notification bound. A
+    /// blocking send on a full queue would wait forever, with the panes paused
+    /// and no rollback ever reached.
+    #[test]
+    fn a_hand_over_to_a_manager_that_stopped_reading_ends_within_the_bound() {
+        let dir = std::path::PathBuf::from("/tmp")
+            .join(format!("herdr-notify-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("notify.sock");
+        let manager = UnixDatagram::bind(&path).expect("bind");
+        let answer_probe = std::thread::spawn(move || {
+            let (_, fds) = recv_with_fds(&manager);
+            drop(fds);
+            manager
+        });
+        let notifier = Notifier::connect(path.as_os_str()).expect("connect");
+        // The manager answered the probe and reads nothing more: fill its queue.
+        let manager = answer_probe.join().expect("manager");
+        // One sender's own buffer runs out before the manager's queue
+        // (net.unix.max_dgram_qlen): fresh senders until none can queue more.
+        let mut fillers = Vec::new();
+        loop {
+            let filler = UnixDatagram::unbound().expect("filler");
+            filler.connect(&path).expect("connect filler");
+            filler.set_nonblocking(true).expect("nonblocking");
+            let mut queued = 0;
+            while filler.send(b"STATUS=filler\n").is_ok() {
+                queued += 1;
+            }
+            fillers.push(filler);
+            if queued == 0 {
+                break;
+            }
+            assert!(fillers.len() < 10_000, "the manager queue never filled");
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(notifier.send_main_pid(4242));
+        });
+        let answer = done_rx.recv_timeout(BARRIER_TIMEOUT + Duration::from_secs(5));
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&dir);
+        match answer {
+            Ok(result) => assert!(result.is_err(), "a hand-over nobody read cannot succeed"),
+            Err(_) => panic!(
+                "the hand-over was still blocked {} ms after it started",
+                (BARRIER_TIMEOUT + Duration::from_secs(5)).as_millis()
+            ),
+        }
     }
 
     #[test]

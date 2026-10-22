@@ -504,6 +504,12 @@ fn abort_handoff_import(
     server_stop: &crate::server::shutdown::ServerStop,
     rollback_main_pid: Option<u32>,
 ) -> io::Error {
+    if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("on_abort") {
+        // Test hook: the import server dies before it answers the abort, as a
+        // crash there would (codex t6kr-r4 P1-2).
+        tracing::error!("handoff import server exiting on abort for a test");
+        std::process::exit(70);
+    }
     let stop_before_close = !server_stop.close_intake_for_handoff();
     let rollback_done = match rollback_main_pid {
         None => false,
