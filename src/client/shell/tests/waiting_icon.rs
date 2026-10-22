@@ -930,3 +930,56 @@ fn an_indented_switcher_row_too_narrow_for_the_icon_schedules_no_repaint() {
     );
     assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
 }
+
+/// One endpoint only: the Local endpoint, listed in the catalog with no SSH profile, so
+/// the sidebar takes the single-endpoint path. Its snapshot holds one Working pane and
+/// one Waiting pane, and `connected` says whether Local is still online.
+fn single_endpoint_state(connected: bool) -> ClientShellState {
+    let config = Config::default();
+    let mut state = state_with_agents(
+        AgentStatus::Working,
+        vec![
+            waiting_agent("pane_1", "ws_1", AgentStatus::Working, &[]),
+            waiting_agent(
+                "pane_2",
+                "ws_1",
+                AgentStatus::Idle,
+                &[("wait", "\u{29d7} mon 1 8m")],
+            ),
+        ],
+        &config,
+    );
+    state.set_endpoint_catalog(&[]);
+    state.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
+    if !connected {
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    }
+    assert_eq!(state.endpoints.len(), 1);
+    state
+}
+
+#[test]
+fn a_disconnected_local_endpoint_keeps_the_single_endpoint_sidebar_static() {
+    for collapsed in [false, true] {
+        let mut state = single_endpoint_state(false);
+        state.sidebar_collapsed = collapsed;
+        let first = compose_waiting_periods_later(&mut state, 0);
+        assert!(
+            !state.config.spinner_drawn.get() && !state.config.waiting_drawn.get(),
+            "collapsed={collapsed}: a disconnected Local's cached rows scheduled repaints"
+        );
+        assert!(!state.tick_working_spinner(next_waiting_frame_due(&state)));
+        let later = compose_waiting_periods_later(&mut state, 1);
+        assert_eq!(
+            frame_text(&first),
+            frame_text(&later),
+            "collapsed={collapsed}"
+        );
+    }
+
+    // Control: the same layout with Local online still animates both clocks.
+    let mut state = single_endpoint_state(true);
+    compose_waiting_periods_later(&mut state, 0);
+    assert!(state.config.spinner_drawn.get());
+    assert!(state.config.waiting_drawn.get());
+}

@@ -54,6 +54,7 @@ pub(super) fn render_agent_panel(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
@@ -88,7 +89,7 @@ pub(super) fn render_agent_panel(
         |row| row.rows.len(),
         |buffer, rect, row, hits| {
             hits.agents.push((rect, row.pane_id.clone()));
-            render_agent_row(buffer, rect, row, false, config);
+            render_agent_row(buffer, rect, row, stale, config);
         },
     );
 }

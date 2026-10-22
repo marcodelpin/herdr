@@ -50,6 +50,7 @@ pub(crate) fn render_collapsed_sidebar(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    stale: bool,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -94,7 +95,7 @@ pub(crate) fn render_collapsed_sidebar(
         );
         let display =
             workspace_display_state(snapshot, &[workspace], workspace.agent_status, config);
-        let (icon, clock) = lookup_display_icon(display, config, false);
+        let (icon, clock) = lookup_display_icon(display, config, stale);
         let written = put_text(
             buffer,
             rect.x.saturating_add(2),
@@ -164,7 +165,7 @@ pub(crate) fn render_collapsed_sidebar(
             }),
         );
         let display = agent_display_state(agent, config);
-        let (icon, clock) = lookup_display_icon(display, config, false);
+        let (icon, clock) = lookup_display_icon(display, config, stale);
         let written = put_text(
             buffer,
             rect.x.saturating_add(2),
@@ -211,6 +212,8 @@ pub(crate) fn render_sidebar(
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
+    // Local may be listed but disconnected: its cached rows then stay static.
+    let local_stale = super::endpoints::local_rows_are_stale(state.endpoints);
     render_sidebar_background(buffer, area, palette);
     hits.sidebar_divider = if area.is_empty() {
         Rect::default()
@@ -333,7 +336,7 @@ pub(crate) fn render_sidebar(
             buffer,
             rect,
             display,
-            false,
+            local_stale,
             entry,
             rows,
             workspace.focused,
@@ -443,6 +446,7 @@ pub(crate) fn render_sidebar(
         detail_area,
         snapshot,
         config,
+        local_stale,
         state.agent_scroll,
         hits,
     );

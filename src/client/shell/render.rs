@@ -266,7 +266,7 @@ pub(super) fn render_shell(
             .endpoints
             .iter()
             .find(|endpoint| &endpoint.endpoint_id == state.active_endpoint_id)
-            .is_some_and(|endpoint| endpoint.status != ClientEndpointStatus::Online);
+            .is_some_and(ClientShellEndpoint::is_stale);
         super::mobile::render_mobile_header(
             buffer,
             layout.mobile_header,
@@ -305,6 +305,7 @@ pub(super) fn render_shell(
                 state
                     .selected_workspace_id
                     .map(|target| target.workspace_id.as_str()),
+                super::endpoints::local_rows_are_stale(state.endpoints),
                 &mut hits,
             );
         } else {
