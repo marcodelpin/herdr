@@ -139,6 +139,30 @@ pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -
     None
 }
 
+/// Without unix sockets the server process cannot be pinned; a local stop
+/// waits on its endpoints only.
+#[cfg(not(unix))]
+pub(crate) enum PinnedProcess {}
+
+#[cfg(not(unix))]
+impl PinnedProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        match *self {}
+    }
+
+    pub(crate) fn wait_for_exit_until(
+        &self,
+        _deadline: std::time::Instant,
+    ) -> std::io::Result<bool> {
+        match *self {}
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pin_local_stream_peer(_stream: &crate::ipc::LocalStream) -> Option<PinnedProcess> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -445,7 +469,8 @@ pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
-    local_stream_peer_description, spawn_server_signal_monitor, RemoteBridgeWake,
+    local_stream_peer_description, pin_local_stream_peer, spawn_server_signal_monitor,
+    PinnedProcess, RemoteBridgeWake,
 };
 
 mod client_state;

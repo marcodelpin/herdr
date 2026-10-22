@@ -992,6 +992,11 @@ pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
     (result == 0 && pid > 0).then_some(pid as u32)
 }
 
+/// macOS has no pidfd; a local stop waits on the server's sockets only.
+pub(super) fn open_pidfd(_pid: u32) -> Option<std::os::fd::OwnedFd> {
+    None
+}
+
 pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
     let info = process_bsdinfo(pid)?;
     Some((comm_from_bsdinfo(&info)?, info.pbi_ppid))

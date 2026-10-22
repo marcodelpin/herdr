@@ -336,6 +336,52 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
     Some(description)
 }
 
+/// The process serving a local socket, pinned so that waiting for its exit
+/// cannot follow a reused pid.
+pub(crate) struct PinnedProcess {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl PinnedProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Waits until the process has exited (an unreaped one counts) or until
+    /// `deadline`, and reports whether it exited.
+    pub(crate) fn wait_for_exit_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            match poll_fd_readable(self.pidfd.as_raw_fd(), timeout_ms) {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+/// Pins the process on the other end of a connected local stream: the one
+/// that called listen() on the socket. None when it cannot be named or pinned,
+/// or when it is this process.
+pub(crate) fn pin_local_stream_peer(stream: &crate::ipc::LocalStream) -> Option<PinnedProcess> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let pid = super::socket_peer_pid(socket.as_fd().as_raw_fd())?;
+    if pid == std::process::id() {
+        return None;
+    }
+    let pidfd = super::open_pidfd(pid)?;
+    Some(PinnedProcess { pid, pidfd })
+}
+
 // The disposition is process-wide. Under cfg(test) the unit tests share one
 // process, so these helpers leave it alone: SIG_DFL there would turn any other
 // test's write to a closed socket into a SIGPIPE kill of the test binary

@@ -284,6 +284,11 @@ fn stop_socket_with_timeout(
             socket_path.display()
         )
     })?;
+    // herdr-eys1: a stop is complete when the server process is gone, not when
+    // its sockets stop answering. After a live handoff systemd SIGKILLs the main
+    // process as soon as ExecStop returns, which would cut the server's teardown
+    // short (its panes) and end the unit as failed.
+    let server_process = crate::platform::pin_local_stream_peer(&stream);
     let stop_response = send_stop_request(stream, &request, deadline)?;
     if let Some(response) = stop_response {
         if let Some(error) = response.get("error") {
@@ -302,7 +307,25 @@ fn stop_socket_with_timeout(
                 .join(", ")
         ));
     }
+    if let Some(process) = server_process {
+        if !server_process_exited_until(&process, deadline) {
+            return Err(format!(
+                "{label} closed its sockets but its process {} did not exit within {}ms",
+                process.pid(),
+                timeout.as_millis()
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether the pinned server process exited by `deadline`. A process that
+/// cannot be waited on does not hold the stop.
+fn server_process_exited_until(
+    process: &crate::platform::PinnedProcess,
+    deadline: Instant,
+) -> bool {
+    process.wait_for_exit_until(deadline).unwrap_or(true)
 }
 
 pub fn delete_session(name: &str) -> Result<SessionInfo, String> {
@@ -717,6 +740,88 @@ mod tests {
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&config_home);
         std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[cfg(unix)]
+    const FAKE_STOP_SERVER_SOCKET: &str = "HERDR_TEST_FAKE_STOP_SERVER_SOCKET";
+    #[cfg(unix)]
+    const FAKE_STOP_SERVER_LINGER: Duration = Duration::from_millis(800);
+
+    /// A no-op as a test of its own. Re-executed by
+    /// `a_local_stop_returns_only_after_the_server_process_exited` as a server
+    /// process that answers one stop, removes its socket at once and exits
+    /// FAKE_STOP_SERVER_LINGER later, as a server still tearing down its panes.
+    #[cfg(unix)]
+    #[test]
+    fn fake_stop_server_process() {
+        let Some(socket_path) = std::env::var_os(FAKE_STOP_SERVER_SOCKET) else {
+            return;
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        for stream in listener.incoming() {
+            let stream = stream.unwrap();
+            let mut request = String::new();
+            // The parent's readiness probes connect and close without a line.
+            if BufReader::new(&stream).read_line(&mut request).unwrap_or(0) == 0 {
+                continue;
+            }
+            assert!(request.contains("server.stop"), "{request}");
+            (&stream)
+                .write_all(b"{\"id\":\"cli:session:stop\",\"result\":{}}\n")
+                .unwrap();
+            break;
+        }
+        drop(listener);
+        std::fs::remove_file(&socket_path).unwrap();
+        std::thread::sleep(FAKE_STOP_SERVER_LINGER);
+    }
+
+    /// herdr-eys1: after a live handoff systemd SIGKILLs the main process as
+    /// soon as ExecStop (`herdr server stop`) returns, so a local stop must not
+    /// return while the server process still runs after its sockets are gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_stop_returns_only_after_the_server_process_exited() {
+        let socket_path = unique_test_path("stop-waits-for-exit");
+        let mut server = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session::tests::fake_stop_server_process",
+                "--nocapture",
+            ])
+            .env(FAKE_STOP_SERVER_SOCKET, &socket_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let bound_by = Instant::now() + Duration::from_secs(10);
+        while !is_running_at(&socket_path) {
+            if Instant::now() >= bound_by || server.try_wait().unwrap().is_some() {
+                let _ = server.kill();
+                let _ = server.wait();
+                panic!("the fake server never bound {}", socket_path.display());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let stopped = stop_socket_with_timeout(
+            socket_path.clone(),
+            vec![socket_path.clone()],
+            Duration::from_secs(10),
+            "server",
+        );
+        let exited = server.try_wait().unwrap();
+        if exited.is_none() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+
+        assert_eq!(stopped, Ok(()));
+        assert!(
+            exited.is_some(),
+            "the stop returned while the server process was still running"
+        );
     }
 
     #[test]

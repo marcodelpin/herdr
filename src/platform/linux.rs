@@ -782,6 +782,18 @@ pub(super) fn socket_peer_pid(fd: RawFd) -> Option<u32> {
     (result == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
+/// A pidfd for `pid`: it becomes readable when the process exits, and it
+/// cannot follow a reused pid. None before Linux 5.3 or when the process is gone.
+pub(super) fn open_pidfd(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = RawFd::try_from(fd).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: pidfd_open returned a new descriptor that nothing else owns.
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
 pub(super) fn process_name_and_parent(pid: u32) -> Option<(String, u32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = stat.rfind(')')?;
