@@ -258,10 +258,7 @@ fn wait_for_no_server(runtime_dir: &Path, timeout: Duration) {
         if pids.is_empty() {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "servers still running: {pids:?}"
-        );
+        assert!(Instant::now() < deadline, "servers still running: {pids:?}");
         thread::sleep(Duration::from_millis(25));
     }
 }
@@ -936,11 +933,8 @@ fn a_server_that_hands_an_owed_session_on_reports_no_loss() {
     wait_for_api(&api_socket, Duration::from_secs(20));
 
     assert_ok(&request(&api_socket, handoff_request()));
-    let last = wait_for_server_pid_not_in(
-        &runtime_dir,
-        &[first, importer],
-        Duration::from_secs(10),
-    );
+    let last =
+        wait_for_server_pid_not_in(&runtime_dir, &[first, importer], Duration::from_secs(10));
     wait_gone(importer, Duration::from_secs(10), "the exporting importer");
     fs::remove_dir_all(&blocker).unwrap();
     let log = server_log(&config_home);
