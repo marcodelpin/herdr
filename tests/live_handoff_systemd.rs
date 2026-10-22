@@ -247,6 +247,41 @@ fn create_workspace(api_socket: &Path) -> (String, u32) {
     (pane_id, shell)
 }
 
+fn server_log(config_home: &Path) -> String {
+    fs::read_to_string(config_home.join("herdr-dev/herdr-server.log")).unwrap_or_default()
+}
+
+fn wait_for_no_server(runtime_dir: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let pids = live_server_pids(runtime_dir);
+        if pids.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "servers still running: {pids:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Waits until the fake manager names a process other than `old_pid` as main.
+fn wait_for_main_pid_moved(manager: &FakeManager, old_pid: u32) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let main = manager.main();
+        if main != old_pid {
+            return main;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the old server never handed the main pid over"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn saved_workspace_count(config_home: &Path) -> Option<usize> {
     let bytes = fs::read(config_home.join("herdr-dev/session.json")).ok()?;
     let session: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -358,6 +393,18 @@ impl FakeManager {
         let mut state = self.state.lock().unwrap();
         state.notify_access = access.to_string();
         write_show(&self.show_file, &state, false);
+    }
+
+    /// Answers `show` as systemd does for a unit name it does not know: the
+    /// server asked about the wrong unit (codex t6kr-r3 #4).
+    fn answer_for_another_unit(&self) {
+        let tmp = self.show_file.with_extension("tmp");
+        fs::write(
+            &tmp,
+            "LoadState=not-found\nControlGroup=\nMainPID=0\nNotifyAccess=none\n",
+        )
+        .unwrap();
+        fs::rename(&tmp, &self.show_file).unwrap();
     }
 
     fn main(&self) -> u32 {
@@ -758,6 +805,160 @@ fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
         "the final save must be on disk when the api socket stops answering"
     );
     wait_gone(pid, Duration::from_secs(10), "the server");
+    drop(server);
+    cleanup_test_base(&base);
+}
+
+/// codex t6kr-r3 #2 (ADR-0018 D3), commit with an api stop: while the old
+/// server decides, the import server owns the socket path, so `herdr server
+/// stop` (systemd's ExecStop) reaches it. It is not lost: the import server
+/// commits, saves the session and stops; the old server exits as handed over.
+#[test]
+fn an_api_stop_during_a_decision_that_commits_stops_the_replacement_with_a_final_save() {
+    let fx = start_supervised(Policy::Accept, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let api_socket = fx.api_socket.clone();
+    let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
+    let replacement = wait_for_main_pid_moved(&fx.manager, fx.old_pid);
+    // The read-back is still pending: the old server is deciding.
+    assert_ok(&request(&fx.api_socket, stop_request()));
+    assert_ok(&handoff.join().expect("handoff thread"));
+    wait_gone(fx.old_pid, Duration::from_secs(5), "the old server");
+    wait_gone(
+        replacement,
+        Duration::from_secs(10),
+        "the replacement after the stop it received while the old server decided",
+    );
+    assert_eq!(
+        saved_workspace_count(&fx.config_home),
+        Some(1),
+        "the replacement must save the session it stops with"
+    );
+    wait_for_no_server(&fx.runtime_dir, Duration::from_secs(5));
+}
+
+/// codex t6kr-r3 #2 (ADR-0018 D2 step 1), abort with a stop signal: a SIGTERM
+/// that reaches the old server while it decides is held, not lost. systemd
+/// keeps the old server as main process, so it aborts, keeps the panes, and
+/// then applies the held stop: a final save, and no server is left running.
+#[test]
+fn a_stop_signal_during_a_decision_that_aborts_stops_the_old_server_with_a_final_save() {
+    let fx = start_supervised(Policy::Ignore, true, &[(DECISION_DELAY_ENV, "1500")]);
+    let api_socket = fx.api_socket.clone();
+    let handoff = thread::spawn(move || request(&api_socket, handoff_request()));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !fx.manager.saw_main_pid(fx.old_pid, None) {
+        assert!(
+            Instant::now() < deadline,
+            "the old server never asked for the hand-over"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        unsafe { libc::kill(fx.old_pid as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert_error_contains(
+        &handoff.join().expect("handoff thread"),
+        "did not take the import server",
+    );
+    wait_gone(
+        fx.old_pid,
+        Duration::from_secs(15),
+        "the old server after the stop signal it held during the decision",
+    );
+    assert_eq!(
+        saved_workspace_count(&fx.config_home),
+        Some(1),
+        "the old server must save the session it stops with"
+    );
+    wait_for_no_server(&fx.runtime_dir, Duration::from_secs(5));
+}
+
+/// codex t6kr-r3 #4 (ADR-0018 D1): an answer about a unit other than the one
+/// of this server's cgroup (a wrong name reads `LoadState=not-found`,
+/// `MainPID=0`) must not read as "another process is main" and send the
+/// handoff on unsupervised: it refuses before anything is paused.
+#[test]
+fn an_answer_about_another_unit_refuses_the_handoff_and_keeps_the_panes() {
+    let fx = start_supervised(Policy::Accept, true, &[]);
+    fx.manager.answer_for_another_unit();
+    assert_error_contains(
+        &request(&fx.api_socket, handoff_request()),
+        "is not the unit of this server's cgroup",
+    );
+    assert!(
+        !fx.manager.saw_main_pid(fx.old_pid, None),
+        "nothing may be sent to systemd after a refused probe"
+    );
+    wait_for_only_server(&fx.runtime_dir, fx.old_pid, Duration::from_secs(5));
+    wait_for_api(&fx.api_socket, Duration::from_secs(10));
+    fx.assert_panes_kept();
+}
+
+/// herdr-to89 and herdr-3gmf (codex ir4j-r5 P2-2 and P2-1; ADR-0018 D3): a
+/// server that imported a session whose save kept failing still owes that
+/// session when it hands it on. After the commit the session is the next
+/// server's: the exporter takes no session writer lock, runs no unsaved-session
+/// check and reports no loss, while the importer saves it once it can.
+#[test]
+fn a_server_that_hands_an_owed_session_on_reports_no_loss() {
+    let base = unique_test_dir();
+    let _ = fs::remove_dir_all(&base);
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket, &[]);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let first = server.child.process_id().expect("server pid");
+    let (pane_id, shell) = create_workspace(&api_socket);
+    // Every session write fails while this directory sits where the
+    // temporary session file goes (as a full disk would).
+    let blocker = config_home.join("herdr-dev/session.json.tmp");
+    fs::create_dir_all(blocker.join("blocker")).unwrap();
+
+    assert_ok(&request(&api_socket, handoff_request()));
+    let importer = wait_for_server_pid_not_in(&runtime_dir, &[first], Duration::from_secs(10));
+    wait_gone(first, Duration::from_secs(5), "the first server");
+    // The importer's save bound (10 s) runs out; its event loop starts owing
+    // the session.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !server_log(&config_home)
+        .contains("the transferred session was not written within the handoff save bound")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the importer's save never ran out of its bound:\n{}",
+            server_log(&config_home)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    wait_for_api(&api_socket, Duration::from_secs(20));
+
+    assert_ok(&request(&api_socket, handoff_request()));
+    let last = wait_for_server_pid_not_in(
+        &runtime_dir,
+        &[first, importer],
+        Duration::from_secs(10),
+    );
+    wait_gone(importer, Duration::from_secs(10), "the exporting importer");
+    fs::remove_dir_all(&blocker).unwrap();
+    let log = server_log(&config_home);
+    assert!(
+        !log.contains("the handed-over session is lost"),
+        "the exporter reported a loss although the next server took the session over:\n{log}"
+    );
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(shell_pid(&api_socket, &pane_id), shell);
+    assert!(!process_gone(shell), "the pane shell {shell} died");
+
+    assert_ok(&request(&api_socket, stop_request()));
+    wait_gone(last, Duration::from_secs(20), "the last server");
+    assert_eq!(
+        saved_workspace_count(&config_home),
+        Some(1),
+        "the last server must have written the session it was handed"
+    );
     drop(server);
     cleanup_test_base(&base);
 }
