@@ -110,6 +110,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
@@ -200,6 +203,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -264,6 +270,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -315,6 +324,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -362,6 +374,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -412,6 +427,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -466,6 +484,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -527,6 +548,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -586,6 +610,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -653,6 +680,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -712,6 +742,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -765,6 +798,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -821,6 +857,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -871,6 +910,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -927,6 +969,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -980,6 +1025,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -1053,6 +1101,14 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Remove Zig caches
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: x86_64-unknown-linux-musl
+
       - name: Prefer official Ubuntu mirrors over Azure
         run: |
           if [ -f /etc/apt/apt-mirrors.txt ]; then
@@ -1066,9 +1122,6 @@ jobs:
           sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build musl-tools
-
-      - name: Remove Zig caches
-        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
       - name: Build
         run: cargo build --release --locked --target x86_64-unknown-linux-musl

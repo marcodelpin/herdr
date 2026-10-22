@@ -41,6 +41,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
@@ -93,6 +96,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         run: |
           sudo apt-get update
@@ -103,16 +109,9 @@ jobs:
           perl -0pi -e 's/\(elapsed\.as_millis\(\) \/ WORKING_SPINNER_FRAME_PERIOD\.as_millis\(\)\) as usize/0usize \/\/ MUTANT frozen frame/' src/client/shell.rs
           landed=$(grep -c 'MUTANT frozen frame' src/client/shell.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
-          # The build fetches libghostty-vt's lazy Zig packages from codeberg.org and
-          # deps.files.ghostty.org; a DNS failure there once failed this job before any
-          # test ran. Retry the BUILD only - three failures still fail the job, and the
-          # mutant verdict below is never retried.
-          for attempt in 1 2 3; do
-            cargo test --locked --bin herdr --no-run && break
-            [ "$attempt" = 3 ] && { echo "build failed 3 times; the mutant was never tested"; exit 1; }
-            echo "build failed (attempt $attempt/3); retrying"
-            sleep $((attempt * 20))
-          done
+          # The libghostty-vt Zig packages were prefetched (with retry) by the shared
+          # zig-fetch-retry step, so neither this build nor the verdict below is retried.
+          cargo test --locked --bin herdr --no-run
           if cargo test --locked --bin herdr client::shell::tests::working_spinner::working_icon_differs_between_composes_at_different_times; then
             echo "MUTANT SURVIVED: the differs-between-composes test passed with a frozen frame"
             exit 1
@@ -141,6 +140,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -199,6 +201,9 @@ jobs:
         uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -263,6 +268,11 @@ jobs:
           Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: x86_64-pc-windows-msvc
 
       - name: Build
         run: cargo build --release --locked --target x86_64-pc-windows-msvc

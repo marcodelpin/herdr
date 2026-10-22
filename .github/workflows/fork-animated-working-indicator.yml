@@ -38,6 +38,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
@@ -76,6 +79,9 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
 
       - name: Install Linux build tools
         run: |
@@ -125,6 +131,11 @@ jobs:
           Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: x86_64-pc-windows-msvc
 
       - name: Build
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
