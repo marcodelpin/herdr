@@ -27,6 +27,16 @@ impl HeadlessServer {
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
         info!("starting live handoff");
+        // ADR-0018 D1: a server that leads a systemd unit moves the unit's main
+        // pid before it commits, or the unit ends every pane together with it.
+        let supervision = match crate::server::systemd_unit::probe() {
+            Ok(supervision) => supervision,
+            Err(err) => {
+                self.handoff_in_progress = false;
+                warn!(err = %err, "live handoff refused");
+                return Err(io::Error::other(format!("live handoff refused: {err}")));
+            }
+        };
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
@@ -196,20 +206,49 @@ impl HeadlessServer {
                 "handoff replacement server did not become ready: {err}"
             )));
         }
-        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            match self.wait_then_restore_public_sockets_after_failed_handoff() {
-                Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+        let supervised = match &supervision {
+            crate::server::systemd_unit::Supervision::Supervised(lead) => {
+                if let Err(err) =
+                    self.decide_supervised_handoff(lead, &mut stream, &mut import_child)
+                {
+                    match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                        Ok(()) => {
+                            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                        }
+                        Err(restore_err) => {
+                            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                            return Err(io::Error::other(format!(
+                                "{err}; old server could not restore public sockets: {restore_err}"
+                            )));
+                        }
+                    }
+                    return Err(err);
                 }
-                Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
-                    )));
-                }
+                true
             }
-            return Err(err);
+            crate::server::systemd_unit::Supervision::Unsupervised => false,
+        };
+        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
+            if supervised {
+                // systemd already names the import server as main process: that
+                // cannot be taken back, and reaping it would hide its end from
+                // systemd. Exit as handed over (ADR-0018 crash table).
+                warn!(err = %err, pid = import_child.id(), "systemd took the import server as main process, but the commit could not be sent; exiting without reaping it");
+            } else {
+                crate::server::handoff::cleanup_failed_import_child(&mut import_child);
+                match self.wait_then_restore_public_sockets_after_failed_handoff() {
+                    Ok(()) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    }
+                    Err(restore_err) => {
+                        self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                        return Err(io::Error::other(format!(
+                            "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
+                        )));
+                    }
+                }
+                return Err(err);
+            }
         }
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
@@ -219,9 +258,105 @@ impl HeadlessServer {
             debug!(terminal = %terminal_id, "preserving pane runtime for handoff");
             runtime.preserve_for_handoff();
         }
+        if let Some(reason) = self.server_stop.take_late_stop() {
+            // ADR-0018 D2 step 5: the replacement owns the stop now. It is this
+            // server's unreaped child, so its pid cannot have been reused.
+            let pid = import_child.id();
+            info!(%reason, pid, "a stop reached the old server during the handoff decision; forwarding it to the replacement");
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
         Ok(())
+    }
+
+    /// ADR-0018 D2: the decision between `ready` and `committed`. `Ok` means
+    /// commit: systemd names the import server as the unit's main process. An
+    /// error means the handoff is off, the import server has been told, and the
+    /// panes stay with this server.
+    #[cfg(unix)]
+    fn decide_supervised_handoff(
+        &mut self,
+        lead: &crate::server::systemd_unit::UnitLead,
+        stream: &mut std::os::unix::net::UnixStream,
+        import_child: &mut std::process::Child,
+    ) -> io::Result<()> {
+        use crate::server::systemd_unit::HandOver;
+
+        if !self.server_stop.close_intake_for_handoff() {
+            self.abort_import(stream, import_child, None, true);
+            return Err(io::Error::other(
+                "live handoff aborted: a stop arrived before the decision; the old server keeps the panes and stops",
+            ));
+        }
+        let import_pid = import_child.id();
+        let (rollback, main_is_self, reason) = match lead.hand_main_pid_to(import_pid) {
+            HandOver::Accepted => {
+                info!(unit = %lead.describe(), pid = import_pid, "systemd took the import server as main process; committing the handoff");
+                return Ok(());
+            }
+            HandOver::Refused => (
+                None,
+                true,
+                format!(
+                    "systemd did not take the import server as the main process of {}",
+                    lead.describe()
+                ),
+            ),
+            HandOver::Unknown(why) => (
+                Some(std::process::id()),
+                false,
+                format!(
+                    "systemd's answer about the main process of {} is unknown ({why}); rolled back through the import server",
+                    lead.describe()
+                ),
+            ),
+        };
+        self.abort_import(stream, import_child, rollback, main_is_self);
+        Err(io::Error::other(format!(
+            "live handoff aborted: {reason}; the old server keeps the panes"
+        )))
+    }
+
+    /// Tells the import server the handoff is off, takes over a stop it
+    /// received, and reaps it only once this server is known to be the unit's
+    /// main process again (a reap would hide the import server's end from
+    /// systemd if systemd still named it).
+    #[cfg(unix)]
+    fn abort_import(
+        &mut self,
+        stream: &mut std::os::unix::net::UnixStream,
+        import_child: &mut std::process::Child,
+        rollback_main_pid: Option<u32>,
+        main_is_self: bool,
+    ) {
+        let reply = crate::server::handoff::send_abort(stream, rollback_main_pid)
+            .and_then(|()| crate::server::handoff::wait_aborted(stream));
+        self.server_stop.reopen_intake();
+        let main_confirmed = match &reply {
+            Ok(reply) => {
+                if reply.stop_requested {
+                    self.server_stop.request(ShutdownReason::ApiStop {
+                        caller: Some("a stop received by the handoff import server".into()),
+                    });
+                }
+                main_is_self || reply.rollback_done
+            }
+            Err(err) => {
+                warn!(err = %err, "the handoff import server did not answer the abort");
+                main_is_self
+            }
+        };
+        if main_confirmed {
+            crate::server::handoff::cleanup_failed_import_child(import_child);
+        } else {
+            warn!(
+                pid = import_child.id(),
+                "systemd may still name the import server as main process; leaving it unreaped so systemd sees its real end"
+            );
+        }
     }
 
     pub(super) fn finish_live_handoff_shutdown(&mut self) {
@@ -336,6 +471,14 @@ impl HeadlessServer {
     pub(super) async fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
         self.reject_late_client_connections().await;
+
+        // herdr-whd2 (ADR-0018 D4): `herdr server stop` returns once the sockets
+        // stop answering, and after a live handoff systemd kills the main process
+        // right after that, so the final save is written before any socket goes.
+        if self.app.policy.persist_session {
+            self.app.save_session_on_shutdown();
+            self.app.policy.persist_session = false;
+        }
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {

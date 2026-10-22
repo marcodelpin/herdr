@@ -20,4 +20,6 @@ mod render_scale_benchmark;
 pub(crate) mod render_stream;
 pub(crate) mod shutdown;
 pub mod socket_paths;
+#[cfg(unix)]
+pub(crate) mod systemd_unit;
 pub(crate) mod terminal_attach;

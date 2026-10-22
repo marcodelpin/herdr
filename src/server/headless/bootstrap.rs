@@ -438,10 +438,16 @@ fn build_handoff_import_server(
         ))
         .holding(server));
     }
-    let committed = crate::server::handoff::report_ready(&mut received.stream)
-        .and_then(|()| crate::server::handoff::wait_committed(&mut received.stream));
-    if let Err(err) = committed {
-        return Err(StartupFailure::from(err).holding(server));
+    let decision = crate::server::handoff::report_ready(&mut received.stream)
+        .and_then(|()| crate::server::handoff::wait_decision(&mut received.stream));
+    match decision {
+        Ok(crate::server::handoff::SourceDecision::Commit) => {}
+        Ok(crate::server::handoff::SourceDecision::Abort { rollback_main_pid }) => {
+            let err =
+                abort_handoff_import(&mut received.stream, &server.server_stop, rollback_main_pid);
+            return Err(StartupFailure::from(err).holding(server));
+        }
+        Err(err) => return Err(StartupFailure::from(err).holding(server)),
     }
     let save_by = startup_stop.committed();
     server.app.assume_handoff_ownership();
@@ -487,6 +493,39 @@ fn save_transferred_session(startup_stop: &StartupStop, app: &mut app::App, save
         warn!(%err, "writing the transferred session failed; retrying");
         std::thread::sleep(HANDOFF_SAVE_RETRY);
     }
+}
+
+/// ADR-0018 D2: the source called the handoff off. Stop taking stops, give the
+/// systemd main pid back when asked, report a stop that arrived here, and end
+/// with an error, so that an exit as main process still reads as a failure.
+#[cfg(unix)]
+fn abort_handoff_import(
+    stream: &mut std::os::unix::net::UnixStream,
+    server_stop: &crate::server::shutdown::ServerStop,
+    rollback_main_pid: Option<u32>,
+) -> io::Error {
+    let stop_before_close = !server_stop.close_intake_for_handoff();
+    let rollback_done = match rollback_main_pid {
+        None => false,
+        Some(pid) => match crate::server::systemd_unit::send_main_pid_rollback(pid) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(pid, err = %err, "could not give the systemd main pid back to the handoff source");
+                false
+            }
+        },
+    };
+    let stop_requested = stop_before_close || server_stop.take_late_stop().is_some();
+    if let Err(err) = crate::server::handoff::report_aborted(
+        stream,
+        crate::server::handoff::AbortReply {
+            stop_requested,
+            rollback_done,
+        },
+    ) {
+        warn!(err = %err, "could not answer the handoff abort");
+    }
+    io::Error::other("live handoff aborted by the source server")
 }
 
 #[cfg(not(unix))]

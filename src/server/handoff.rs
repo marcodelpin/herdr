@@ -288,13 +288,110 @@ pub(crate) fn report_ready(stream: &mut UnixStream) -> io::Result<()> {
     stream.flush()
 }
 
+/// What the source decided once the import server reported ready (ADR-0018 D2).
 #[cfg(unix)]
-pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
-    let committed = read_line_through_signals(stream, Instant::now() + READY_TIMEOUT)?;
-    if committed.trim_end() != "committed" {
-        return Err(io::Error::other("handoff source did not commit"));
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SourceDecision {
+    Commit,
+    /// The handoff is off. With a pid, the import server first gives the
+    /// systemd main pid back to that process.
+    Abort {
+        rollback_main_pid: Option<u32>,
+    },
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_decision(stream: &mut UnixStream) -> io::Result<SourceDecision> {
+    let line = read_line_through_signals(stream, Instant::now() + READY_TIMEOUT)?;
+    parse_decision(line.trim_end())
+}
+
+#[cfg(unix)]
+fn parse_decision(line: &str) -> io::Result<SourceDecision> {
+    match line {
+        "committed" => Ok(SourceDecision::Commit),
+        "abort" => Ok(SourceDecision::Abort {
+            rollback_main_pid: None,
+        }),
+        _ => match line
+            .strip_prefix("rollback ")
+            .and_then(|pid| pid.parse::<u32>().ok())
+        {
+            Some(pid) => Ok(SourceDecision::Abort {
+                rollback_main_pid: Some(pid),
+            }),
+            None => Err(io::Error::other("handoff source did not commit")),
+        },
     }
-    Ok(())
+}
+
+/// Calls the handoff off after `ready`. An import server that predates
+/// ADR-0018 reads this as "the source did not commit" and exits.
+#[cfg(unix)]
+pub(crate) fn send_abort(
+    stream: &mut UnixStream,
+    rollback_main_pid: Option<u32>,
+) -> io::Result<()> {
+    let line = match rollback_main_pid {
+        Some(pid) => format!("rollback {pid}\n"),
+        None => "abort\n".to_string(),
+    };
+    stream.write_all(line.as_bytes())?;
+    stream.flush()
+}
+
+/// The import server's answer to an abort.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AbortReply {
+    /// A stop reached the import server before it stopped taking them.
+    pub(crate) stop_requested: bool,
+    /// The rollback barrier completed: the source is the main process again.
+    pub(crate) rollback_done: bool,
+}
+
+#[cfg(unix)]
+pub(crate) fn report_aborted(stream: &mut UnixStream, reply: AbortReply) -> io::Result<()> {
+    stream.write_all(
+        format!(
+            "aborted stop={} rollback={}\n",
+            u8::from(reply.stop_requested),
+            u8::from(reply.rollback_done)
+        )
+        .as_bytes(),
+    )?;
+    stream.flush()
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_aborted(stream: &mut UnixStream) -> io::Result<AbortReply> {
+    // A stop signal reaching the source meanwhile is held by its closed stop
+    // intake; it must not cut this read short and lose the import's reply.
+    let line = read_line_through_signals(stream, Instant::now() + READY_TIMEOUT)?;
+    parse_abort_reply(line.trim_end()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected handoff abort reply {:?}", line.trim_end()),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn parse_abort_reply(line: &str) -> Option<AbortReply> {
+    let rest = line.strip_prefix("aborted ")?;
+    let mut stop_requested = None;
+    let mut rollback_done = None;
+    for field in rest.split(' ') {
+        match field.split_once('=')? {
+            ("stop", value) => stop_requested = Some(value == "1"),
+            ("rollback", value) => rollback_done = Some(value == "1"),
+            _ => {}
+        }
+    }
+    Some(AbortReply {
+        stop_requested: stop_requested?,
+        rollback_done: rollback_done?,
+    })
 }
 
 /// Reads one line by `deadline`, through any signal that arrives meanwhile.

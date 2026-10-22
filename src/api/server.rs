@@ -990,9 +990,18 @@ fn handle_request(
 
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
-            server_stop.request(ShutdownReason::ApiStop {
+            if !server_stop.request_unless_deciding(ShutdownReason::ApiStop {
                 caller: stop_caller,
-            });
+            }) {
+                // ADR-0018 D2: a live handoff is deciding who owns the session;
+                // the retried stop reaches whichever server owns the socket path.
+                return error_response_json(
+                    request.id,
+                    "server_handoff_in_progress",
+                    "a live handoff is deciding which server owns the session; retry the stop"
+                        .into(),
+                );
+            }
             return serde_json::to_string(&SuccessResponse {
                 id: request.id,
                 result: ResponseResult::Ok {},
