@@ -53,6 +53,10 @@ timeout="$zon:14:20: error: unable to connect to server: Timeout"
 nohost="$zon:14:20: error: unable to connect to server: UriMissingHost"
 badscheme="$zon:14:20: error: unable to connect to server: UnsupportedUriScheme"
 badmac="$zon:22:20: error: HTTP response read failure: TlsBadRecordMac"
+# The cause must END the line: a longer name that starts like a transient one, or trailing
+# text after it, is not on the allowlist (pins the end anchor of the retry pattern).
+longername="$zon:14:20: error: unable to connect to server: TimeoutWithSuffix"
+trailing="$zon:14:20: error: unable to connect to server: NameServerFailure (no retry)"
 fingerprint="$zon:1:2: error: invalid fingerprint: 0x0; if this is a new or forked package, use this value: 0x6705a76eea54dde9"
 compile="/r/vendor/libghostty-vt/src/lib_vt.zig:10:5: error: use of undeclared identifier 'foo'"
 
@@ -109,6 +113,8 @@ run_case uri-missing-host 1 1 4 "$nohost"
 run_case unsupported-uri-scheme 1 1 4 "$badscheme"
 run_case tls-bad-record-mac 1 1 4 "$badmac"
 run_case dns-beside-tls-bad-record-mac 1 1 4 "$(printf '%s\n%s' "$dns" "$badmac")"
+run_case cause-with-a-longer-name 1 1 4 "$longername"
+run_case cause-with-trailing-text 1 1 4 "$trailing"
 
 # A later attempt that turns fatal stops the loop there.
 run_case dns-then-hash-mismatch 1 2 4 "$dns" "$(printf '%s\n%s' "$refused" "$mismatch")"

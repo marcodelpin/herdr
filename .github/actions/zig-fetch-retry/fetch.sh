@@ -99,7 +99,15 @@ fi
 #     TlsInitializationFailed, UnknownHostName (also a misspelt host), and the rest.
 #   src/Package/Fetch.zig:1213 "HTTP request failed: {t}" wraps std.Io.Writer.Error
 #     (lib/std/Io/Writer.zig:91), whose only member is WriteFailed: a socket write
-#     that failed after the connection was up. Kept: WriteFailed.
+#     that failed after the connection was up. Kept: WriteFailed, as a DECLARED
+#     EXCEPTION to fail-closed: the socket writer folds every underlying write error
+#     into it (lib/std/Io/net.zig:1378, Unexpected and cancellation included; on
+#     Windows an unclassified send failure becomes Unexpected first,
+#     lib/std/Io/Threaded.zig:13166), so a permanent write failure is retried too.
+#     Its cost is bounded: at most attempts-1 extra calls plus the backoff (15/30/45 s
+#     by default) before the same failure. Accepted 2026-10-22 (herdr-5bka, ADR-0020 in
+#     the wrapper): a connection reset while the request is written is the transient
+#     case this step exists for.
 #   src/Package/Fetch.zig:1219 "HTTP response read failure: {t}" wraps
 #     Connection.ReadError (lib/std/http/Client.zig:390) = std.crypto.tls.Client.ReadError
 #     (lib/std/crypto/tls/Client.zig:53) || Stream.Reader.Error (lib/std/Io/net.zig:1262).
