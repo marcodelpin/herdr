@@ -29,6 +29,12 @@ const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
     command.env_remove("HERDR_STARTUP_CWD");
     command.env_remove("HERDR_SESSION");
+    // A test server leads no systemd unit, whatever cgroup the test runner is
+    // in (ADR-0018 D1); tests that need one set these again.
+    command.env_remove("NOTIFY_SOCKET");
+    command.env_remove("HERDR_TEST_SYSTEMD_SHOW_FILE");
+    command.env_remove("HERDR_TEST_HANDOFF_DECISION_DELAY_MS");
+    command.env("HERDR_TEST_SYSTEMD_CGROUP", "0::/\n");
 }
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
