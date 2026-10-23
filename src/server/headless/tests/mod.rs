@@ -6180,6 +6180,17 @@ fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
 #[tokio::test]
 async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_client() {
     let mut server = test_headless_server();
+    // herdr-qqvm: the fixture shell exits at once; under load the PTY actor
+    // saw that exit and closed user writes before the resume command was
+    // queued, so the start reported false. Keep the shell alive for this test.
+    #[cfg(windows)]
+    {
+        server.app.state.default_shell = "C:\\Windows\\System32\\cmd.exe".into();
+    }
+    #[cfg(not(windows))]
+    {
+        server.app.state.default_shell = "/bin/sh".into();
+    }
     let workspace = crate::workspace::Workspace::test_new("restored");
     let pane_id = workspace.tabs[0].root_pane;
     let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
