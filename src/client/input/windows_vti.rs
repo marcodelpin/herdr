@@ -393,6 +393,11 @@ struct DefaultMouseCandidate {
     /// ends went to the report, never once the pane saw one (a byte-free
     /// press, or a press before the report) (ADR-0013 amendment 4).
     unreleased_keys: Vec<(WindowsKeyRecord, bool)>,
+    /// The keys whose release this burst staged for the pane whatever the
+    /// report does: a later press of one starts a cycle the pane has not
+    /// seen, though `pane_held_keys` still holds the key until the burst
+    /// ends (ADR-0013 amendment 4).
+    pane_released_keys: Vec<WindowsKeyRecord>,
 }
 
 impl Default for WindowsInputPump {
@@ -506,6 +511,7 @@ impl WindowsInputPump {
             PlatformInputItem::Semantic(event) => {
                 let raw_events = self.flush_before_semantic();
                 let mut events = self.process_raw_events(raw_events);
+                self.note_native_key_events(std::slice::from_ref(&event));
                 events.push(event);
                 events
             }
@@ -580,8 +586,9 @@ impl WindowsInputPump {
                     };
                     self.process_raw_events(raw_events)
                 } else {
-                    if let Some(record) = nested_record {
-                        self.note_pane_key(record);
+                    match nested_record {
+                        Some(record) => self.note_pane_key(record),
+                        None => self.note_native_key_events(&events),
                     }
                     let raw_events = if events.is_empty() {
                         self.framer.flush_timeout()
@@ -648,6 +655,7 @@ impl WindowsInputPump {
             self.framer.end_staged_records();
             let staged = std::mem::take(&mut self.default_mouse_candidate.events);
             let unreleased = std::mem::take(&mut self.default_mouse_candidate.unreleased_keys);
+            self.default_mouse_candidate.pane_released_keys.clear();
             for (record, taken) in std::mem::take(&mut self.default_mouse_candidate.records) {
                 if !accepted_default_mouse || !taken {
                     self.note_pane_key(record);
@@ -691,7 +699,8 @@ impl WindowsInputPump {
     /// pushed bytes the report can take. A release ends every press of its
     /// key since the last release, so it goes with the report only when
     /// all of them did: a byte-free press of the key, or one the pane saw
-    /// before the report, keeps the release (ADR-0013 amendment 4).
+    /// before the report and has not seen released, keeps the release
+    /// (ADR-0013 amendment 4).
     fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) -> bool {
         let candidate = &mut self.default_mouse_candidate;
         candidate.active = true;
@@ -703,7 +712,11 @@ impl WindowsInputPump {
                 let owned = has_report_bytes
                     && match unreleased {
                         Some(index) => candidate.unreleased_keys[index].1,
-                        None => matching_key_index(&self.pane_held_keys, record).is_none(),
+                        None => {
+                            matching_key_index(&self.pane_held_keys, record).is_none()
+                                || matching_key_index(&candidate.pane_released_keys, record)
+                                    .is_some()
+                        }
                     };
                 match unreleased {
                     Some(index) => candidate.unreleased_keys[index] = (record, owned),
@@ -712,7 +725,14 @@ impl WindowsInputPump {
             }
             has_report_bytes
         } else {
-            unreleased.is_some_and(|index| candidate.unreleased_keys.remove(index).1)
+            let taken = unreleased.is_some_and(|index| candidate.unreleased_keys.remove(index).1);
+            if tracked
+                && !taken
+                && matching_key_index(&candidate.pane_released_keys, record).is_none()
+            {
+                candidate.pane_released_keys.push(record);
+            }
+            taken
         };
         candidate.records.push((record, taken));
         taken
@@ -727,6 +747,20 @@ impl WindowsInputPump {
             remove_matching_key(&mut self.pane_held_keys, record);
         } else if matching_key_index(&self.pane_held_keys, record).is_none() {
             self.pane_held_keys.push(record);
+        }
+    }
+
+    /// Records the native console keys of events that reached the pane:
+    /// a native record carries no nested record, only its events do.
+    fn note_native_key_events(&mut self, events: &[crate::protocol::ClientInputEvent]) {
+        for event in events {
+            if let crate::protocol::ClientInputEvent::Key {
+                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                ..
+            } = event
+            {
+                self.note_pane_key(*record);
+            }
         }
     }
 
