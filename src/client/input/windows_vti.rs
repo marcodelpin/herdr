@@ -370,34 +370,163 @@ struct WindowsInputPump {
     paste_from_win32_key_records: bool,
     pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
     default_mouse_candidate: DefaultMouseCandidate,
-    consumed_default_mouse_keys: Vec<WindowsKeyRecord>,
-    /// The nested keys whose press reached the pane and whose release has
-    /// not: a report never takes the release of one (ADR-0013 amendment 4).
-    pane_held_keys: Vec<WindowsKeyRecord>,
+    /// The open press cycle of every key and who owns it: the one place a
+    /// release learns where it goes (ADR-0013 amendment 5).
+    key_cycles: KeyCycleLedger,
 }
 
 #[derive(Default)]
 struct DefaultMouseCandidate {
     active: bool,
-    /// The staged events in arrival order, each with whether the report
-    /// takes its record: a press when it pushed bytes the report can take,
-    /// a release when the report owns its key. An accepted report consumes
-    /// only those; a record that pushed none (an arrow key) stays semantic
-    /// input (ADR-0013 amendment 3, D4).
-    events: Vec<(crate::protocol::ClientInputEvent, bool)>,
-    /// The staged records in arrival order, each with whether the report
-    /// takes it, so the pump knows which reach the pane.
-    records: Vec<(WindowsKeyRecord, bool)>,
-    /// The keys pressed in this burst and not released, each with whether
-    /// the report owns its release: only while every press the release
-    /// ends went to the report, never once the pane saw one (a byte-free
-    /// press, or a press before the report) (ADR-0013 amendment 4).
-    unreleased_keys: Vec<(WindowsKeyRecord, bool)>,
-    /// The keys whose release this burst staged for the pane whatever the
-    /// report does: a later press of one starts a cycle the pane has not
-    /// seen, though `pane_held_keys` still holds the key until the burst
-    /// ends (ADR-0013 amendment 4).
-    pane_released_keys: Vec<WindowsKeyRecord>,
+    /// The staged events in arrival order, each with the fate of its
+    /// record: `Pane` events stay input whatever the report does, `Staged`
+    /// ones go with the report (consumed when it is accepted, replayed when
+    /// it is not). A record that pushed no bytes (an arrow key) gives the
+    /// report nothing (ADR-0013 amendment 3, D4; amendment 5).
+    events: Vec<(crate::protocol::ClientInputEvent, RecordFate)>,
+}
+
+/// Who owns the open press cycle of a key: the presses since its last
+/// release (ADR-0013 amendment 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleOwner {
+    /// A press of the cycle reached the pane, or reaches it whatever the
+    /// pending report does.
+    Pane,
+    /// Every press went to a report, some to the pending one.
+    Staged,
+    /// Every press went to reports that were accepted.
+    Consumed,
+}
+
+/// Where one key record goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordFate {
+    /// It reaches the pane.
+    Pane,
+    /// It goes with the pending report: consumed if the report is
+    /// accepted, replayed to the pane if it is not.
+    Staged,
+    /// It is dropped: it ends a cycle accepted reports consumed.
+    Consumed,
+}
+
+/// One ledger of press cycles that every tracked key record joins in
+/// arrival order, nested or native, inside a report or outside one. A
+/// release ends exactly its key's open cycle and takes that cycle's owner
+/// as its fate (ADR-0013 amendment 5).
+#[derive(Default)]
+struct KeyCycleLedger {
+    /// Per key (virtual key and scan code), its open cycle's owner.
+    open: Vec<((u16, u16), CycleOwner)>,
+    /// Test builds: the fate of every tracked record, in arrival order;
+    /// `Staged` until its report ends (property I6 judges by these).
+    #[cfg(test)]
+    fates: Vec<(WindowsKeyRecord, RecordFate)>,
+}
+
+impl KeyCycleLedger {
+    /// The key a record belongs to; records with neither a virtual key nor
+    /// a scan code (raw bytes) are not tracked.
+    fn key(record: WindowsKeyRecord) -> Option<(u16, u16)> {
+        (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
+            .then_some((record.virtual_key_code, record.virtual_scan_code))
+    }
+
+    fn owner(&self, record: WindowsKeyRecord) -> Option<CycleOwner> {
+        let key = Self::key(record)?;
+        self.open
+            .iter()
+            .find(|(open, _)| *open == key)
+            .map(|(_, owner)| *owner)
+    }
+
+    /// A press joins its key's cycle, opening one if none is open. A
+    /// `staged` press goes with the pending report; any other reaches the
+    /// pane, and then so does the cycle's release.
+    fn press(&mut self, record: WindowsKeyRecord, staged: bool) -> RecordFate {
+        let fate = if staged {
+            RecordFate::Staged
+        } else {
+            RecordFate::Pane
+        };
+        let Some(key) = Self::key(record) else {
+            return fate;
+        };
+        let joined = if staged {
+            CycleOwner::Staged
+        } else {
+            CycleOwner::Pane
+        };
+        match self.open.iter_mut().find(|(open, _)| *open == key) {
+            Some((_, owner)) if *owner != CycleOwner::Pane => *owner = joined,
+            Some(_) => {}
+            None => self.open.push((key, joined)),
+        }
+        self.log(record, fate);
+        fate
+    }
+
+    /// A release ends its key's open cycle and goes where its owner says;
+    /// with no open cycle (a key held before the client attached) it
+    /// reaches the pane.
+    fn release(&mut self, record: WindowsKeyRecord) -> RecordFate {
+        let Some(key) = Self::key(record) else {
+            return RecordFate::Pane;
+        };
+        let fate = match self.open.iter().position(|(open, _)| *open == key) {
+            Some(index) => match self.open.remove(index).1 {
+                CycleOwner::Pane => RecordFate::Pane,
+                CycleOwner::Staged => RecordFate::Staged,
+                CycleOwner::Consumed => RecordFate::Consumed,
+            },
+            None => RecordFate::Pane,
+        };
+        self.log(record, fate);
+        fate
+    }
+
+    /// A record that reaches the pane whatever happens.
+    fn note_pane(&mut self, record: WindowsKeyRecord) -> RecordFate {
+        if record.key_down {
+            self.press(record, false)
+        } else {
+            self.release(record)
+        }
+    }
+
+    /// The pending report ended: what went with it is consumed when it was
+    /// accepted and reaches the pane when it was not.
+    fn end_report(&mut self, accepted: bool) {
+        let owner = if accepted {
+            CycleOwner::Consumed
+        } else {
+            CycleOwner::Pane
+        };
+        for (_, open) in &mut self.open {
+            if *open == CycleOwner::Staged {
+                *open = owner;
+            }
+        }
+        #[cfg(test)]
+        for (_, fate) in &mut self.fates {
+            if *fate == RecordFate::Staged {
+                *fate = if accepted {
+                    RecordFate::Consumed
+                } else {
+                    RecordFate::Pane
+                };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn log(&mut self, record: WindowsKeyRecord, fate: RecordFate) {
+        self.fates.push((record, fate));
+    }
+
+    #[cfg(not(test))]
+    fn log(&mut self, _record: WindowsKeyRecord, _fate: RecordFate) {}
 }
 
 impl Default for WindowsInputPump {
@@ -408,8 +537,7 @@ impl Default for WindowsInputPump {
             paste_from_win32_key_records: false,
             pending_physical_escape: None,
             default_mouse_candidate: DefaultMouseCandidate::default(),
-            consumed_default_mouse_keys: Vec::new(),
-            pane_held_keys: Vec::new(),
+            key_cycles: KeyCycleLedger::default(),
         }
     }
 }
@@ -492,6 +620,7 @@ impl WindowsInputPump {
             if !self.framer.has_pending_bracketed_paste() {
                 let raw_events = self.flush_before_semantic();
                 events.extend(self.process_raw_events(raw_events));
+                self.note_native_key_events(vec![escape.clone()]);
                 self.pending_physical_escape = Some((escape, false));
                 return events;
             }
@@ -511,8 +640,7 @@ impl WindowsInputPump {
             PlatformInputItem::Semantic(event) => {
                 let raw_events = self.flush_before_semantic();
                 let mut events = self.process_raw_events(raw_events);
-                self.note_native_key_events(std::slice::from_ref(&event));
-                events.push(event);
+                events.extend(self.note_native_key_events(vec![event]));
                 events
             }
             PlatformInputItem::PasteAwareBytes {
@@ -521,14 +649,16 @@ impl WindowsInputPump {
                 win32_paste_bytes,
                 nested_record,
             } => {
-                if self.consume_default_mouse_key_event(nested_record) {
+                if self.drops_consumed_release(nested_record) {
                     Vec::new()
                 } else {
                     let pending_paste = self.framer.has_pending_bracketed_paste();
                     if !pending_paste && self.framer.has_pending_default_mouse_sequence() {
                         self.stage_default_mouse_record(nested_record, &raw_bytes);
-                    } else if !pending_paste {
-                        self.note_pane_key(nested_record);
+                    } else {
+                        // Raw bytes reach the framer in order with the
+                        // flushes before them, so the record joins now.
+                        self.key_cycles.note_pane(nested_record);
                     }
                     let decode_win32_record = self.paste_from_win32_key_records || !pending_paste;
                     self.pending_escape_origin = if decode_win32_record && !pending_paste {
@@ -557,11 +687,19 @@ impl WindowsInputPump {
                 events,
                 nested_record,
             } => {
-                let suppress_consumed_key = nested_record
-                    .is_some_and(|record| self.consume_default_mouse_key_event(record));
+                let suppress_consumed_key =
+                    nested_record.is_some_and(|record| self.drops_consumed_release(record));
                 if suppress_consumed_key {
                     Vec::new()
                 } else if self.framer.has_pending_bracketed_paste() {
+                    match nested_record {
+                        Some(record) => {
+                            self.key_cycles.note_pane(record);
+                        }
+                        None => {
+                            self.note_native_key_events(events);
+                        }
+                    }
                     let bytes = if self.paste_from_win32_key_records {
                         &win32_paste_bytes
                     } else {
@@ -586,17 +724,23 @@ impl WindowsInputPump {
                     };
                     self.process_raw_events(raw_events)
                 } else {
-                    match nested_record {
-                        Some(record) => self.note_pane_key(record),
-                        None => self.note_native_key_events(&events),
-                    }
                     let raw_events = if events.is_empty() {
                         self.framer.flush_timeout()
                     } else {
                         self.flush_before_semantic()
                     };
+                    // The flush may end an older report and commit its
+                    // staged records, so the record joins the ledger after
+                    // it, in the order the pane gets the events (codex
+                    // hvqok-r2 P2).
                     let mut output = self.process_raw_events(raw_events);
-                    output.extend(events);
+                    match nested_record {
+                        Some(record) => {
+                            self.key_cycles.note_pane(record);
+                            output.extend(events);
+                        }
+                        None => output.extend(self.note_native_key_events(events)),
+                    }
                     output
                 }
             }
@@ -653,29 +797,16 @@ impl WindowsInputPump {
         {
             self.default_mouse_candidate.active = false;
             self.framer.end_staged_records();
-            let staged = std::mem::take(&mut self.default_mouse_candidate.events);
-            let unreleased = std::mem::take(&mut self.default_mouse_candidate.unreleased_keys);
-            self.default_mouse_candidate.pane_released_keys.clear();
-            for (record, taken) in std::mem::take(&mut self.default_mouse_candidate.records) {
-                if !accepted_default_mouse || !taken {
-                    self.note_pane_key(record);
-                }
-            }
-            let mut staged: Vec<_> = if accepted_default_mouse {
-                self.consumed_default_mouse_keys.extend(
-                    unreleased
-                        .into_iter()
-                        .filter(|(_, owned)| *owned)
-                        .map(|(record, _)| record),
-                );
-                staged
-                    .into_iter()
-                    .filter(|(_, has_report_bytes)| !has_report_bytes)
-                    .map(|(event, _)| event)
-                    .collect()
-            } else {
-                staged.into_iter().map(|(event, _)| event).collect()
-            };
+            self.key_cycles.end_report(accepted_default_mouse);
+            let mut staged: Vec<_> = std::mem::take(&mut self.default_mouse_candidate.events)
+                .into_iter()
+                .filter(|(_, fate)| match fate {
+                    RecordFate::Pane => true,
+                    RecordFate::Staged => !accepted_default_mouse,
+                    RecordFate::Consumed => false,
+                })
+                .map(|(event, _)| event)
+                .collect();
             staged.append(&mut output);
             output = staged;
         }
@@ -688,88 +819,66 @@ impl WindowsInputPump {
         raw_bytes: &[u8],
         events: Vec<crate::protocol::ClientInputEvent>,
     ) {
-        let taken = self.stage_default_mouse_record(record, raw_bytes);
+        let fate = self.stage_default_mouse_record(record, raw_bytes);
         self.default_mouse_candidate
             .events
-            .extend(events.into_iter().map(|event| (event, taken)));
+            .extend(events.into_iter().map(|event| (event, fate)));
     }
 
-    /// Stages a record for the pending report and returns whether an
-    /// accepted report takes it. A press goes with the report when it
-    /// pushed bytes the report can take. A release ends every press of its
-    /// key since the last release, so it goes with the report only when
-    /// all of them did: a byte-free press of the key, or one the pane saw
-    /// before the report and has not seen released, keeps the release
-    /// (ADR-0013 amendment 4).
-    fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) -> bool {
-        let candidate = &mut self.default_mouse_candidate;
-        candidate.active = true;
-        let tracked = record.virtual_key_code != 0 || record.virtual_scan_code != 0;
-        let unreleased = unreleased_key_index(&candidate.unreleased_keys, record);
-        let taken = if record.key_down {
-            let has_report_bytes = !raw_bytes.is_empty();
-            if tracked {
-                let owned = has_report_bytes
-                    && match unreleased {
-                        Some(index) => candidate.unreleased_keys[index].1,
-                        None => {
-                            matching_key_index(&self.pane_held_keys, record).is_none()
-                                || matching_key_index(&candidate.pane_released_keys, record)
-                                    .is_some()
-                        }
-                    };
-                match unreleased {
-                    Some(index) => candidate.unreleased_keys[index] = (record, owned),
-                    None => candidate.unreleased_keys.push((record, owned)),
-                }
-            }
-            has_report_bytes
+    /// Stages a record for the pending report and returns its fate from the
+    /// ledger. A press goes with the report when it pushed bytes the report
+    /// can take; a release goes where the owner of the cycle it ends says
+    /// (ADR-0013 amendment 5).
+    fn stage_default_mouse_record(
+        &mut self,
+        record: WindowsKeyRecord,
+        raw_bytes: &[u8],
+    ) -> RecordFate {
+        self.default_mouse_candidate.active = true;
+        if record.key_down {
+            self.key_cycles.press(record, !raw_bytes.is_empty())
         } else {
-            let taken = unreleased.is_some_and(|index| candidate.unreleased_keys.remove(index).1);
-            if tracked
-                && !taken
-                && matching_key_index(&candidate.pane_released_keys, record).is_none()
-            {
-                candidate.pane_released_keys.push(record);
-            }
-            taken
-        };
-        candidate.records.push((record, taken));
-        taken
-    }
-
-    /// Records that a nested key record reached the pane.
-    fn note_pane_key(&mut self, record: WindowsKeyRecord) {
-        if record.virtual_key_code == 0 && record.virtual_scan_code == 0 {
-            return;
-        }
-        if !record.key_down {
-            remove_matching_key(&mut self.pane_held_keys, record);
-        } else if matching_key_index(&self.pane_held_keys, record).is_none() {
-            self.pane_held_keys.push(record);
+            self.key_cycles.release(record)
         }
     }
 
-    /// Records the native console keys of events that reached the pane:
-    /// a native record carries no nested record, only its events do.
-    fn note_native_key_events(&mut self, events: &[crate::protocol::ClientInputEvent]) {
-        for event in events {
-            if let crate::protocol::ClientInputEvent::Key {
-                source: crate::protocol::ClientKeySource::WindowsConsole { record },
-                ..
-            } = event
-            {
-                self.note_pane_key(*record);
-            }
-        }
-    }
-
-    fn consume_default_mouse_key_event(&mut self, record: WindowsKeyRecord) -> bool {
-        let Some(index) = matching_key_index(&self.consumed_default_mouse_keys, record) else {
+    /// A nested release that ends a cycle accepted reports consumed is
+    /// dropped whole, wherever it arrives.
+    fn drops_consumed_release(&mut self, record: WindowsKeyRecord) -> bool {
+        if record.key_down || self.key_cycles.owner(record) != Some(CycleOwner::Consumed) {
             return false;
-        };
-        self.consumed_default_mouse_keys.remove(index);
-        !record.key_down
+        }
+        self.key_cycles.release(record);
+        true
+    }
+
+    /// Native console key events join the ledger through the record of
+    /// their `WindowsConsole` source, once per record (a repeated press
+    /// reports several events of one record); a release of a consumed
+    /// cycle is dropped. Returns the events that reach the pane.
+    fn note_native_key_events(
+        &mut self,
+        events: Vec<crate::protocol::ClientInputEvent>,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut last: Option<(WindowsKeyRecord, RecordFate)> = None;
+        events
+            .into_iter()
+            .filter(|event| {
+                let crate::protocol::ClientInputEvent::Key {
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                    ..
+                } = event
+                else {
+                    return true;
+                };
+                let fate = match last {
+                    Some((noted, fate)) if noted == *record => fate,
+                    _ => self.key_cycles.note_pane(*record),
+                };
+                last = Some((*record, fate));
+                fate != RecordFate::Consumed
+            })
+            .collect()
     }
 
     fn raw_events_to_client_events(
@@ -780,31 +889,6 @@ impl WindowsInputPump {
             .filter_map(windows_client_input_event_from_raw)
             .collect()
     }
-}
-
-fn matching_key_index(keys: &[WindowsKeyRecord], record: WindowsKeyRecord) -> Option<usize> {
-    keys.iter().position(|candidate| {
-        candidate.virtual_key_code == record.virtual_key_code
-            && candidate.virtual_scan_code == record.virtual_scan_code
-    })
-}
-
-fn unreleased_key_index(
-    keys: &[(WindowsKeyRecord, bool)],
-    record: WindowsKeyRecord,
-) -> Option<usize> {
-    keys.iter().position(|(candidate, _)| {
-        candidate.virtual_key_code == record.virtual_key_code
-            && candidate.virtual_scan_code == record.virtual_scan_code
-    })
-}
-
-fn remove_matching_key(keys: &mut Vec<WindowsKeyRecord>, record: WindowsKeyRecord) -> bool {
-    let Some(index) = matching_key_index(keys, record) else {
-        return false;
-    };
-    keys.remove(index);
-    true
 }
 
 impl PlatformInputItem {
@@ -983,6 +1067,26 @@ impl PumpUnderTest {
 
     pub(crate) fn framer_mut(&mut self) -> &mut crate::raw_input::RawInputFramer {
         &mut self.0.pump.framer
+    }
+
+    /// The fate of every tracked key record the pump's ledger saw, in
+    /// arrival order: `Some(true)` reached the pane, `Some(false)` was
+    /// consumed, `None` still waits for its report (ADR-0013 amendment 5).
+    pub(crate) fn record_fates(&self) -> Vec<(WindowsKeyRecord, Option<bool>)> {
+        self.0
+            .pump
+            .key_cycles
+            .fates
+            .iter()
+            .map(|(record, fate)| {
+                let fate = match fate {
+                    RecordFate::Pane => Some(true),
+                    RecordFate::Consumed => Some(false),
+                    RecordFate::Staged => None,
+                };
+                (*record, fate)
+            })
+            .collect()
     }
 
     /// Raw input bytes, as the mapper's win32-input-mode framer passes them
