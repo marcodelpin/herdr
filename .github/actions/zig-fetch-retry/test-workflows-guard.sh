@@ -40,6 +40,8 @@ expect() {
 #   drop    remove that job's zig-fetch-retry step
 #   unguard remove the 'if' of the first retry step in a job whose Install Zig and first
 #           build step share one 'if'
+#   disable set 'if: false' on the first retry step in a job whose Install Zig and first
+#           build step do NOT share one 'if' (codex zs55-r2 P3: a disabled prefetch)
 mutate() {
   local dst="$work/$1"
   mkdir -p "$dst"
@@ -64,6 +66,9 @@ for path in sorted(src.glob("*.yml")):
             elif mode == "unguard" and gated and "if" in s:
                 del s["if"]
                 done = True
+            elif mode == "disable" and zig and build and not gated:
+                s["if"] = False
+                done = True
             break
     (dst / path.name).write_text(yaml.safe_dump(doc, sort_keys=False))
 sys.exit(0 if done else 3)
@@ -77,6 +82,7 @@ mkdir -p "$work/empty"
 expect empty-scan-refused 1 "$work" "$work/empty"
 if mutate dropped drop; then expect dropped-retry-detected 1 "$work" "$work/dropped"; else ko dropped-retry-detected "mutation found no retry step"; fi
 if mutate unguarded unguard; then expect unguarded-retry-detected 1 "$work" "$work/unguarded"; else ko unguarded-retry-detected "mutation found no guarded retry step"; fi
+if mutate disabled disable; then expect disabled-retry-detected 1 "$work" "$work/disabled"; else ko disabled-retry-detected "mutation found no ungated retry step"; fi
 
 # Codex zs55-r1 P2: in preview.yml the prefetch must carry the same 'if' as Install Zig,
 # else a should_publish=false no-op runs a Zig build without the toolchain.

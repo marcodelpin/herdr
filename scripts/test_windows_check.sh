@@ -43,6 +43,10 @@ nohost="  $zon:14:20: error: unable to connect to server: UriMissingHost"
 rustc=$'error[E0308]: mismatched types\n --> src/main.rs:1:14\nerror: could not compile `herdr` (bin "herdr") due to 1 previous error'
 lint=$'error: unused variable: `x`\n --> src/main.rs:2:9\nerror: could not compile `herdr` (bin "herdr") due to 1 previous error'
 zigsrc="  C:\\a\\herdr\\vendor\\libghostty-vt\\src\\lib_vt.zig:10:5: error: use of undeclared identifier 'foo'"
+# Codex zs55-r2 P2: plain error diagnostics without a location or a rustc code.
+nolib="error: unable to find dynamic system library 'c' with path 'C:\\a\\lib'"
+otherwrap='error: failed to run custom build command for `ring v0.17.8`'
+linker='error: linking with `link.exe` failed: exit code: 1120'
 
 # run_case NAME WANT_RC(0|nonzero) WANT_CALLS OUT1 [OUT2 ...]; '-' = a successful call.
 run_case() {
@@ -77,6 +81,9 @@ run_case dns-plus-rustc-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$rustc" -
 run_case permanent-cause-not-retried 1 1 "$wrap"$'\n'"$nohost" -
 run_case zig-compile-error-not-retried 1 1 "$wrap"$'\n'"$zigsrc" -
 run_case no-error-line-not-retried 1 1 "something went wrong" -
+run_case dns-plus-plain-error-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$nolib" -
+run_case dns-plus-other-build-script-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$otherwrap" -
+run_case dns-plus-linker-error-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$linker" -
 
 echo "test_windows_check: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
