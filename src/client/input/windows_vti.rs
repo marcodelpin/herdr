@@ -5389,16 +5389,16 @@ mod tests {
             &[hash, hash_up],
             2,
         ));
-        let summary = event_summary_with_kinds(&events);
-        let releases = summary
-            .iter()
-            .filter(|entry| entry.starts_with("Release"))
-            .count();
-        assert_eq!(releases, 1, "{summary:?}: {events:?}");
+        // The press the pane saw, its one release, then the report (codex
+        // hvqok-r1: a count of releases let `[Release, Mouse]` pass).
         assert_eq!(
-            summary.last().map(String::as_str),
-            Some("mouse"),
-            "{summary:?}"
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char('#') mods 1".to_string(),
+                "Release Char('#') mods 1".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
         );
     }
 
