@@ -142,6 +142,14 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    /// herdr-3cr r3: dedupe keys of the deferred agent resumes started so
+    /// far, so a native fallback cannot resume a session a second time.
+    started_agent_resume_keys: std::collections::HashSet<String>,
+    /// herdr-3cr r4: plans whose native fallback yielded to another
+    /// terminal's still-pending plan of the same session, by that dedupe
+    /// key. If the pending owner fails instead of starting, they get their
+    /// plan back (`release_agent_resume_key`).
+    yielded_agent_resumes: std::collections::HashMap<String, Vec<agent_resume::YieldedAgentResume>>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -656,6 +664,8 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            started_agent_resume_keys: std::collections::HashSet::new(),
+            yielded_agent_resumes: std::collections::HashMap::new(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

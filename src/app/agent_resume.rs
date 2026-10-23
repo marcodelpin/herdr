@@ -14,6 +14,25 @@ struct PendingAgentResumeCandidate {
     cols: u16,
 }
 
+/// herdr-3cr r4: a pending plan that yielded its native fallback to another
+/// terminal's pending plan of the same session (see `yielded_agent_resumes`).
+pub(crate) struct YieldedAgentResume {
+    terminal_id: crate::terminal::TerminalId,
+    plan: crate::agent_resume::AgentResumePlan,
+    restore_error: Option<String>,
+    yield_error: String,
+}
+
+/// herdr-3cr r4: why a deferred reported resume command is not launched.
+#[derive(Debug)]
+enum DeferredResumeRefusal {
+    /// The reserved directory is gone and no saved session id names the
+    /// session.
+    DirGone,
+    /// The reserved path still exists but resolves to another directory.
+    DirReplaced(std::path::PathBuf),
+}
+
 /// ADR-0002, herdr-ct9: prefer the agent's own reported cwd over the pane's
 /// shell cwd for a deferred resume, when it names a directory that still
 /// exists - a claude tab whose shell sits in one project while its agent
@@ -28,9 +47,8 @@ pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std
         .persisted_agent_session
         .as_ref()
         .and_then(|session| session.cwd.as_deref())
-        .map(std::path::Path::new)
-        .filter(|cwd| cwd.is_dir())
-        .map(std::path::Path::to_path_buf)
+        // herdr-3cr: same rule as restore admission and `reported_resume_dir`.
+        .and_then(crate::agent_resume::usable_agent_cwd)
         .unwrap_or_else(|| terminal.cwd.clone())
 }
 
@@ -40,22 +58,50 @@ pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std
 /// latest in its working directory - so the same argv in another directory
 /// is another conversation: one the herdr-4r8 live-holder gate (which checks
 /// the saved session id) never looked at, and one restore de-duplication
-/// never reserved. When the launch directory differs from the reserved one
-/// (the agent cwd vanished between restore and launch, or reappeared), the
-/// saved session id's native plan is used instead: it names its session, so
-/// 4r8 checks the identity actually resumed and two panes can no longer land
-/// on the same conversation. With no usable session id the resume is
-/// skipped (`Err` returns the dropped plan for the log line). A native plan
-/// (`launch_dir == None`) passes through unchanged.
-fn deferred_resume_plan_in(
+/// never reserved.
+///
+/// herdr-3cr r3 (codex h3cr-r2b P2-1, P2-4): the reserved directory is the
+/// `resume_dir_identity` restore computed once, and it is also the directory
+/// the launch spawns in. Nothing is re-resolved here: an alias that was
+/// removed or retargeted after restore neither drops the resume nor moves
+/// it into a directory nobody reserved. When the reserved directory itself
+/// is gone, the saved session id's native plan is used instead, in `cwd`:
+/// it names its session, so 4r8 checks the identity actually resumed. With
+/// no usable session id the resume is skipped (`Err` returns the dropped
+/// plan for the log line). A native plan (`launch_dir == None`) passes
+/// through unchanged, in `cwd`.
+///
+/// herdr-3cr r4 (codex h3cr-r3fix finding 2): the reserved directory is
+/// the canonical identity restore recorded (`resume_dir_identity`). It is
+/// resolved again here and must still be that same canonical path: a
+/// reserved path that now resolves elsewhere (the directory renamed away
+/// and replaced by a symlink, or a parent component re-pointed) is refused,
+/// never spawned into the other directory and never replaced by a
+/// fallback. A real directory recreated at the same canonical path is not
+/// detected, nor is a change between this check and the spawn (ADR-0022).
+///
+/// The `Err` hands the plan back by value on a refusal that runs at most once
+/// per pane restore, so boxing it buys nothing; on x86_64-pc-windows-msvc the
+/// larger `PathBuf` puts it over clippy's 128-byte line (herdr-3cr r5b).
+#[allow(clippy::result_large_err)]
+fn deferred_resume_launch(
     terminal: &crate::terminal::TerminalState,
     plan: crate::agent_resume::AgentResumePlan,
-    cwd: &std::path::Path,
-) -> Result<crate::agent_resume::AgentResumePlan, crate::agent_resume::AgentResumePlan> {
-    match plan.launch_dir.as_deref() {
-        None => return Ok(plan),
-        Some(reserved) if reserved == cwd => return Ok(plan),
-        Some(_) => {}
+    cwd: std::path::PathBuf,
+) -> Result<
+    (crate::agent_resume::AgentResumePlan, std::path::PathBuf),
+    (crate::agent_resume::AgentResumePlan, DeferredResumeRefusal),
+> {
+    let Some(reserved) = plan.launch_dir.clone() else {
+        return Ok((plan, cwd));
+    };
+    if let Ok(resolved) = std::fs::canonicalize(&reserved) {
+        if resolved != reserved {
+            return Err((plan, DeferredResumeRefusal::DirReplaced(resolved)));
+        }
+        if resolved.is_dir() {
+            return Ok((plan, reserved));
+        }
     }
     terminal
         .persisted_agent_session
@@ -64,7 +110,8 @@ fn deferred_resume_plan_in(
         .and_then(|session| {
             crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
         })
-        .ok_or(plan)
+        .map(|native| (native, cwd))
+        .ok_or((plan, DeferredResumeRefusal::DirGone))
 }
 
 impl App {
@@ -292,27 +339,69 @@ impl App {
         }
 
         // herdr-nrr: a reported resume command runs only in the directory
-        // its dedupe key reserved. See `deferred_resume_plan_in`.
+        // its dedupe key reserved. See `deferred_resume_launch`.
         let reserved_dir = plan.launch_dir.clone();
+        let pending_plan = plan.clone();
         let resolved = match self.state.terminals.get(&terminal_id) {
-            Some(terminal) => deferred_resume_plan_in(terminal, plan, &cwd),
-            None => Ok(plan),
+            Some(terminal) => deferred_resume_launch(terminal, plan, cwd.clone()),
+            None => Ok((plan, cwd.clone())),
         };
-        let plan = match resolved {
-            Ok(plan) => {
+        let (plan, cwd) = match resolved {
+            Ok((plan, launch_cwd)) => {
                 if plan.launch_dir.is_none() && reserved_dir.is_some() {
+                    // herdr-3cr r3 (codex h3cr-r2b P2-3): restore reserved
+                    // the reported command's directory, never this native
+                    // plan's session, so it is de-duplicated here: a pane
+                    // still waiting on the native plan of the same session,
+                    // or a resume of it already started, keeps it.
+                    //
+                    // herdr-3cr r4 (codex h3cr-r3fix finding 1): yielding to
+                    // a pane that has not started yet is provisional. This
+                    // plan is parked under the key, and if that pane fails
+                    // instead of starting, the key is released and this plan
+                    // comes back, so a usable fallback is never lost to a
+                    // pane that cannot launch.
+                    let started = self.started_agent_resume_keys.contains(&plan.dedupe_key);
+                    if started || self.agent_resume_key_taken(&terminal_id, &plan.dedupe_key) {
+                        tracing::warn!(
+                            pane = pane_id.raw(),
+                            terminal = %terminal_id,
+                            agent = %plan.agent,
+                            reserved_dir = ?reserved_dir,
+                            started,
+                            "skipping deferred agent resume: the reported resume command's directory is gone and its saved session is resumed by another pane"
+                        );
+                        let error = "The saved resume command belongs to a directory that is no longer available, and its saved session is restored in another pane.".to_string();
+                        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                            if !started {
+                                self.yielded_agent_resumes
+                                    .entry(plan.dedupe_key.clone())
+                                    .or_default()
+                                    .push(YieldedAgentResume {
+                                        terminal_id: terminal_id.clone(),
+                                        plan: pending_plan,
+                                        restore_error: terminal.restore_error.clone(),
+                                        yield_error: error.clone(),
+                                    });
+                            }
+                            terminal.pending_agent_resume_plan = None;
+                            terminal.restore_error = Some(error);
+                            terminal.revision = terminal.revision.saturating_add(1);
+                        }
+                        return true;
+                    }
                     tracing::info!(
                         pane = pane_id.raw(),
                         terminal = %terminal_id,
                         agent = %plan.agent,
                         reserved_dir = ?reserved_dir,
-                        cwd = %cwd.display(),
-                        "reported resume command's directory changed; resuming the saved session id instead"
+                        cwd = %launch_cwd.display(),
+                        "reported resume command's directory is gone; resuming the saved session id instead"
                     );
                 }
-                plan
+                (plan, launch_cwd)
             }
-            Err(plan) => {
+            Err((plan, DeferredResumeRefusal::DirGone)) => {
                 tracing::warn!(
                     pane = pane_id.raw(),
                     terminal = %terminal_id,
@@ -321,11 +410,19 @@ impl App {
                     cwd = %cwd.display(),
                     "skipping deferred agent resume: the reported resume command's directory changed and no saved session id names the session"
                 );
-                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.pending_agent_resume_plan = None;
-                    terminal.restore_error = Some("The saved resume command belongs to a directory that is no longer available. Restore the directory and restart this session.".into());
-                    terminal.revision = terminal.revision.saturating_add(1);
-                }
+                self.fail_pending_agent_resume(&terminal_id, "The saved resume command belongs to a directory that is no longer available. Restore the directory and restart this session.".into());
+                return true;
+            }
+            Err((plan, DeferredResumeRefusal::DirReplaced(resolved))) => {
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    reserved_dir = ?reserved_dir,
+                    resolved = %resolved.display(),
+                    "skipping deferred agent resume: the reported resume command's directory now resolves to another directory"
+                );
+                self.fail_pending_agent_resume(&terminal_id, format!("The saved resume command's directory now leads to {}, not the directory it was saved in. Restore the directory and restart this session.", resolved.display()));
                 return true;
             }
         };
@@ -356,11 +453,11 @@ impl App {
         };
 
         if !cwd.is_dir() {
-            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                terminal.pending_agent_resume_plan = None;
-                terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());
-                terminal.revision = terminal.revision.saturating_add(1);
-            }
+            self.fail_pending_agent_resume(
+                &terminal_id,
+                "Saved directory is unavailable. Restore the directory and restart this session."
+                    .into(),
+            );
             return true;
         }
 
@@ -396,18 +493,17 @@ impl App {
                         holder_pid = holder.pid,
                         "skipping agent resume: session is already open in another running Claude process"
                     );
-                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                        terminal.pending_agent_resume_plan = None;
-                        terminal.restore_error = Some(format!(
+                    self.fail_pending_agent_resume(
+                        &terminal_id,
+                        format!(
                             "This conversation is already open in another running Claude session (pid {}{}). Close it and restart this session.",
                             holder.pid,
                             holder
                                 .cwd
                                 .map(|cwd| format!(", {cwd}"))
                                 .unwrap_or_default(),
-                        ));
-                        terminal.revision = terminal.revision.saturating_add(1);
-                    }
+                        ),
+                    );
                     return true;
                 }
             }
@@ -436,18 +532,17 @@ impl App {
                     err = %err,
                     "failed to start shell for deferred agent resume"
                 );
-                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.pending_agent_resume_plan = None;
-                    terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
-                    terminal.revision = terminal.revision.saturating_add(1);
-                }
+                self.fail_pending_agent_resume(
+                    &terminal_id,
+                    format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."),
+                );
                 return true;
             }
         };
 
         let mut input = resume_command;
         input.push('\r');
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
+        if let Err(err) = send_agent_resume_command(&runtime, Bytes::from(input)) {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -460,12 +555,123 @@ impl App {
         }
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        self.yielded_agent_resumes.remove(&plan.dedupe_key);
+        self.started_agent_resume_keys.insert(plan.dedupe_key);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
         }
         true
     }
+
+    /// herdr-3cr r4: `terminal_id`'s pending plan ends without starting, with
+    /// `error` shown in its pane. Its dedupe key is released, so a plan that
+    /// yielded the same session to it gets its turn.
+    fn fail_pending_agent_resume(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        error: String,
+    ) {
+        let Some(terminal) = self.state.terminals.get_mut(terminal_id) else {
+            return;
+        };
+        let plan = terminal.pending_agent_resume_plan.take();
+        terminal.restore_error = Some(error);
+        terminal.revision = terminal.revision.saturating_add(1);
+        if let Some(plan) = plan {
+            self.release_agent_resume_key(&plan.dedupe_key);
+        }
+    }
+
+    /// herdr-3cr r4 (codex h3cr-r3fix finding 1): once no started resume and
+    /// no pending plan holds `key` any more, the plans that yielded to it are
+    /// pending again, in a pane that is still waiting with the error the
+    /// yield left. The next launch pass decides them as before.
+    fn release_agent_resume_key(&mut self, key: &str) {
+        if self.started_agent_resume_keys.contains(key)
+            || self.state.terminals.values().any(|terminal| {
+                terminal
+                    .pending_agent_resume_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.dedupe_key == key)
+            })
+        {
+            return;
+        }
+        let Some(yielded) = self.yielded_agent_resumes.remove(key) else {
+            return;
+        };
+        for yielded in yielded {
+            if self.terminal_runtimes.get(&yielded.terminal_id).is_some() {
+                continue;
+            }
+            let Some(terminal) = self.state.terminals.get_mut(&yielded.terminal_id) else {
+                continue;
+            };
+            if terminal.pending_agent_resume_plan.is_some()
+                || terminal.restore_error.as_deref() != Some(yielded.yield_error.as_str())
+            {
+                continue;
+            }
+            tracing::info!(
+                terminal = %yielded.terminal_id,
+                agent = %yielded.plan.agent,
+                "deferred agent resume is pending again: the pane it yielded its session to failed to start"
+            );
+            terminal.pending_agent_resume_plan = Some(yielded.plan);
+            terminal.restore_error = yielded.restore_error;
+            terminal.revision = terminal.revision.saturating_add(1);
+        }
+    }
+
+    /// herdr-3cr r5 (codex h3cr-r4fix P2): releases every parked key whose
+    /// pending owner is gone. A pending owner can also end without starting
+    /// by being removed - its pane closed, or its pane died after a failed
+    /// enqueue - and that drops its plan with its terminal, past
+    /// `fail_pending_agent_resume`. `release_agent_resume_key` keeps a key
+    /// that a started resume or a still-pending plan holds, so a live owner
+    /// is never overtaken.
+    pub(crate) fn release_orphaned_agent_resume_keys(&mut self) {
+        if self.yielded_agent_resumes.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self.yielded_agent_resumes.keys().cloned().collect();
+        for key in keys {
+            self.release_agent_resume_key(&key);
+        }
+    }
+
+    /// herdr-3cr r3: whether `key` is already resumed by a deferred launch,
+    /// or still pending as another terminal's plan.
+    fn agent_resume_key_taken(&self, terminal_id: &crate::terminal::TerminalId, key: &str) -> bool {
+        self.started_agent_resume_keys.contains(key)
+            || self.state.terminals.iter().any(|(id, terminal)| {
+                id != terminal_id
+                    && terminal
+                        .pending_agent_resume_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.dedupe_key == key)
+            })
+    }
+}
+
+/// herdr-3cr r5: types the deferred resume command into the fresh shell.
+/// Tests can make the enqueue fail, the exit codex h3cr-r4fix traced to a
+/// stranded fallback once the pane then dies.
+fn send_agent_resume_command(
+    runtime: &crate::terminal::TerminalRuntime,
+    input: Bytes,
+) -> Result<(), tokio::sync::mpsc::error::TrySendError<Bytes>> {
+    #[cfg(test)]
+    if FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.get()) {
+        return Err(tokio::sync::mpsc::error::TrySendError::Closed(input));
+    }
+    runtime.try_send_bytes(input)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AGENT_RESUME_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn derived_pending_agent_resume_pane_infos(
@@ -1138,6 +1344,555 @@ mod tests {
     impl Drop for NrrLaunchRecorder {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    // herdr-3cr (codex h3cr-r1 P2-4, r3 h3cr-r2b P2-1/P2-4): restore reserves
+    // a reported command for the directory it names, whatever spelling the
+    // report used; the deferred launch keeps the reported command and runs
+    // it in that reserved directory, and only falls back to the saved id
+    // once the reserved directory itself is gone.
+    #[cfg(unix)]
+    #[test]
+    fn agent_restore_3cr_deferred_launch_accepts_an_alias_of_the_reserved_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-3cr-launch-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = root.join("project");
+        let other = root.join("other");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let link = root.join("project-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let reported = crate::agent_resume::ReportedAgentResume {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
+        };
+        let mut terminal =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), real.clone());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("codex-3cr").unwrap(),
+            cwd: Some(link.display().to_string()),
+        });
+
+        let plan = reported.plan(&link);
+        let real_identity = real.canonicalize().unwrap();
+        // herdr-3cr r3: the launch spawns in the reserved directory, whatever
+        // directory the caller proposed.
+        for launch in [real.clone(), link.clone(), real.join("."), other.clone()] {
+            let (resolved, cwd) = deferred_resume_launch(&terminal, plan.clone(), launch.clone())
+                .expect("the reserved dir exists, so the plan is kept");
+            assert_eq!(
+                resolved.argv,
+                reported.argv,
+                "launch proposed in {} keeps the reported command",
+                launch.display()
+            );
+            assert_eq!(cwd, real_identity, "the spawn runs in the reserved dir");
+        }
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&real).unwrap();
+        let (resolved, cwd) = deferred_resume_launch(&terminal, plan, other.clone())
+            .expect("the saved id still names a session");
+        assert_ne!(
+            resolved.argv, reported.argv,
+            "with the reserved dir gone the reported command never runs"
+        );
+        assert_eq!(cwd, other);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // herdr-3cr r3: a codex `resume --last` reported command, the shape the
+    // h3cr-r2b findings use (a command that names no session of its own).
+    #[cfg(unix)]
+    fn r3_codex_reported() -> crate::agent_resume::ReportedAgentResume {
+        crate::agent_resume::ReportedAgentResume {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "--last".into()],
+        }
+    }
+
+    #[cfg(unix)]
+    fn r3_codex_session(
+        id: &str,
+        agent_cwd: &std::path::Path,
+    ) -> crate::agent_resume::PersistedAgentSession {
+        crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id(id).unwrap(),
+            cwd: Some(agent_cwd.display().to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn r3_codex_app(
+        label: &str,
+        terminals: usize,
+        recorder: &NrrLaunchRecorder,
+    ) -> (App, Vec<crate::terminal::TerminalId>) {
+        let mut app = test_app();
+        app.state.workspaces = (0..terminals)
+            .map(|_| crate::workspace::Workspace::test_new(label))
+            .collect();
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state
+            .agent_launchers
+            .insert("codex".into(), recorder.launcher.clone());
+        let terminal_ids = app
+            .state
+            .workspaces
+            .iter()
+            .map(|ws| ws.terminal_id(ws.tabs[0].root_pane).unwrap().clone())
+            .collect();
+        (app, terminal_ids)
+    }
+
+    // herdr-3cr r3 (codex h3cr-r2b P2-1): restore reserved the reported
+    // command for the canonical directory behind the alias `/link`. `/link`
+    // is removed before the deferred launch while the directory it named is
+    // still there. The launch must run in the reserved directory itself;
+    // re-resolving the alias at launch dropped the only usable restore.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r3_removed_alias_still_launches_in_the_reserved_dir() {
+        let recorder = NrrLaunchRecorder::new("3cr-r3-f1");
+        let real = recorder.dir("real");
+        let link = recorder.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r3-f1", 1, &recorder);
+        let terminal_id = &terminal_ids[0];
+        let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+        terminal.cwd = link.clone();
+        terminal.persisted_agent_session = None;
+        terminal.pending_agent_resume_plan = Some(r3_codex_reported().plan(&link));
+
+        std::fs::remove_file(&link).unwrap();
+        app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+        assert!(
+            app.terminal_runtimes.get(terminal_id).is_some(),
+            "the reserved directory still exists, so the resume must start, got: {:?}",
+            app.state.terminals[terminal_id].restore_error
+        );
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(launches, vec![format!("{}|resume --last", real.display())]);
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r3 (codex h3cr-r2b P2-4): the alias `/link` named X when the
+    // reservation was made and is retargeted to Y before the launch. The
+    // spawn must receive the reserved directory X, not the alias path, so
+    // the command can never run in a directory nobody reserved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r3_spawn_runs_in_the_reserved_dir_not_the_alias() {
+        let recorder = NrrLaunchRecorder::new("3cr-r3-f4");
+        let real = recorder.dir("real");
+        let other = recorder.dir("other");
+        let link = recorder.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r3-f4", 1, &recorder);
+        let terminal_id = &terminal_ids[0];
+        let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+        terminal.cwd = other.clone();
+        terminal.persisted_agent_session = Some(r3_codex_session("codex-3cr-f4", &link));
+        terminal.pending_agent_resume_plan = Some(r3_codex_reported().plan(&link));
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+        assert!(app.terminal_runtimes.get(terminal_id).is_some());
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!("{}|resume --last", real.display())],
+            "the reported command runs in the directory it reserved"
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r3 (codex h3cr-r2b P2-3): two codex panes persist the same
+    // session S and report `codex resume --last` from different agent dirs
+    // X and Y, so restore keeps both plans. X and Y vanish before the
+    // launch and both fall back to the native plan `codex resume S`. Only
+    // one of them may resume S; the other gets a restore error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r3_native_fallbacks_dedupe_on_the_session() {
+        let recorder = NrrLaunchRecorder::new("3cr-r3-f3");
+        let agent_dirs = [recorder.dir("agent-x"), recorder.dir("agent-y")];
+        let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r3-f3", 2, &recorder);
+        for ((terminal_id, agent_dir), pane_dir) in
+            terminal_ids.iter().zip(&agent_dirs).zip(&pane_dirs)
+        {
+            let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+            terminal.cwd = pane_dir.clone();
+            terminal.persisted_agent_session =
+                Some(r3_codex_session("codex-3cr-shared", agent_dir));
+            terminal.pending_agent_resume_plan = Some(r3_codex_reported().plan(agent_dir));
+        }
+        for agent_dir in &agent_dirs {
+            std::fs::remove_dir_all(agent_dir).unwrap();
+        }
+        for terminal_id in &terminal_ids {
+            app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+        }
+
+        let _ = recorder.wait_for_launches(1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!(
+                "{}|resume codex-3cr-shared",
+                pane_dirs[0].display()
+            )],
+            "session S is resumed once"
+        );
+        assert!(app.terminal_runtimes.get(&terminal_ids[1]).is_none());
+        let second = &app.state.terminals[&terminal_ids[1]];
+        assert!(second.pending_agent_resume_plan.is_none());
+        assert!(second.restore_error.is_some());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r3 (codex h3cr-r2b P2-3): a fallback must also yield to a
+    // pane whose own pending plan is the native resume of the same session,
+    // whatever the launch order.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r3_native_fallback_yields_to_a_pending_native_plan() {
+        let recorder = NrrLaunchRecorder::new("3cr-r3-f3b");
+        let agent_dir = recorder.dir("agent-x");
+        let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r3-f3b", 2, &recorder);
+        let session = r3_codex_session("codex-3cr-native", &agent_dir);
+        let native =
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                .unwrap();
+        let first = app.state.terminals.get_mut(&terminal_ids[0]).unwrap();
+        first.cwd = pane_dirs[0].clone();
+        first.persisted_agent_session = Some(session.clone());
+        first.pending_agent_resume_plan = Some(r3_codex_reported().plan(&agent_dir));
+        let second = app.state.terminals.get_mut(&terminal_ids[1]).unwrap();
+        second.cwd = pane_dirs[1].clone();
+        second.persisted_agent_session = Some(session.clone());
+        second.pending_agent_resume_plan = Some(native);
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_none());
+        assert!(app.state.terminals[&terminal_ids[0]]
+            .restore_error
+            .is_some());
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[1], 24, 80, true);
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!(
+                "{}|resume codex-3cr-native",
+                pane_dirs[1].display()
+            )]
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r4 (codex h3cr-r3fix finding 1): pane A holds the reported
+    // command for agent dir X and saved session S; pane B holds the native
+    // plan of S. X is gone, and so is B's only directory. B can never resume
+    // S, so S must still be resumed once, by A's native fallback, in either
+    // launch order. A pane that yielded to B gets its plan back when B
+    // fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r4_failed_pending_owner_releases_the_session() {
+        for a_first in [true, false] {
+            let recorder = NrrLaunchRecorder::new("3cr-r4-f1");
+            let agent_dir = recorder.dir("agent-x");
+            let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+            let (mut app, terminal_ids) = r3_codex_app("3cr-r4-f1", 2, &recorder);
+            let session = r3_codex_session("codex-3cr-r4-f1", &agent_dir);
+            let native =
+                crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                    .unwrap();
+            let first = app.state.terminals.get_mut(&terminal_ids[0]).unwrap();
+            first.cwd = pane_dirs[0].clone();
+            first.persisted_agent_session = Some(session.clone());
+            first.pending_agent_resume_plan = Some(r3_codex_reported().plan(&agent_dir));
+            let second = app.state.terminals.get_mut(&terminal_ids[1]).unwrap();
+            second.cwd = pane_dirs[1].clone();
+            second.persisted_agent_session = Some(session.clone());
+            second.pending_agent_resume_plan = Some(native);
+
+            std::fs::remove_dir_all(&agent_dir).unwrap();
+            std::fs::remove_dir_all(&pane_dirs[1]).unwrap();
+            let order = if a_first {
+                [&terminal_ids[0], &terminal_ids[1], &terminal_ids[0]]
+            } else {
+                [&terminal_ids[1], &terminal_ids[0], &terminal_ids[0]]
+            };
+            for terminal_id in order {
+                app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+            }
+
+            assert!(
+                app.terminal_runtimes.get(&terminal_ids[0]).is_some(),
+                "a_first={a_first}: A must resume S once B failed, got: {:?}",
+                app.state.terminals[&terminal_ids[0]].restore_error
+            );
+            assert!(app.state.terminals[&terminal_ids[0]]
+                .restore_error
+                .is_none());
+            assert!(app.terminal_runtimes.get(&terminal_ids[1]).is_none());
+            assert!(app.state.terminals[&terminal_ids[1]]
+                .restore_error
+                .is_some());
+            let launches = recorder.wait_for_launches(1).await;
+            assert_eq!(
+                launches,
+                vec![format!("{}|resume codex-3cr-r4-f1", pane_dirs[0].display())],
+                "a_first={a_first}: session S is resumed once, by A"
+            );
+
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+        }
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2): the r4 setup with every directory
+    // but X intact. A launches first: X is gone, so A's native fallback
+    // yields S to B's still-pending native plan and is parked under S.
+    #[cfg(unix)]
+    fn r5_parked_fallback_app(
+        label: &str,
+        recorder: &NrrLaunchRecorder,
+    ) -> (
+        App,
+        Vec<crate::terminal::TerminalId>,
+        [std::path::PathBuf; 2],
+    ) {
+        let agent_dir = recorder.dir("agent-x");
+        let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+        let (mut app, terminal_ids) = r3_codex_app(label, 2, recorder);
+        let session = r3_codex_session(&format!("codex-{label}"), &agent_dir);
+        let native =
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                .unwrap();
+        let first = app.state.terminals.get_mut(&terminal_ids[0]).unwrap();
+        first.cwd = pane_dirs[0].clone();
+        first.persisted_agent_session = Some(session.clone());
+        first.pending_agent_resume_plan = Some(r3_codex_reported().plan(&agent_dir));
+        let second = app.state.terminals.get_mut(&terminal_ids[1]).unwrap();
+        second.cwd = pane_dirs[1].clone();
+        second.persisted_agent_session = Some(session);
+        second.pending_agent_resume_plan = Some(native);
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_none());
+        let parked = &app.state.terminals[&terminal_ids[0]];
+        assert!(parked.pending_agent_resume_plan.is_none());
+        assert!(parked.restore_error.is_some());
+        (app, terminal_ids, pane_dirs)
+    }
+
+    // A, parked behind B, must resume S once B is gone without starting.
+    #[cfg(unix)]
+    async fn r5_assert_parked_fallback_resumes(
+        app: &mut App,
+        terminal_ids: &[crate::terminal::TerminalId],
+        pane_dirs: &[std::path::PathBuf; 2],
+        recorder: &NrrLaunchRecorder,
+        label: &str,
+    ) {
+        assert!(!app.state.terminals.contains_key(&terminal_ids[1]));
+        assert!(
+            app.state.terminals[&terminal_ids[0]]
+                .pending_agent_resume_plan
+                .is_some(),
+            "A's parked fallback must be pending again once B is gone"
+        );
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_some());
+        assert!(app.state.terminals[&terminal_ids[0]]
+            .restore_error
+            .is_none());
+        let _ = recorder.wait_for_launches(1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!("{}|resume codex-{label}", pane_dirs[0].display())],
+            "session S is resumed once, by A"
+        );
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2, terminal removal): pane B, the
+    // pending owner of S, is closed before it launches (the pane.close path:
+    // its workspace closes, `remove_unattached_terminal_ids` drops B's
+    // terminal, the runtimes are shut down). A's parked fallback is usable
+    // and must resume S.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r5_closed_pending_owner_releases_the_session() {
+        let label = "3cr-r5-close";
+        let recorder = NrrLaunchRecorder::new(label);
+        let (mut app, terminal_ids, pane_dirs) = r5_parked_fallback_app(label, &recorder);
+
+        app.state.selected = 1;
+        app.state.close_selected_workspace();
+        app.shutdown_detached_terminal_runtimes();
+
+        r5_assert_parked_fallback_resumes(&mut app, &terminal_ids, &pane_dirs, &recorder, label)
+            .await;
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2, enqueue failure): B's shell spawns
+    // but typing the resume command fails, so B keeps its plan for a retry.
+    // B's pane then dies before any retry. A's parked fallback must resume S.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r5_failed_enqueue_then_pane_died_releases_the_session() {
+        let label = "3cr-r5-enqueue";
+        let recorder = NrrLaunchRecorder::new(label);
+        let (mut app, terminal_ids, pane_dirs) = r5_parked_fallback_app(label, &recorder);
+        let pane_b = app.state.workspaces[1].tabs[0].root_pane;
+
+        super::FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.set(true));
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[1], 24, 80, true);
+        super::FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.set(false));
+        assert!(app.terminal_runtimes.get(&terminal_ids[1]).is_none());
+        assert!(
+            app.state.terminals[&terminal_ids[1]]
+                .pending_agent_resume_plan
+                .is_some(),
+            "a failed enqueue keeps B's plan for a retry"
+        );
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: pane_b,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+
+        r5_assert_parked_fallback_resumes(&mut app, &terminal_ids, &pane_dirs, &recorder, label)
+            .await;
+    }
+
+    // herdr-3cr r4 (codex h3cr-r3fix finding 1, missing ordering): pane B's
+    // native plan of S starts FIRST; pane A's reported dir X is gone, so its
+    // native fallback names S too and must be refused. Recording started
+    // keys only for fallbacks would let A resume S a second time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r4_native_first_blocks_a_later_fallback() {
+        let recorder = NrrLaunchRecorder::new("3cr-r4-nf");
+        let agent_dir = recorder.dir("agent-x");
+        let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r4-nf", 2, &recorder);
+        let session = r3_codex_session("codex-3cr-r4-nf", &agent_dir);
+        let native =
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                .unwrap();
+        let first = app.state.terminals.get_mut(&terminal_ids[0]).unwrap();
+        first.cwd = pane_dirs[0].clone();
+        first.persisted_agent_session = Some(session.clone());
+        first.pending_agent_resume_plan = Some(r3_codex_reported().plan(&agent_dir));
+        let second = app.state.terminals.get_mut(&terminal_ids[1]).unwrap();
+        second.cwd = pane_dirs[1].clone();
+        second.persisted_agent_session = Some(session.clone());
+        second.pending_agent_resume_plan = Some(native);
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[1], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[1]).is_some());
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_none());
+        let refused = &app.state.terminals[&terminal_ids[0]];
+        assert!(refused.pending_agent_resume_plan.is_none());
+        assert!(refused.restore_error.is_some());
+
+        let _ = recorder.wait_for_launches(1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!("{}|resume codex-3cr-r4-nf", pane_dirs[1].display())],
+            "session S is resumed once, by the native plan that started first"
+        );
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r4 (codex h3cr-r3fix finding 2): A reserved the canonical
+    // directory X through the alias `current`. Before the launch, X itself
+    // is renamed away and replaced by a symlink to Y. `X` still passes
+    // `is_dir()`, but it now resolves to Y: the reported command must be
+    // refused with a restore error, never spawned in Y.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r4_replaced_reserved_dir_is_refused() {
+        let recorder = NrrLaunchRecorder::new("3cr-r4-f2");
+        let real = recorder.dir("x");
+        let other = recorder.dir("y");
+        let current = recorder.root.join("current");
+        std::os::unix::fs::symlink(&real, &current).unwrap();
+        let (mut app, terminal_ids) = r3_codex_app("3cr-r4-f2", 1, &recorder);
+        let terminal_id = &terminal_ids[0];
+        let plan = r3_codex_reported().plan(&current);
+        assert_eq!(plan.launch_dir.as_deref(), Some(real.as_path()));
+        let terminal = app.state.terminals.get_mut(terminal_id).unwrap();
+        terminal.cwd = other.clone();
+        terminal.persisted_agent_session = Some(r3_codex_session("codex-3cr-r4-f2", &current));
+        terminal.pending_agent_resume_plan = Some(plan);
+
+        std::fs::rename(&real, recorder.root.join("x-old")).unwrap();
+        std::os::unix::fs::symlink(&other, &real).unwrap();
+        assert!(real.is_dir());
+        app.start_pending_agent_resume_for_terminal(terminal_id, 24, 80, true);
+
+        assert!(
+            app.terminal_runtimes.get(terminal_id).is_none(),
+            "the reserved directory now resolves to another directory"
+        );
+        let terminal = &app.state.terminals[terminal_id];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.restore_error.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(recorder.wait_for_launches(0).await.is_empty());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
         }
     }
 
