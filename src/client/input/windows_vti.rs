@@ -5507,4 +5507,122 @@ mod tests {
             "{events:?}"
         );
     }
+
+    /// The serialized records of `records`, then idle ticks to the end of
+    /// every hold, on the caller's translator.
+    fn serialized_records_on(
+        translator: &mut WindowsInputTranslator,
+        records: &[WindowsKeyRecord],
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in records.iter().copied() {
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex hvqok-r2 P2 (herdr-vqok r3, ADR-0013 amendment 5): serialized
+    /// Space down, raw `ESC [ M`, serialized Space up (staged), native
+    /// Space down (it interrupts the report), raw `ESC [ M`, serialized
+    /// Space repeat that gives the report its button byte, serialized Space
+    /// up, raw `d 2`. The native press reaches the pane after the staged
+    /// release of the first cycle, so the second cycle is the pane's and its
+    /// release reaches it. Before, the native press was noted before the
+    /// staged release was committed, the release erased it and the report
+    /// took the second release: Press, Release, Press, Mouse.
+    #[test]
+    fn review_vqok_r3_native_press_after_a_staged_release_keeps_its_release() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+            events.extend(translator.translate(record));
+        }
+        for record in win32_input_mode_encoded_record(space_up) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r2 P2 (herdr-vqok r3): raw `ESC [ M`, serialized Space
+    /// down (the button byte), raw `d 2`, then a native Space press and a
+    /// serialized Space release. The accepted report consumed the first
+    /// press; the native press starts the pane's cycle, so the release
+    /// reaches the pane. Before, the consumed-key entry survived the native
+    /// press and swallowed the release: Mouse, Press.
+    #[test]
+    fn review_vqok_r3_native_press_after_an_accepted_report_keeps_its_release() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "mouse".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r2 P2, the native release (herdr-vqok r3): as above with
+    /// a native Space release before the native press. It ends the cycle
+    /// the accepted report consumed, so it is dropped; the next cycle is the
+    /// pane's and keeps its release. Before, the native release bypassed
+    /// the consumed key and the consumed entry swallowed the second
+    /// release: Mouse, Release, Press.
+    #[test]
+    fn review_vqok_r3_native_release_of_a_consumed_cycle_is_dropped() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(translator.translate(WindowsInputRecord::Key(space_up)));
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "mouse".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
 }

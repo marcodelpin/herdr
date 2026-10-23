@@ -1839,6 +1839,22 @@ fn i6_release_cycles_align_sees_lost_and_swapped_releases() {
     assert!(release_cycles_align(&[r1], &[]));
 }
 
+/// codex hvqok-r2 P3 (herdr-vqok r3): `P1, R1, P2, R2` with identical
+/// presses and distinguishable releases; P1 reached the pane, the report
+/// consumed P2 (so its cycle's release R2 is consumed too). Output `P1, R2`
+/// lost R1 and leaked R2, but the round-2 search read the press as P2's.
+#[test]
+fn i6_release_cycles_align_holds_an_emitted_press_to_its_own_cycle() {
+    let p1 = key_record(0x20, 0x39, 0x20, 0);
+    let r1 = released(p1);
+    let r2 = released(key_record(0x20, 0x39, 0x20, LEFT_CTRL_PRESSED));
+    let input = [p1, r1, p1, r2];
+    assert!(!release_cycles_align(
+        &input,
+        &[(ClientKeyKind::Press, p1), (ClientKeyKind::Release, r2)]
+    ));
+}
+
 impl<'a> Harness<'a> {
     fn new(case: &'a Case, seed: u64) -> Self {
         let base = Instant::now();
