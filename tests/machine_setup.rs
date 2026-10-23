@@ -83,6 +83,11 @@ struct SetupOptions<'a> {
     selection: &'a [u8],
     explicit_session: Option<&'a str>,
     noninteractive: bool,
+    // Install from a small fixture file instead of the running debug binary. The
+    // default source is current_exe(), about 275 MB in a debug build; the fake ssh
+    // discards it, but reading and piping it all under full-suite I/O pressure kept
+    // the PTY silent past the 20 s watchdog (herdr-c6rh).
+    small_install_source: bool,
 }
 
 fn setup(installed: &str, answer: &str, handoff: bool) -> SetupResult {
@@ -186,6 +191,11 @@ fn setup_options(
         "HERDR_CONFIG_PATH",
     ] {
         command.env_remove(name);
+    }
+    if options.small_install_source {
+        let source = root.join("install-source");
+        fs::write(&source, "#!/bin/sh\nexit 0\n").unwrap();
+        command.env("HERDR_REMOTE_BINARY", &source);
     }
     if options.noninteractive {
         // A redirected stdin makes machine add non-interactive while retaining
@@ -504,7 +514,16 @@ fn machine_add_reports_strict_host_key_failure() {
 
 #[test]
 fn machine_setup_old_install_requires_one_explicit_stop_approval() {
-    let result = setup("old", "y\n", false);
+    let result = setup_options(
+        "old",
+        "y\n",
+        false,
+        false,
+        SetupOptions {
+            small_install_source: true,
+            ..SetupOptions::default()
+        },
+    );
     assert_eq!(result.prompts, 1, "{}", result.output);
     assert!(
         result
