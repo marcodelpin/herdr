@@ -5367,4 +5367,110 @@ mod tests {
             "{summary:?}"
         );
     }
+
+    /// The Space press record (vk 0x20, scan 0x39) of the herdr-vqok tests.
+    const VQOK_SPACE: WindowsKeyRecord = WindowsKeyRecord {
+        key_down: true,
+        repeat_count: 1,
+        virtual_key_code: 0x20,
+        virtual_scan_code: 0x39,
+        unicode: 0x20,
+        control_key_state: 0,
+    };
+
+    /// codex hvqok-r1 P2 (herdr-vqok r2): Space pressed on its own reaches
+    /// the pane; inside an X10 report its release is staged, then a second
+    /// Space press gives the report its button byte and is released, then
+    /// raw `d 2`. The staged release ends the press the pane saw, so the
+    /// second press starts a cycle the report owns whole: the pane sees
+    /// Press, Release, Mouse. Before, the second press consulted the pane
+    /// state from before the report, still held, and kept its release:
+    /// Press, Release, Release, Mouse.
+    #[test]
+    fn review_vqok_r2_cycle_after_a_staged_release_goes_with_the_report() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[space_up, VQOK_SPACE, space_up],
+            3,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok r2, the same burst with the second release after raw
+    /// `d 2`: the accepted report consumed the second press, so it consumes
+    /// that release too. Before, it escaped: Press, Release, Mouse, Release.
+    #[test]
+    fn review_vqok_r2_release_after_report_end_of_a_cycle_the_report_owned_is_consumed() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[space_up, VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r1 P2 (herdr-vqok r2): a native console Space press
+    /// reaches the pane, then raw `ESC [ M`, a serialized Space repeat that
+    /// gives the report its button byte, its serialized release, raw `d 2`.
+    /// The release ends the press the pane saw natively, so it reaches the
+    /// pane. Before, a native press was not tracked as held by the pane,
+    /// the repeat owned the release and the pane kept Space down: Press,
+    /// Mouse.
+    #[test]
+    fn review_vqok_r2_release_of_a_key_pressed_natively_survives_the_report() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = translator.translate(WindowsInputRecord::Key(VQOK_SPACE));
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
 }
