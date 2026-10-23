@@ -48,7 +48,10 @@
 //!   pending;
 //! - I5 a pump idle drops bytes only once the newest pending byte is
 //!   `PUMP_IDLE_QUIET` old, or at a named deadline, and the oracle allows a
-//!   drop after a cut only when the cut was quiet.
+//!   drop after a cut only when the cut was quiet;
+//! - I6 on the pump a console key reported released was reported pressed,
+//!   and one reported pressed whose last input record is a release is
+//!   reported released (herdr-vqok).
 
 use super::*;
 use crate::client::PumpUnderTest;
@@ -78,6 +81,8 @@ const SHIFT_PRESS: WindowsKeyRecord = key_record(0x10, 0x2a, 0, SHIFT_PRESSED);
 const EXTENDED_SALT: u64 = 0x00e7_0000_0000;
 /// Mixed into the seed of the silent-record draws of an X10 report.
 const SILENT_SALT: u64 = 0x0051_1e00_0000_0000;
+/// Mixed into the seed of the byte-free repeat draws of an X10 report.
+const REPEAT_SALT: u64 = 0x00e9_ea70_0000_0000;
 
 // The ADR bounds table, restated so the oracle does not read the framer's
 // own deadlines (`oracle_bounds_match_the_adr` ties them together).
@@ -591,7 +596,11 @@ fn silent_record(rng: &mut Rng) -> WindowsKeyRecord {
 /// the pane once, in order (ADR-0013 D4). One time in two a record that
 /// types no character (an arrow, sometimes repeated) is staged before one
 /// of the payload records: the report takes none of its bytes, so it
-/// reaches the pane either way (ADR-0013 amendment 3, D4).
+/// reaches the pane either way (ADR-0013 amendment 3, D4). When the button
+/// key is Space and the silent record comes after it, that record is
+/// sometimes a Ctrl+Space press of the same key with no bytes, released
+/// before or after the report ends: its release goes with it, never with
+/// the report (herdr-vqok; ADR-0013 amendment 4).
 fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let first_gap = gap(rng);
     case.push_raw(&[(first_gap, b"\x1b[M")], Kind::X10);
@@ -602,12 +611,17 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     // The silent record draws from its own generator, seeded from the case
     // so far, so the cases of every stream stay the ones the earlier rounds
     // measured.
-    let mut side = Rng(case
+    let side_seed = case
         .input
         .iter()
         .fold(SILENT_SALT ^ case.reads.len() as u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-        }));
+        });
+    let mut side = Rng(side_seed);
+    // Its own generator too, so the cases without a repeat stay the same.
+    let mut repeat = Rng(side_seed ^ REPEAT_SALT);
+    let mut button = None;
+    let mut late_release = None;
     let silent = if side.chance(1, 2) {
         let at = side.below(3) as usize;
         let record = silent_record(&mut side);
@@ -619,9 +633,23 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let mut kept = Vec::new();
     for index in 0..3 {
         if let Some((_, record)) = silent.filter(|(at, _)| *at == index) {
+            let byte_free_repeat = button
+                .filter(|button: &WindowsKeyRecord| button.virtual_key_code == 0x20)
+                .is_some()
+                && repeat.chance(3, 4);
+            let record = if byte_free_repeat {
+                WindowsKeyRecord {
+                    repeat_count: record.repeat_count,
+                    ..key_record(0x20, 0x39, 0, LEFT_CTRL_PRESSED)
+                }
+            } else {
+                record
+            };
             case.push_nested(record_gap(&mut side), record);
             if side.chance(1, 3) {
                 case.push_nested(side.range(0, 5), released(record));
+            } else if byte_free_repeat && repeat.chance(3, 4) {
+                late_release = Some(released(record));
             }
             keys.push(nested_keys(record));
             kept.push(nested_keys(record));
@@ -637,10 +665,16 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
             }
         };
         case.push_nested(record_gap(rng), record);
+        if index == 0 {
+            button = Some(record);
+        }
         if rng.chance(1, 3) {
             case.push_nested(rng.range(0, 5), released(record));
         }
         keys.push(nested_keys(record));
+    }
+    if let Some(record) = late_release {
+        case.push_nested(repeat.range(0, 5), record);
     }
     case.expected.push(Unit {
         bytes: keys.concat(),
@@ -1532,7 +1566,8 @@ fn decode(driver: Driver, chunks: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 /// What a pump event typed, in the notation of the expectations: the
 /// native record stands as `SEMANTIC`, the key of a nested record as
-/// `NESTED` and its character. Releases of console keys are not checked.
+/// `NESTED` and its character. Releases of console keys are left out of
+/// this stream; I6 (`Harness::observe_releases`) pairs them with presses.
 fn pump_event_bytes(event: &ClientInputEvent) -> Option<Vec<u8>> {
     match event {
         ClientInputEvent::Key {
@@ -1669,6 +1704,9 @@ struct Harness<'a> {
     /// earlier when a semantic key came while a lone ESC was pending (the
     /// pump's host-reply Escape rule).
     default_window_end: u64,
+    /// The console keys (virtual key, scan code) the pump reported pressed
+    /// and not yet released (I6).
+    held_keys: Vec<(u16, u16)>,
 }
 
 impl<'a> Harness<'a> {
@@ -1706,6 +1744,7 @@ impl<'a> Harness<'a> {
             },
             rng: Rng(seed),
             default_window_end: DEFAULT_COLOR_WINDOW,
+            held_keys: Vec::new(),
         };
         let config = case.config;
         let framer = harness.byte_framer_mut();
@@ -1867,6 +1906,7 @@ impl<'a> Harness<'a> {
         } else {
             "after an idle tick"
         };
+        self.observe_releases(&events)?;
         self.settle(what, pump_events(&events))
     }
 
@@ -1980,6 +2020,7 @@ impl<'a> Harness<'a> {
                 ));
             }
         }
+        self.observe_releases(&events)?;
         self.settle("after a key record", pump_events(&events))
     }
 
@@ -1993,9 +2034,74 @@ impl<'a> Harness<'a> {
         )
     }
 
+    /// I6: a console key the pump reports released was reported pressed
+    /// (no release without its press), keyed by virtual key and scan code.
+    fn observe_releases(&mut self, events: &[ClientInputEvent]) -> Result<(), String> {
+        for event in events {
+            let ClientInputEvent::Key {
+                kind,
+                source: ClientKeySource::WindowsConsole { record },
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let key = (record.virtual_key_code, record.virtual_scan_code);
+            let held = self.held_keys.iter().position(|held| *held == key);
+            match (kind, held) {
+                (ClientKeyKind::Release, Some(index)) => {
+                    self.held_keys.remove(index);
+                }
+                (ClientKeyKind::Release, None) => {
+                    return Err(format!(
+                        "I6: release of key {key:?} with no press reported at {} ms",
+                        self.now
+                    ));
+                }
+                (_, None) => self.held_keys.push(key),
+                (_, Some(_)) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// I6: a console key the pump reported pressed whose last input record
+    /// is a release ends released (no press without its release).
+    fn check_releases(&self) -> Result<(), String> {
+        for key in &self.held_keys {
+            let last = self.case.reads.iter().rev().find_map(|read| {
+                read.nested
+                    .filter(|record| (record.virtual_key_code, record.virtual_scan_code) == *key)
+            });
+            if last.is_some_and(|record| !record.key_down) {
+                let records: Vec<String> = self
+                    .case
+                    .reads
+                    .iter()
+                    .filter_map(|read| read.nested)
+                    .filter(|record| (record.virtual_key_code, record.virtual_scan_code) == *key)
+                    .map(|record| {
+                        format!(
+                            "{}{:#x}x{}",
+                            if record.key_down { "down " } else { "up " },
+                            record.unicode,
+                            record.repeat_count
+                        )
+                    })
+                    .collect();
+                return Err(format!(
+                    "I6: key {key:?} reported pressed, released in the input, never reported released; its records {records:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn finish(&self) -> Result<(), String> {
         if self.byte_framer().has_pending_input() || self.filter_pending() {
             Err(self.stranded())
+        } else if self.pump.is_some() {
+            self.check_releases()
         } else {
             Ok(())
         }
@@ -2105,6 +2211,7 @@ impl<'a> Harness<'a> {
                     return Err("no pump".to_string());
                 };
                 let events = pump.bytes(&raw);
+                self.observe_releases(&events)?;
                 self.settle("after a read", pump_events(&events))?;
                 if self.rng.chance(1, 4) {
                     self.flush(true)?;
@@ -2731,10 +2838,26 @@ struct ExtendedCoverage {
     staged_report_keys: usize,
     standalone_keys: usize,
     staged_silent_keys: usize,
+    /// herdr-vqok: byte-free Ctrl+Space repeats of a Space button record,
+    /// and their releases.
+    byte_free_repeats: usize,
+    byte_free_repeat_releases: usize,
 }
 
 impl ExtendedCoverage {
     fn count(&mut self, case: &Case) {
+        for record in case.reads.iter().filter_map(|read| read.nested) {
+            if record.virtual_key_code == 0x20
+                && record.unicode == 0
+                && record.control_key_state == LEFT_CTRL_PRESSED
+            {
+                if record.key_down {
+                    self.byte_free_repeats += 1;
+                } else {
+                    self.byte_free_repeat_releases += 1;
+                }
+            }
+        }
         self.staged_silent_keys += case
             .reads
             .iter()
@@ -2834,6 +2957,8 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_report_keys,
         standalone_keys,
         staged_silent_keys,
+        byte_free_repeats,
+        byte_free_repeat_releases,
     } = extended;
     for count in [
         unterminated_colors,
@@ -2845,6 +2970,9 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_silent_keys,
     ] {
         assert!(count > 1_000, "{extended:?}");
+    }
+    for count in [byte_free_repeats, byte_free_repeat_releases] {
+        assert!(count > 100, "{extended:?}");
     }
 }
 

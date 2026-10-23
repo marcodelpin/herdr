@@ -5130,4 +5130,182 @@ mod tests {
             "{events:?}"
         );
     }
+
+    /// Each event as kind, key and modifiers (`mouse` for a Mouse event),
+    /// releases included.
+    fn event_summary_with_kinds(events: &[crate::protocol::ClientInputEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                crate::protocol::ClientInputEvent::Key {
+                    code,
+                    modifiers,
+                    kind,
+                    ..
+                } => format!("{kind:?} {code:?} mods {modifiers}"),
+                crate::protocol::ClientInputEvent::Mouse { .. } => "mouse".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Raw `ESC [ M`, then the given serialized key records, raw `d 2` after
+    /// the first `before_d2` of them, the rest, then idle ticks to the end
+    /// of every hold.
+    fn x10_report_with_d2_after(
+        records: &[WindowsKeyRecord],
+        before_d2: usize,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut translator = WindowsInputTranslator::default();
+        x10_report_with_d2_after_on(&mut translator, records, before_d2)
+    }
+
+    /// `x10_report_with_d2_after` on the caller's translator.
+    fn x10_report_with_d2_after_on(
+        translator: &mut WindowsInputTranslator,
+        records: &[WindowsKeyRecord],
+        before_d2: usize,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+            events.extend(translator.translate(record));
+        }
+        for (index, record) in records.iter().copied().enumerate() {
+            if index == before_d2 {
+                for record in win32_input_mode_encoded_raw_bytes(b"d2") {
+                    events.extend(translator.translate(record));
+                }
+            }
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        if before_d2 >= records.len() {
+            for record in win32_input_mode_encoded_raw_bytes(b"d2") {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex f5251-r8fix (herdr-vqok): a release belongs to the press it
+    /// ends, the latest press of its key. Raw `ESC [ M`, a Space press that
+    /// gives the report its button byte, a Ctrl+Space press of the same
+    /// held key with no bytes, its release, raw `d 2`. The report takes
+    /// Space; Ctrl+Space, which gave it nothing, reaches the pane pressed
+    /// and released. Before, the release matched Space's entry by virtual
+    /// key and scan code and went with the report: a press with no release.
+    #[test]
+    fn review_vqok_release_of_byte_free_repeat_before_report_end_survives() {
+        let space = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x20,
+            virtual_scan_code: 0x39,
+            unicode: 0x20,
+            control_key_state: 0,
+        };
+        let ctrl_space = WindowsKeyRecord {
+            unicode: 0,
+            control_key_state: 0x0008,
+            ..space
+        };
+        let ctrl_space_up = WindowsKeyRecord {
+            key_down: false,
+            ..ctrl_space
+        };
+        let events = x10_report_with_d2_after(&[space, ctrl_space, ctrl_space_up], 3);
+        let ctrl = crossterm::event::KeyModifiers::CONTROL.bits();
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                format!("Press Char(' ') mods {ctrl}"),
+                format!("Release Char(' ') mods {ctrl}"),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok, the release after the report: the same burst with raw
+    /// `d 2` before the Ctrl+Space release. The accepted report consumes
+    /// Space's press only; the later release ends Ctrl+Space, which reached
+    /// the pane, so it reaches the pane too. Before, Space's stale entry
+    /// moved to the consumed keys and the release was dropped there.
+    #[test]
+    fn review_vqok_release_of_byte_free_repeat_after_report_end_survives() {
+        let space = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x20,
+            virtual_scan_code: 0x39,
+            unicode: 0x20,
+            control_key_state: 0,
+        };
+        let ctrl_space = WindowsKeyRecord {
+            unicode: 0,
+            control_key_state: 0x0008,
+            ..space
+        };
+        let ctrl_space_up = WindowsKeyRecord {
+            key_down: false,
+            ..ctrl_space
+        };
+        let events = x10_report_with_d2_after(&[space, ctrl_space, ctrl_space_up], 2);
+        let ctrl = crossterm::event::KeyModifiers::CONTROL.bits();
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                format!("Press Char(' ') mods {ctrl}"),
+                "mouse".to_string(),
+                format!("Release Char(' ') mods {ctrl}"),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok, found by property I6: a held key whose first press
+    /// reached the pane (typed on its own) and whose repeat press gives an
+    /// X10 report its button byte. Its one release ends the press the pane
+    /// saw, so it reaches the pane; before, the report took it with the
+    /// repeat and the pane kept the key down.
+    #[test]
+    fn review_vqok_release_of_key_the_pane_saw_pressed_survives_the_report() {
+        let hash = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x33,
+            virtual_scan_code: 0x04,
+            unicode: u16::from(b'#'),
+            control_key_state: 0x0010,
+        };
+        let hash_up = WindowsKeyRecord {
+            key_down: false,
+            ..hash
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(hash) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[hash, hash_up],
+            2,
+        ));
+        let summary = event_summary_with_kinds(&events);
+        let releases = summary
+            .iter()
+            .filter(|entry| entry.starts_with("Release"))
+            .count();
+        assert_eq!(releases, 1, "{summary:?}: {events:?}");
+        assert_eq!(
+            summary.last().map(String::as_str),
+            Some("mouse"),
+            "{summary:?}"
+        );
+    }
 }
