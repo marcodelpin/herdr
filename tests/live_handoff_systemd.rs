@@ -233,8 +233,8 @@ fn shell_pid(api_socket: &Path, pane_id: &str) -> u32 {
     }
 }
 
-/// A workspace created now is saved only by the final save: the session save
-/// debounce is 5 s.
+/// A workspace created now reaches the disk by an autosave no sooner than the
+/// session save debounce (5 s), or by the final save.
 fn create_workspace(api_socket: &Path) -> (String, u32) {
     let created = request(
         api_socket,
@@ -858,56 +858,82 @@ fn a_unit_lead_without_notify_access_refuses_the_handoff() {
     fx.assert_panes_kept();
 }
 
+const SHUTDOWN_TRACE_ENV: &str = "HERDR_TEST_SHUTDOWN_TRACE";
+const FINAL_SAVE_STEP: &str = "final session save";
+const API_DRAIN_STEP: &str = "api shutdown drain";
+
 /// herdr-whd2 (ADR-0018 D4): the final session save is on disk before the api
 /// socket stops answering. `herdr server stop` returns then, and after a
 /// handoff systemd kills the main process right after it returns.
-#[test]
-fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
+///
+/// codex t6kr-r4fix P2: the order is read from the server's shutdown trace,
+/// written by the shutdown save itself and by the start of the api drain, so
+/// an ordinary autosave can neither stand in for the final save nor make a
+/// correct server fail. With `autosave_each`, the test waits until each
+/// workspace was autosaved before the next one is created (codex's scenario).
+fn assert_final_save_before_api_drain(workspaces: usize, autosave_each: bool) {
     let base = unique_test_dir();
     let _ = fs::remove_dir_all(&base);
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
-    let server = spawn_server(&config_home, &runtime_dir, &api_socket, &[]);
+    fs::create_dir_all(&base).unwrap();
+    let trace = base.join("shutdown-trace");
+    let trace_text = trace.display().to_string();
+    let server = spawn_server(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[(SHUTDOWN_TRACE_ENV, trace_text.as_str())],
+    );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let pid = server.child.process_id().expect("server pid");
-    // codex t6kr-r4 P2-6: an ordinary autosave (5 s after a change) may write
-    // the workspace first when this test is descheduled. That is no failure of
-    // the server: add workspaces until the newest one is not yet on disk, so
-    // only the final save can have written it.
-    let mut workspaces = 0;
-    loop {
+    for created in 1..=workspaces {
         create_workspace(&api_socket);
-        workspaces += 1;
-        if saved_workspace_count(&config_home) != Some(workspaces) {
-            break;
+        if autosave_each {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while saved_workspace_count(&config_home) != Some(created) {
+                assert!(
+                    Instant::now() < deadline,
+                    "workspace {created} was never autosaved"
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
         }
-        assert!(workspaces < 5, "every workspace was autosaved at once");
     }
 
     assert_ok(&request(&api_socket, stop_request()));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(&api_socket).is_ok() {
-        assert!(Instant::now() < deadline, "the api socket kept answering");
-        thread::sleep(Duration::from_millis(2));
-    }
-    // Freeze the server where `herdr server stop` returns.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGSTOP);
-    }
-    let saved = saved_workspace_count(&config_home);
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGCONT);
-    }
-    assert_eq!(
-        saved,
-        Some(workspaces),
-        "the final save must be on disk when the api socket stops answering"
-    );
     wait_gone(pid, Duration::from_secs(10), "the server");
+    let steps = fs::read_to_string(&trace).unwrap_or_default();
+    let steps: Vec<&str> = steps.lines().collect();
+    let final_save = steps.iter().position(|step| *step == FINAL_SAVE_STEP);
+    let api_drain = steps.iter().position(|step| *step == API_DRAIN_STEP);
+    assert!(
+        api_drain.is_some(),
+        "the api drain never ran: shutdown trace {steps:?}"
+    );
+    assert!(
+        final_save.is_some_and(|save| Some(save) < api_drain),
+        "the final save must be written before the api socket stops answering: shutdown trace {steps:?}"
+    );
+    assert_eq!(
+        saved_workspace_count(&config_home),
+        Some(workspaces),
+        "the final save must hold every workspace"
+    );
     drop(server);
     cleanup_test_base(&base);
+}
+
+#[test]
+fn the_final_session_save_lands_before_the_api_socket_stops_answering() {
+    assert_final_save_before_api_drain(3, false);
+}
+
+#[test]
+fn the_final_session_save_lands_before_the_api_socket_stops_answering_after_autosaves() {
+    assert_final_save_before_api_drain(5, true);
 }
 
 /// codex t6kr-r3 #2 (ADR-0018 D3), commit with an api stop: while the old

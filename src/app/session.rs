@@ -154,9 +154,13 @@ impl App {
     pub(crate) fn save_session_on_shutdown(&mut self) {
         if self.pane_exit_checkpoint_pending && !self.state.session_dirty {
             self.session_save_deadline = None;
+            crate::server::shutdown::trace_for_test("final session save: checkpoint current");
             return;
         }
-        self.save_session_now();
+        // Logged by the writer.
+        if self.try_save_session_now().is_ok() {
+            crate::server::shutdown::trace_for_test("final session save");
+        }
     }
 }
 

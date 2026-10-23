@@ -118,6 +118,7 @@ impl ApiShutdownControl {
     /// a later caller finds the work done, or waits for it, and never extends
     /// the bound counted from the first stop.
     pub(crate) fn drain_for_shutdown_by(&self, deadline: Instant) {
+        crate::server::shutdown::trace_for_test("api shutdown drain");
         let mut turn = self.drain.serialize_shutdown();
         let deadline = turn.deadline(deadline);
         announce_api_shutdown(&self.running, &self.drain);

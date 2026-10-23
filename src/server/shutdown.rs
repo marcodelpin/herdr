@@ -140,6 +140,27 @@ impl ServerStop {
     }
 }
 
+/// Test hook (codex t6kr-r4fix P2): names the file that [`trace_for_test`]
+/// appends shutdown steps to, so an integration test can read their order
+/// without depending on when an ordinary autosave runs.
+pub(crate) const TRACE_FOR_TEST_ENV_VAR: &str = "HERDR_TEST_SHUTDOWN_TRACE";
+
+/// Appends `step` as one line to the file named by [`TRACE_FOR_TEST_ENV_VAR`];
+/// does nothing when the variable is unset.
+pub(crate) fn trace_for_test(step: &str) {
+    let Some(path) = std::env::var_os(TRACE_FOR_TEST_ENV_VAR) else {
+        return;
+    };
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{step}\n").as_bytes()));
+    if let Err(err) = appended {
+        tracing::warn!(err = %err, step, "failed to append to the shutdown trace for a test");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
