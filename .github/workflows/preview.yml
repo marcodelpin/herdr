@@ -127,6 +127,7 @@ jobs:
           cache-bin: false
 
       - name: Prefetch Zig packages (fetch retried; never a build)
+        if: steps.plan.outputs.should_publish == 'true'
         uses: ./.github/actions/zig-fetch-retry
 
       - name: Run checks
