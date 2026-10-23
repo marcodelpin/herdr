@@ -368,12 +368,21 @@ struct WindowsInputPump {
     framer: crate::raw_input::RawInputFramer,
     pending_escape_origin: Option<EscapeOrigin>,
     paste_from_win32_key_records: bool,
-    pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
+    pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool, Provenance)>,
     default_mouse_candidate: DefaultMouseCandidate,
     /// The open press cycle of every key and who owns it: the one place a
     /// release learns where it goes (ADR-0013 amendment 5).
     key_cycles: KeyCycleLedger,
+    /// Test builds: the provenance of every console key event the pump
+    /// emitted, in emission order (property I6, herdr-vqok r5).
+    #[cfg(test)]
+    emitted_from: Vec<Provenance>,
 }
+
+/// The record a console key event came from: in test builds, its index in
+/// the ledger's fate log when the ledger tracks its key; always `None` in
+/// production (ADR-0013 amendment 6).
+type Provenance = Option<usize>;
 
 #[derive(Default)]
 struct DefaultMouseCandidate {
@@ -383,7 +392,7 @@ struct DefaultMouseCandidate {
     /// ones go with the report (consumed when it is accepted, replayed when
     /// it is not). A record that pushed no bytes (an arrow key) gives the
     /// report nothing (ADR-0013 amendment 3, D4; amendment 5).
-    events: Vec<(crate::protocol::ClientInputEvent, RecordFate)>,
+    events: Vec<(crate::protocol::ClientInputEvent, RecordFate, Provenance)>,
 }
 
 /// Who owns the open press cycle of a key: the presses since its last
@@ -426,6 +435,9 @@ struct KeyCycleLedger {
     /// `Staged` until its report ends (property I6 judges by these).
     #[cfg(test)]
     fates: Vec<(WindowsKeyRecord, RecordFate)>,
+    /// Test builds: the fate-log index of the record the last note logged.
+    #[cfg(test)]
+    noted: Option<usize>,
 }
 
 impl KeyCycleLedger {
@@ -434,6 +446,21 @@ impl KeyCycleLedger {
     fn key(record: WindowsKeyRecord) -> Option<(u16, u16)> {
         (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
             .then_some((record.virtual_key_code, record.virtual_scan_code))
+    }
+
+    /// Notes one record and returns its fate with its provenance, the index
+    /// the note gave it in the fate log (test builds, tracked keys only).
+    fn traced(&mut self, note: impl FnOnce(&mut Self) -> RecordFate) -> (RecordFate, Provenance) {
+        #[cfg(test)]
+        {
+            self.noted = None;
+            let fate = note(self);
+            (fate, self.noted.take())
+        }
+        #[cfg(not(test))]
+        {
+            (note(self), None)
+        }
     }
 
     fn owner(&self, record: WindowsKeyRecord) -> Option<CycleOwner> {
@@ -543,6 +570,7 @@ impl KeyCycleLedger {
 
     #[cfg(test)]
     fn log(&mut self, record: WindowsKeyRecord, fate: RecordFate) {
+        self.noted = Some(self.fates.len());
         self.fates.push((record, fate));
     }
 
@@ -559,6 +587,8 @@ impl Default for WindowsInputPump {
             pending_physical_escape: None,
             default_mouse_candidate: DefaultMouseCandidate::default(),
             key_cycles: KeyCycleLedger::default(),
+            #[cfg(test)]
+            emitted_from: Vec::new(),
         }
     }
 }
@@ -615,7 +645,7 @@ impl WindowsInputPump {
 
     fn process(&mut self, item: PlatformInputItem) -> Vec<crate::protocol::ClientInputEvent> {
         let mut events = Vec::new();
-        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+        if let Some((escape, open_bracket, from)) = self.pending_physical_escape.take() {
             let raw_bytes = item.raw_bytes();
             let continues_sgr = if open_bracket {
                 raw_bytes.is_some_and(|bytes| bytes.starts_with(b"<"))
@@ -627,9 +657,10 @@ impl WindowsInputPump {
                 let raw_events = self.framer.push(prefix);
                 events.extend(self.process_raw_events(raw_events));
             } else if !open_bracket && raw_bytes == Some(b"[") {
-                self.pending_physical_escape = Some((escape, true));
+                self.pending_physical_escape = Some((escape, true, from));
                 return events;
             } else {
+                self.emit(from, std::slice::from_ref(&escape));
                 events.push(escape);
                 if open_bracket {
                     let raw_events = self.framer.push(b"[");
@@ -641,8 +672,11 @@ impl WindowsInputPump {
             if !self.framer.has_pending_bracketed_paste() {
                 let raw_events = self.flush_before_semantic();
                 events.extend(self.process_raw_events(raw_events));
-                self.note_native_key_events(vec![escape.clone()]);
-                self.pending_physical_escape = Some((escape, false));
+                // The press is noted now and emitted later, unless an SGR
+                // report takes it.
+                let from = console_record(&escape)
+                    .and_then(|record| self.key_cycles.traced(|ledger| ledger.note_pane(record)).1);
+                self.pending_physical_escape = Some((escape, false, from));
                 return events;
             }
         }
@@ -760,7 +794,9 @@ impl WindowsInputPump {
                     let mut output = self.process_raw_events(raw_events);
                     match nested_record {
                         Some(record) => {
-                            self.key_cycles.note_pane(record);
+                            let (_, from) =
+                                self.key_cycles.traced(|ledger| ledger.note_pane(record));
+                            self.emit(from, &events);
                             output.extend(events);
                         }
                         None => output.extend(self.note_native_key_events(events)),
@@ -775,7 +811,8 @@ impl WindowsInputPump {
 
     fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
         let mut events = Vec::new();
-        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+        if let Some((escape, open_bracket, from)) = self.pending_physical_escape.take() {
+            self.emit(from, std::slice::from_ref(&escape));
             events.push(escape);
             if open_bracket {
                 let raw_events = self.framer.push(b"[");
@@ -822,15 +859,18 @@ impl WindowsInputPump {
             self.default_mouse_candidate.active = false;
             self.framer.end_staged_records();
             self.key_cycles.end_report(accepted_default_mouse);
-            let mut staged: Vec<_> = std::mem::take(&mut self.default_mouse_candidate.events)
-                .into_iter()
-                .filter(|(_, fate)| match fate {
+            let mut staged = Vec::new();
+            for (event, fate, from) in std::mem::take(&mut self.default_mouse_candidate.events) {
+                let replayed = match fate {
                     RecordFate::Pane => true,
                     RecordFate::Staged => !accepted_default_mouse,
                     RecordFate::Consumed => false,
-                })
-                .map(|(event, _)| event)
-                .collect();
+                };
+                if replayed {
+                    self.emit(from, std::slice::from_ref(&event));
+                    staged.push(event);
+                }
+            }
             staged.append(&mut output);
             output = staged;
         }
@@ -843,10 +883,10 @@ impl WindowsInputPump {
         raw_bytes: &[u8],
         events: Vec<crate::protocol::ClientInputEvent>,
     ) {
-        let fate = self.stage_default_mouse_record(record, raw_bytes);
+        let (fate, from) = self.stage_default_mouse_record(record, raw_bytes);
         self.default_mouse_candidate
             .events
-            .extend(events.into_iter().map(|event| (event, fate)));
+            .extend(events.into_iter().map(|event| (event, fate, from)));
     }
 
     /// Stages a record for the pending report and returns its fate from the
@@ -857,13 +897,16 @@ impl WindowsInputPump {
         &mut self,
         record: WindowsKeyRecord,
         raw_bytes: &[u8],
-    ) -> RecordFate {
+    ) -> (RecordFate, Provenance) {
         self.default_mouse_candidate.active = true;
-        if record.key_down {
-            self.key_cycles.press(record, !raw_bytes.is_empty())
-        } else {
-            self.key_cycles.release(record)
-        }
+        let staged = !raw_bytes.is_empty();
+        self.key_cycles.traced(|ledger| {
+            if record.key_down {
+                ledger.press(record, staged)
+            } else {
+                ledger.release(record)
+            }
+        })
     }
 
     /// Outside a paste, a nested release that ends a cycle accepted reports
@@ -894,26 +937,39 @@ impl WindowsInputPump {
         &mut self,
         events: Vec<crate::protocol::ClientInputEvent>,
     ) -> Vec<crate::protocol::ClientInputEvent> {
-        let mut last: Option<(WindowsKeyRecord, RecordFate)> = None;
-        events
-            .into_iter()
-            .filter(|event| {
-                let crate::protocol::ClientInputEvent::Key {
-                    source: crate::protocol::ClientKeySource::WindowsConsole { record },
-                    ..
-                } = event
-                else {
-                    return true;
-                };
-                let fate = match last {
-                    Some((noted, fate)) if noted == *record => fate,
-                    _ => self.key_cycles.note_pane(*record),
-                };
-                last = Some((*record, fate));
-                fate != RecordFate::Consumed
-            })
-            .collect()
+        let mut last: Option<(WindowsKeyRecord, RecordFate, Provenance)> = None;
+        let mut output = Vec::with_capacity(events.len());
+        for event in events {
+            let Some(record) = console_record(&event) else {
+                output.push(event);
+                continue;
+            };
+            let (fate, from) = match last {
+                Some((noted, fate, from)) if noted == record => (fate, from),
+                _ => self.key_cycles.traced(|ledger| ledger.note_pane(record)),
+            };
+            last = Some((record, fate, from));
+            if fate != RecordFate::Consumed {
+                self.emit(from, std::slice::from_ref(&event));
+                output.push(event);
+            }
+        }
+        output
     }
+
+    /// Test builds: records the provenance of the console key events among
+    /// `events`, which the pump emits now (property I6).
+    #[cfg(test)]
+    fn emit(&mut self, from: Provenance, events: &[crate::protocol::ClientInputEvent]) {
+        let emitted = events
+            .iter()
+            .filter(|event| console_record(event).is_some())
+            .count();
+        self.emitted_from.extend(std::iter::repeat_n(from, emitted));
+    }
+
+    #[cfg(not(test))]
+    fn emit(&mut self, _from: Provenance, _events: &[crate::protocol::ClientInputEvent]) {}
 
     /// Native console key events whose bytes become paste text join the
     /// ledger through their record, once per record, as paste text.
@@ -940,6 +996,17 @@ impl WindowsInputPump {
             .into_iter()
             .filter_map(windows_client_input_event_from_raw)
             .collect()
+    }
+}
+
+/// The console record a key event carries, if it came from one.
+fn console_record(event: &crate::protocol::ClientInputEvent) -> Option<WindowsKeyRecord> {
+    match event {
+        crate::protocol::ClientInputEvent::Key {
+            source: crate::protocol::ClientKeySource::WindowsConsole { record },
+            ..
+        } => Some(*record),
+        _ => None,
     }
 }
 
@@ -1139,6 +1206,13 @@ impl PumpUnderTest {
                 (*record, fate)
             })
             .collect()
+    }
+
+    /// For every console key event the pump emitted, in emission order, the
+    /// index in `record_fates` of the record it came from; `None` for a
+    /// record the ledger does not track (property I6, herdr-vqok r5).
+    pub(crate) fn emitted_from(&self) -> &[Option<usize>] {
+        &self.0.pump.emitted_from
     }
 
     /// Raw input bytes, as the mapper's win32-input-mode framer passes them
@@ -5901,10 +5975,12 @@ mod tests {
                 "{text:?}"
             );
             let mut after = translator.translate(WindowsInputRecord::Key(VQOK_SPACE));
-            after.extend(translator.translate(WindowsInputRecord::Key(WindowsKeyRecord {
-                key_down: false,
-                ..VQOK_SPACE
-            })));
+            after.extend(
+                translator.translate(WindowsInputRecord::Key(WindowsKeyRecord {
+                    key_down: false,
+                    ..VQOK_SPACE
+                })),
+            );
             assert_eq!(
                 event_summary_with_kinds(&after).len(),
                 2,

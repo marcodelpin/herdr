@@ -51,10 +51,11 @@
 //!   drop after a cut only when the cut was quiet;
 //! - I6 on the pump the console key events of each key follow its input
 //!   press cycles (the presses up to a release, and that release): every
-//!   event is an input record of the key, in input order, a press reported
-//!   at most its repeat count of times, and a release reported exactly
-//!   when a press of its cycle was; a release with no press before it in
-//!   the input may go either way (herdr-vqok).
+//!   event is held to the input record the pump emitted it from (its
+//!   provenance) and carries that record, in input order; a press is
+//!   reported at most its repeat count of times, and a release exactly
+//!   when a press of its own cycle was; a release with no press before it
+//!   in its cycle may go either way (herdr-vqok, r5: per record).
 
 use super::*;
 use crate::client::PumpUnderTest;
@@ -1768,85 +1769,93 @@ fn fates_follow_cycles(input: &[(WindowsKeyRecord, Fate)]) -> bool {
     true
 }
 
-/// I6 for one key: whether its reported console events can be read as its
-/// input records in order, by their fates. A consumed record is never
-/// reported; a press that reached the pane is reported 0 to repeat-count
-/// times (the record itself, Press or Repeat first and Repeat after, so a
-/// second Press is never one record's repeat), and a release that reached
-/// it once (as Release, the record itself) exactly when a press since the
-/// previous release was reported, not at all when none was. A release with
-/// no press before it in the input may be reported or not. Wrong release
-/// identity, a lost intermediate release, an extra one and a press read as
-/// a later identical one the report consumed all fail.
-fn release_cycles_align(
+/// I6 for one key: whether its console events, each attributed to the
+/// input record it came from (its index in `input`, which the pump
+/// records as it emits the event), follow that record and its press cycle.
+/// Events come in input order and each carries its own record. A consumed
+/// record has none; a press that reached the pane has 0 to repeat-count
+/// (the record itself, Press or Repeat first and Repeat after); a release
+/// that reached it has exactly one Release when a press of its cycle (the
+/// presses since the previous release) has an event, none when no press
+/// has. A release with no press before it in its cycle may have one or
+/// none. Provenance makes the judgement per record: no event can stand in
+/// for another identical record's (codex hvqok-r4fix P2, herdr-vqok r5).
+fn records_follow_provenance(
+    input: &[(WindowsKeyRecord, Fate)],
+    events: &[(ClientKeyKind, WindowsKeyRecord, usize)],
+) -> bool {
+    let in_order = events.windows(2).all(|pair| pair[0].2 <= pair[1].2);
+    let own = events
+        .iter()
+        .all(|(_, record, from)| input.get(*from).is_some_and(|(input, _)| input == record));
+    if !in_order || !own {
+        return false;
+    }
+    let (mut in_cycle, mut reported) = (false, false);
+    for (index, (record, fate)) in input.iter().enumerate() {
+        let kinds: Vec<ClientKeyKind> = events
+            .iter()
+            .filter(|(_, _, from)| *from == index)
+            .map(|(kind, _, _)| *kind)
+            .collect();
+        if *fate == Fate::Consumed && !kinds.is_empty() {
+            return false;
+        }
+        if record.key_down {
+            let repeats = usize::from(record.repeat_count.max(1));
+            let shaped = kinds.iter().enumerate().all(|(k, kind)| {
+                if k == 0 {
+                    *kind != ClientKeyKind::Release
+                } else {
+                    *kind == ClientKeyKind::Repeat
+                }
+            });
+            if kinds.len() > repeats || !shaped {
+                return false;
+            }
+            in_cycle = true;
+            reported |= !kinds.is_empty();
+        } else {
+            if kinds.len() > 1 || kinds.iter().any(|kind| *kind != ClientKeyKind::Release) {
+                return false;
+            }
+            if in_cycle && kinds.len() != usize::from(reported) {
+                return false;
+            }
+            (in_cycle, reported) = (false, false);
+        }
+    }
+    true
+}
+
+/// Whether some attribution of `events` to the input records, in order,
+/// passes `records_follow_provenance`: what a check that cannot see
+/// provenance can decide at best (the r1-r4 I6). The unit cases below hold
+/// I6 to rejecting every attribution where the r4 check did.
+fn some_attribution_passes(
     input: &[(WindowsKeyRecord, Fate)],
     events: &[(ClientKeyKind, WindowsKeyRecord)],
 ) -> bool {
     fn walk(
         input: &[(WindowsKeyRecord, Fate)],
         events: &[(ClientKeyKind, WindowsKeyRecord)],
-        state: (usize, usize, bool, bool),
-        failed: &mut std::collections::HashSet<(usize, usize, bool, bool)>,
+        chosen: &mut Vec<(ClientKeyKind, WindowsKeyRecord, usize)>,
     ) -> bool {
-        let (i, j, reported, in_cycle) = state;
-        if i == input.len() {
-            return j == events.len();
-        }
-        if failed.contains(&state) {
-            return false;
-        }
-        let (record, fate) = input[i];
-        let ok = if record.key_down {
-            let repeats = if fate == Fate::Pane {
-                usize::from(record.repeat_count.max(1))
-            } else {
-                0
-            };
-            // A record's reports after its first are repeats: a later Press
-            // is the next record's (codex hvqok-r3 P3).
-            (0..=repeats)
-                .take_while(|&k| {
-                    k == 0
-                        || events.get(j + k - 1).is_some_and(|(kind, event)| {
-                            let own = if k == 1 {
-                                *kind != ClientKeyKind::Release
-                            } else {
-                                *kind == ClientKeyKind::Repeat
-                            };
-                            own && *event == record
-                        })
-                })
-                .any(|k| {
-                    walk(
-                        input,
-                        events,
-                        (i + 1, j + k, reported || k > 0, true),
-                        failed,
-                    )
-                })
-        } else {
-            let reported_here = fate == Fate::Pane
-                && events.get(j).is_some_and(|(kind, event)| {
-                    *kind == ClientKeyKind::Release && *event == record
-                });
-            let mut next = |j| walk(input, events, (i + 1, j, false, false), failed);
-            match (in_cycle, reported) {
-                (true, true) => reported_here && next(j + 1),
-                (true, false) => next(j),
-                (false, _) => (reported_here && next(j + 1)) || next(j),
-            }
+        let Some(&(kind, record)) = events.get(chosen.len()) else {
+            return records_follow_provenance(input, chosen);
         };
-        if !ok {
-            failed.insert(state);
-        }
-        ok
+        let first = chosen.last().map_or(0, |(_, _, from)| *from);
+        (first..input.len()).any(|from| {
+            if input[from].0 != record {
+                return false;
+            }
+            chosen.push((kind, record, from));
+            let passes = walk(input, events, chosen);
+            chosen.pop();
+            passes
+        })
     }
-    walk(
-        input,
-        events,
-        (0, 0, false, false),
-        &mut std::collections::HashSet::new(),
-    )
+    walk(input, events, &mut Vec::new())
 }
 
 #[test]
@@ -1859,30 +1868,30 @@ fn i6_release_cycles_align_sees_lost_and_swapped_releases() {
     let release = |record| (ClientKeyKind::Release, record);
     // The cycles as they happened, and with presses whose bytes reached
     // the pane as text (reported 0 times).
-    assert!(release_cycles_align(
+    assert!(some_attribution_passes(
         &input,
         &[press(p1), release(r1), press(p2), release(r2)]
     ));
-    assert!(release_cycles_align(&input, &[press(p1), release(r1)]));
-    assert!(release_cycles_align(&input, &[]));
+    assert!(some_attribution_passes(&input, &[press(p1), release(r1)]));
+    assert!(some_attribution_passes(&input, &[]));
     // codex hvqok-r1 P3: the intermediate release lost, the releases
     // swapped, a release of a cycle the pane never saw.
-    assert!(!release_cycles_align(
+    assert!(!some_attribution_passes(
         &input,
         &[press(p1), press(p2), release(r2)]
     ));
-    assert!(!release_cycles_align(
+    assert!(!some_attribution_passes(
         &input,
         &[press(p1), release(r2), press(p2), release(r1)]
     ));
-    assert!(!release_cycles_align(
+    assert!(!some_attribution_passes(
         &input,
         &[press(p1), release(r1), release(r2)]
     ));
-    assert!(!release_cycles_align(&input, &[press(p1)]));
+    assert!(!some_attribution_passes(&input, &[press(p1)]));
     // A key-up with no press before it in the input: either way.
-    assert!(release_cycles_align(&[(r1, Fate::Pane)], &[release(r1)]));
-    assert!(release_cycles_align(&[(r1, Fate::Pane)], &[]));
+    assert!(some_attribution_passes(&[(r1, Fate::Pane)], &[release(r1)]));
+    assert!(some_attribution_passes(&[(r1, Fate::Pane)], &[]));
     assert!(fates_follow_cycles(&[(r1, Fate::Consumed)]));
 }
 
@@ -1903,11 +1912,11 @@ fn i6_release_cycles_align_holds_an_emitted_press_to_its_own_cycle() {
         (r2, Fate::Consumed),
     ];
     assert!(fates_follow_cycles(&input));
-    assert!(!release_cycles_align(
+    assert!(!some_attribution_passes(
         &input,
         &[(ClientKeyKind::Press, p1), (ClientKeyKind::Release, r2)]
     ));
-    assert!(release_cycles_align(
+    assert!(some_attribution_passes(
         &input,
         &[(ClientKeyKind::Press, p1), (ClientKeyKind::Release, r1)]
     ));
@@ -1941,17 +1950,17 @@ fn i6_release_cycles_align_holds_a_second_press_to_its_own_record() {
     let repeat = (ClientKeyKind::Repeat, p);
     let release = (ClientKeyKind::Release, r);
     assert!(fates_follow_cycles(&input));
-    assert!(!release_cycles_align(&input, &[press, press, release]));
+    assert!(!some_attribution_passes(&input, &[press, press, release]));
     // The cycles as they happened, with and without the repeats.
-    assert!(release_cycles_align(
+    assert!(some_attribution_passes(
         &input,
         &[press, repeat, release, press, repeat, release]
     ));
-    assert!(release_cycles_align(
+    assert!(some_attribution_passes(
         &input,
         &[press, release, press, release]
     ));
-    assert!(release_cycles_align(&input, &[press, repeat, release]));
+    assert!(some_attribution_passes(&input, &[press, repeat, release]));
 }
 
 /// codex hvqok-r4fix P2 (herdr-vqok r5): identical presses `P` (Space,
@@ -1959,21 +1968,43 @@ fn i6_release_cycles_align_holds_a_second_press_to_its_own_record() {
 /// Input native P1, native R1, serialized P2 (it reaches the pane as raw
 /// text), native P3, native R2, every fate Pane. Output `P1, P3, R2` lost
 /// R1; a check that does not know which record each event came from reads
-/// the first press as P2's and accepts it. I6 must reject it.
+/// the first press as P2's and accepts it. I6 must reject it: with each
+/// event held to its record the first cycle has a press and no release.
 #[test]
 fn i6_rejects_a_lost_release_across_cycles() {
     let p = key_record(0x20, 0, 0x20, 0);
     let r1 = released(p);
     let r2 = released(key_record(0x20, 0, 0x20, LEFT_CTRL_PRESSED));
     let input = [p, r1, p, p, r2].map(|record| (record, Fate::Pane));
+    let press = |from| (ClientKeyKind::Press, p, from);
+    let release = |record, from| (ClientKeyKind::Release, record, from);
     assert!(fates_follow_cycles(&input));
-    assert!(!release_cycles_align(
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(0), press(3), release(r2, 4)]
+    ));
+    // Blind to provenance, the loss reads as a legal stream.
+    assert!(some_attribution_passes(
         &input,
         &[
             (ClientKeyKind::Press, p),
             (ClientKeyKind::Press, p),
             (ClientKeyKind::Release, r2),
         ]
+    ));
+    // The stream as it happened, and with the same events claimed by the
+    // wrong records.
+    assert!(records_follow_provenance(
+        &input,
+        &[press(0), release(r1, 1), press(3), release(r2, 4)]
+    ));
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(2), release(r1, 1), press(3), release(r2, 4)]
+    ));
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(0), release(r1, 4), press(3), release(r2, 1)]
     ));
 }
 
@@ -2325,18 +2356,26 @@ impl<'a> Harness<'a> {
 
     /// I6: per console key (virtual key and scan code), the pump's ledger
     /// saw every input record in order and left none pending, its fates
-    /// follow the press cycles (`fates_follow_cycles`), and the reported
-    /// events follow the fates (`release_cycles_align`). Records with
-    /// neither a virtual key nor a scan code are raw bytes the ledger does
-    /// not track; they are judged as reaching the pane (ADR-0013
-    /// amendment 5).
+    /// follow the press cycles (`fates_follow_cycles`), and every console
+    /// event, held to the record the pump says it came from, follows that
+    /// record (`records_follow_provenance`). Records with neither a virtual
+    /// key nor a scan code are raw bytes the ledger does not track; an
+    /// event from one has no provenance and fails (ADR-0013 amendments 5
+    /// and 6).
     fn check_releases(&self) -> Result<(), String> {
         let input = &self.key_inputs;
-        let fates = self
+        let (fates, emitted_from) = self
             .pump
             .as_ref()
-            .map(PumpUnderTest::record_fates)
+            .map(|pump| (pump.record_fates(), pump.emitted_from().to_vec()))
             .unwrap_or_default();
+        if emitted_from.len() != self.key_events.len() {
+            return Err(format!(
+                "I6: the pump traced {} console key events and reported {}",
+                emitted_from.len(),
+                self.key_events.len()
+            ));
+        }
         let mut keys: Vec<(u16, u16)> = Vec::new();
         for record in input
             .iter()
@@ -2363,11 +2402,13 @@ impl<'a> Harness<'a> {
             };
             let records: Vec<WindowsKeyRecord> =
                 input.iter().copied().filter(|r| of_key(r)).collect();
+            // The fate-log index of each of the key's records, in order.
+            let logged: Vec<usize> = (0..fates.len()).filter(|&i| of_key(&fates[i].0)).collect();
             let judged: Vec<(WindowsKeyRecord, Fate)> = if key == (0, 0) {
                 records.iter().map(|record| (*record, Fate::Pane)).collect()
             } else {
                 let of_key_fates: Vec<(WindowsKeyRecord, Option<bool>)> =
-                    fates.iter().copied().filter(|(r, _)| of_key(r)).collect();
+                    logged.iter().map(|&i| fates[i]).collect();
                 let seen: Vec<WindowsKeyRecord> = of_key_fates.iter().map(|(r, _)| *r).collect();
                 if seen != records || of_key_fates.iter().any(|(_, fate)| fate.is_none()) {
                     return Err(format!(
@@ -2391,20 +2432,29 @@ impl<'a> Harness<'a> {
                     })
                     .collect()
             };
-            let events: Vec<(ClientKeyKind, WindowsKeyRecord)> = self
-                .key_events
-                .iter()
-                .copied()
-                .filter(|(_, record)| of_key(record))
-                .collect();
-            if !fates_follow_cycles(&judged) || !release_cycles_align(&judged, &events) {
+            let mut events: Vec<(ClientKeyKind, WindowsKeyRecord, usize)> = Vec::new();
+            for ((kind, record), from) in self.key_events.iter().zip(&emitted_from) {
+                if !of_key(record) {
+                    continue;
+                }
+                let Some(from) = from.and_then(|from| logged.iter().position(|&i| i == from))
+                else {
+                    return Err(format!(
+                        "I6: key {key:?} reported {kind:?} {} with no record of the key behind it \
+                         (provenance {from:?})",
+                        show(record)
+                    ));
+                };
+                events.push((*kind, *record, from));
+            }
+            if !fates_follow_cycles(&judged) || !records_follow_provenance(&judged, &events) {
                 let records: Vec<String> = judged
                     .iter()
                     .map(|(record, fate)| format!("{} {fate:?}", show(record)))
                     .collect();
                 let events: Vec<String> = events
                     .iter()
-                    .map(|(kind, record)| format!("{kind:?} {}", show(record)))
+                    .map(|(kind, record, from)| format!("{kind:?} {} from #{from}", show(record)))
                     .collect();
                 return Err(format!(
                     "I6: key {key:?} reported {events:?} for its input records {records:?}"
