@@ -2159,13 +2159,12 @@ mod tests {
             .get(&terminal_id)
             .expect("pending resume should leave a shell runtime");
         let marker = "restored agent: shell quoted | marker";
-        for _ in 0..20 {
-            if runtime
+        let deadline = Instant::now() + MARKER_DEADLINE;
+        while Instant::now() < deadline
+            && !runtime
                 .snapshot_history()
                 .is_some_and(|text| text.contains(marker))
-            {
-                break;
-            }
+        {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(
@@ -2192,6 +2191,10 @@ mod tests {
     // appears in the bytes sent to the shell; it can only appear in the pane
     // history if a shell actually evaluated "$(( a * b ))", which only
     // happens when the command that was typed actually ran.
+    // Upper bound for a marker to reach a real pane's history under load.
+    #[cfg(unix)]
+    const MARKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
     #[cfg(unix)]
     fn launcher_target_check_argv(a: u64, b: u64, tag: &str) -> Vec<String> {
         vec![
@@ -2212,13 +2215,17 @@ mod tests {
         marker: &str,
         failure_context: &str,
     ) {
-        for _ in 0..20 {
-            if runtime
+        // Wait on the marker itself with a deadline in seconds: the pane has
+        // to spawn a shell in a PTY, receive the typed command and run it,
+        // and under full-suite load that took more than the 500 ms a fixed
+        // 20 x 25 ms poll allowed (herdr-mrs5). A pass returns as soon as
+        // the marker shows up, so the bound only costs time on a real miss.
+        let deadline = Instant::now() + MARKER_DEADLINE;
+        while Instant::now() < deadline
+            && !runtime
                 .snapshot_history()
                 .is_some_and(|text| text.contains(marker))
-            {
-                break;
-            }
+        {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(
