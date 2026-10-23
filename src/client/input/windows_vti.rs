@@ -5813,6 +5813,102 @@ mod tests {
         );
     }
 
+    /// Feeds raw text as one native character record per byte, the way
+    /// WezTerm delivers bracketed-paste delimiters.
+    fn raw_chars_on(
+        translator: &mut WindowsInputTranslator,
+        text: &str,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in text.chars().map(key_char) {
+            events.extend(translator.translate(record));
+        }
+        events
+    }
+
+    /// codex hvqok-r4fix P1 (herdr-vqok r5): raw `ESC [ M`, serialized
+    /// Space down that gives the report its button byte, raw `d 2`, then
+    /// raw paste delimiters around a serialized Space down and up. The
+    /// accepted report leaves Space's cycle consumed; inside the paste the
+    /// release's serialized bytes are paste text, so they must reach the
+    /// paste decoder whatever owns the cycle. Before, the release was
+    /// dropped whole and the paste decoded `ESC[32;57;32;1;0;1_` as text.
+    #[test]
+    fn review_vqok_r5_release_inside_a_paste_after_a_consumed_cycle_keeps_its_bytes() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(raw_chars_on(&mut translator, "\x1b[200~"));
+        for record in [VQOK_SPACE, space_up] {
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        events.extend(raw_chars_on(&mut translator, "\x1b[201~"));
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        let summary = event_summary_with_kinds(&events);
+        assert_eq!(summary.len(), 2, "{events:?}");
+        assert_eq!(summary[0], "mouse", "{events:?}");
+        assert_eq!(
+            events[1],
+            crate::protocol::ClientInputEvent::Paste { text: " ".into() },
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok r5 companion: the same paste with no report before it
+    /// (a fresh `Text` cycle) and with Enter instead of Space both decode
+    /// the serialized pair to its text, and the paste leaves no cycle open
+    /// that would swallow a later native Space press and release.
+    #[test]
+    fn review_vqok_r5_fresh_text_and_enter_pairs_inside_a_paste_decode() {
+        let enter = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x0d,
+            virtual_scan_code: 0x1c,
+            unicode: 0x0d,
+            control_key_state: 0,
+        };
+        for (press, text) in [(VQOK_SPACE, " "), (enter, "\r")] {
+            let release = WindowsKeyRecord {
+                key_down: false,
+                ..press
+            };
+            let mut translator = WindowsInputTranslator::default();
+            let mut events = raw_chars_on(&mut translator, "\x1b[200~");
+            for record in [press, release] {
+                for record in win32_input_mode_encoded_record(record) {
+                    events.extend(translator.translate(record));
+                }
+            }
+            events.extend(raw_chars_on(&mut translator, "\x1b[201~"));
+            for _ in 0..150 {
+                events.extend(translator.idle());
+            }
+            assert_eq!(
+                events,
+                vec![crate::protocol::ClientInputEvent::Paste { text: text.into() }],
+                "{text:?}"
+            );
+            let mut after = translator.translate(WindowsInputRecord::Key(VQOK_SPACE));
+            after.extend(translator.translate(WindowsInputRecord::Key(WindowsKeyRecord {
+                key_down: false,
+                ..VQOK_SPACE
+            })));
+            assert_eq!(
+                event_summary_with_kinds(&after).len(),
+                2,
+                "{text:?} {after:?}"
+            );
+        }
+    }
+
     /// herdr-vqok r4 (codex hvqok-r3 residual): a serialized Shift press
     /// opens its cycle, a native Shift release emits nothing so the ledger
     /// never sees it, and focus changes clear nothing. The entry is bounded,
