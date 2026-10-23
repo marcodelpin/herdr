@@ -1954,6 +1954,29 @@ fn i6_release_cycles_align_holds_a_second_press_to_its_own_record() {
     assert!(release_cycles_align(&input, &[press, repeat, release]));
 }
 
+/// codex hvqok-r4fix P2 (herdr-vqok r5): identical presses `P` (Space,
+/// scan code 0), releases R1 and R2 told apart by control state 0 and 8.
+/// Input native P1, native R1, serialized P2 (it reaches the pane as raw
+/// text), native P3, native R2, every fate Pane. Output `P1, P3, R2` lost
+/// R1; a check that does not know which record each event came from reads
+/// the first press as P2's and accepts it. I6 must reject it.
+#[test]
+fn i6_rejects_a_lost_release_across_cycles() {
+    let p = key_record(0x20, 0, 0x20, 0);
+    let r1 = released(p);
+    let r2 = released(key_record(0x20, 0, 0x20, LEFT_CTRL_PRESSED));
+    let input = [p, r1, p, p, r2].map(|record| (record, Fate::Pane));
+    assert!(fates_follow_cycles(&input));
+    assert!(!release_cycles_align(
+        &input,
+        &[
+            (ClientKeyKind::Press, p),
+            (ClientKeyKind::Press, p),
+            (ClientKeyKind::Release, r2),
+        ]
+    ));
+}
+
 impl<'a> Harness<'a> {
     fn new(case: &'a Case, seed: u64) -> Self {
         let base = Instant::now();
