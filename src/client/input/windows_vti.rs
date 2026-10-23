@@ -371,17 +371,28 @@ struct WindowsInputPump {
     pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
     default_mouse_candidate: DefaultMouseCandidate,
     consumed_default_mouse_keys: Vec<WindowsKeyRecord>,
+    /// The nested keys whose press reached the pane and whose release has
+    /// not: a report never takes the release of one (ADR-0013 amendment 4).
+    pane_held_keys: Vec<WindowsKeyRecord>,
 }
 
 #[derive(Default)]
 struct DefaultMouseCandidate {
     active: bool,
-    /// The staged events in arrival order, each with whether its record
-    /// pushed bytes the report can take (a release: whether its press did).
-    /// An accepted report consumes only those; a record that pushed none
-    /// (an arrow key) stays semantic input (ADR-0013 amendment 3, D4).
+    /// The staged events in arrival order, each with whether the report
+    /// takes its record: a press when it pushed bytes the report can take,
+    /// a release when the report owns its key. An accepted report consumes
+    /// only those; a record that pushed none (an arrow key) stays semantic
+    /// input (ADR-0013 amendment 3, D4).
     events: Vec<(crate::protocol::ClientInputEvent, bool)>,
-    unreleased_keys: Vec<WindowsKeyRecord>,
+    /// The staged records in arrival order, each with whether the report
+    /// takes it, so the pump knows which reach the pane.
+    records: Vec<(WindowsKeyRecord, bool)>,
+    /// The keys pressed in this burst and not released, each with whether
+    /// the report owns its release: only while every press the release
+    /// ends went to the report, never once the pane saw one (a byte-free
+    /// press, or a press before the report) (ADR-0013 amendment 4).
+    unreleased_keys: Vec<(WindowsKeyRecord, bool)>,
 }
 
 impl Default for WindowsInputPump {
@@ -393,6 +404,7 @@ impl Default for WindowsInputPump {
             pending_physical_escape: None,
             default_mouse_candidate: DefaultMouseCandidate::default(),
             consumed_default_mouse_keys: Vec::new(),
+            pane_held_keys: Vec::new(),
         }
     }
 }
@@ -509,6 +521,8 @@ impl WindowsInputPump {
                     let pending_paste = self.framer.has_pending_bracketed_paste();
                     if !pending_paste && self.framer.has_pending_default_mouse_sequence() {
                         self.stage_default_mouse_record(nested_record, &raw_bytes);
+                    } else if !pending_paste {
+                        self.note_pane_key(nested_record);
                     }
                     let decode_win32_record = self.paste_from_win32_key_records || !pending_paste;
                     self.pending_escape_origin = if decode_win32_record && !pending_paste {
@@ -566,6 +580,9 @@ impl WindowsInputPump {
                     };
                     self.process_raw_events(raw_events)
                 } else {
+                    if let Some(record) = nested_record {
+                        self.note_pane_key(record);
+                    }
                     let raw_events = if events.is_empty() {
                         self.framer.flush_timeout()
                     } else {
@@ -630,16 +647,25 @@ impl WindowsInputPump {
             self.default_mouse_candidate.active = false;
             self.framer.end_staged_records();
             let staged = std::mem::take(&mut self.default_mouse_candidate.events);
+            let unreleased = std::mem::take(&mut self.default_mouse_candidate.unreleased_keys);
+            for (record, taken) in std::mem::take(&mut self.default_mouse_candidate.records) {
+                if !accepted_default_mouse || !taken {
+                    self.note_pane_key(record);
+                }
+            }
             let mut staged: Vec<_> = if accepted_default_mouse {
-                self.consumed_default_mouse_keys
-                    .append(&mut self.default_mouse_candidate.unreleased_keys);
+                self.consumed_default_mouse_keys.extend(
+                    unreleased
+                        .into_iter()
+                        .filter(|(_, owned)| *owned)
+                        .map(|(record, _)| record),
+                );
                 staged
                     .into_iter()
                     .filter(|(_, has_report_bytes)| !has_report_bytes)
                     .map(|(event, _)| event)
                     .collect()
             } else {
-                self.default_mouse_candidate.unreleased_keys.clear();
                 staged.into_iter().map(|(event, _)| event).collect()
             };
             staged.append(&mut output);
@@ -654,30 +680,53 @@ impl WindowsInputPump {
         raw_bytes: &[u8],
         events: Vec<crate::protocol::ClientInputEvent>,
     ) {
-        // A release goes with its press: it belongs to the report when the
-        // press pushed bytes the report can take.
-        let has_report_bytes = if record.key_down {
-            !raw_bytes.is_empty()
-        } else {
-            matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_some()
-        };
+        let taken = self.stage_default_mouse_record(record, raw_bytes);
         self.default_mouse_candidate
             .events
-            .extend(events.into_iter().map(|event| (event, has_report_bytes)));
-        self.stage_default_mouse_record(record, raw_bytes);
+            .extend(events.into_iter().map(|event| (event, taken)));
     }
 
-    fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) {
-        self.default_mouse_candidate.active = true;
-        if record.key_down
-            && !raw_bytes.is_empty()
-            && (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
-        {
-            if matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_none() {
-                self.default_mouse_candidate.unreleased_keys.push(record);
+    /// Stages a record for the pending report and returns whether an
+    /// accepted report takes it. A press goes with the report when it
+    /// pushed bytes the report can take. A release ends every press of its
+    /// key since the last release, so it goes with the report only when
+    /// all of them did: a byte-free press of the key, or one the pane saw
+    /// before the report, keeps the release (ADR-0013 amendment 4).
+    fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) -> bool {
+        let candidate = &mut self.default_mouse_candidate;
+        candidate.active = true;
+        let tracked = record.virtual_key_code != 0 || record.virtual_scan_code != 0;
+        let unreleased = unreleased_key_index(&candidate.unreleased_keys, record);
+        let taken = if record.key_down {
+            let has_report_bytes = !raw_bytes.is_empty();
+            if tracked {
+                let owned = has_report_bytes
+                    && match unreleased {
+                        Some(index) => candidate.unreleased_keys[index].1,
+                        None => matching_key_index(&self.pane_held_keys, record).is_none(),
+                    };
+                match unreleased {
+                    Some(index) => candidate.unreleased_keys[index] = (record, owned),
+                    None => candidate.unreleased_keys.push((record, owned)),
+                }
             }
-        } else if !record.key_down {
-            remove_matching_key(&mut self.default_mouse_candidate.unreleased_keys, record);
+            has_report_bytes
+        } else {
+            unreleased.is_some_and(|index| candidate.unreleased_keys.remove(index).1)
+        };
+        candidate.records.push((record, taken));
+        taken
+    }
+
+    /// Records that a nested key record reached the pane.
+    fn note_pane_key(&mut self, record: WindowsKeyRecord) {
+        if record.virtual_key_code == 0 && record.virtual_scan_code == 0 {
+            return;
+        }
+        if !record.key_down {
+            remove_matching_key(&mut self.pane_held_keys, record);
+        } else if matching_key_index(&self.pane_held_keys, record).is_none() {
+            self.pane_held_keys.push(record);
         }
     }
 
@@ -701,6 +750,16 @@ impl WindowsInputPump {
 
 fn matching_key_index(keys: &[WindowsKeyRecord], record: WindowsKeyRecord) -> Option<usize> {
     keys.iter().position(|candidate| {
+        candidate.virtual_key_code == record.virtual_key_code
+            && candidate.virtual_scan_code == record.virtual_scan_code
+    })
+}
+
+fn unreleased_key_index(
+    keys: &[(WindowsKeyRecord, bool)],
+    record: WindowsKeyRecord,
+) -> Option<usize> {
+    keys.iter().position(|(candidate, _)| {
         candidate.virtual_key_code == record.virtual_key_code
             && candidate.virtual_scan_code == record.virtual_scan_code
     })
