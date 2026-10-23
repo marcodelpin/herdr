@@ -48,7 +48,14 @@
 //!   pending;
 //! - I5 a pump idle drops bytes only once the newest pending byte is
 //!   `PUMP_IDLE_QUIET` old, or at a named deadline, and the oracle allows a
-//!   drop after a cut only when the cut was quiet.
+//!   drop after a cut only when the cut was quiet;
+//! - I6 on the pump the console key events of each key follow its input
+//!   press cycles (the presses up to a release, and that release): every
+//!   event is held to the input record the pump emitted it from (its
+//!   provenance) and carries that record, in input order; a press is
+//!   reported at most its repeat count of times, and a release exactly
+//!   when a press of its own cycle was; a release with no press before it
+//!   in its cycle may go either way (herdr-vqok, r5: per record).
 
 use super::*;
 use crate::client::PumpUnderTest;
@@ -78,6 +85,11 @@ const SHIFT_PRESS: WindowsKeyRecord = key_record(0x10, 0x2a, 0, SHIFT_PRESSED);
 const EXTENDED_SALT: u64 = 0x00e7_0000_0000;
 /// Mixed into the seed of the silent-record draws of an X10 report.
 const SILENT_SALT: u64 = 0x0051_1e00_0000_0000;
+/// Mixed into the seed of the byte-free repeat draws of an X10 report.
+const REPEAT_SALT: u64 = 0x00e9_ea70_0000_0000;
+/// Mixed into the seed of the draw that presses the button key of an X10
+/// report before it and releases it inside it.
+const CARRY_SALT: u64 = 0x00ca_0000_0000_0000;
 
 // The ADR bounds table, restated so the oracle does not read the framer's
 // own deadlines (`oracle_bounds_match_the_adr` ties them together).
@@ -591,10 +603,37 @@ fn silent_record(rng: &mut Rng) -> WindowsKeyRecord {
 /// the pane once, in order (ADR-0013 D4). One time in two a record that
 /// types no character (an arrow, sometimes repeated) is staged before one
 /// of the payload records: the report takes none of its bytes, so it
-/// reaches the pane either way (ADR-0013 amendment 3, D4).
+/// reaches the pane either way (ADR-0013 amendment 3, D4). When the button
+/// key is Space and the silent record comes after it, that record is
+/// sometimes a Ctrl+Space press of the same key with no bytes, released
+/// before or after the report ends: its release goes with it, never with
+/// the report (herdr-vqok; ADR-0013 amendment 4). One time in four the
+/// button key is pressed on its own before the report and released inside
+/// it before its button press: the pane saw that cycle whole, so the next
+/// one goes with the report, release included (herdr-vqok r2).
 fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let first_gap = gap(rng);
+    // The button key, drawn ahead on a copy so the draws stay the same.
+    let next_button = x10_button_record(&mut Rng(rng.0));
+    let carry_seed = case
+        .input
+        .iter()
+        .fold(CARRY_SALT ^ case.reads.len() as u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let mut carry = Rng(carry_seed);
+    let carried = carry.chance(1, 4);
+    if carried {
+        case.push_nested(carry.range(0, 30), next_button);
+        case.expected.push(Unit {
+            bytes: vec![NESTED, next_button.unicode as u8],
+            rule: Rule::KeepEvent,
+        });
+    }
     case.push_raw(&[(first_gap, b"\x1b[M")], Kind::X10);
+    if carried {
+        case.push_nested(carry.range(0, 5), released(next_button));
+    }
     case.expected.push(Unit {
         bytes: b"\x1b[M".to_vec(),
         rule: Rule::Drop,
@@ -602,12 +641,17 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     // The silent record draws from its own generator, seeded from the case
     // so far, so the cases of every stream stay the ones the earlier rounds
     // measured.
-    let mut side = Rng(case
+    let side_seed = case
         .input
         .iter()
         .fold(SILENT_SALT ^ case.reads.len() as u64, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-        }));
+        });
+    let mut side = Rng(side_seed);
+    // Its own generator too, so the cases without a repeat stay the same.
+    let mut repeat = Rng(side_seed ^ REPEAT_SALT);
+    let mut button = None;
+    let mut late_release = None;
     let silent = if side.chance(1, 2) {
         let at = side.below(3) as usize;
         let record = silent_record(&mut side);
@@ -619,9 +663,23 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
     let mut kept = Vec::new();
     for index in 0..3 {
         if let Some((_, record)) = silent.filter(|(at, _)| *at == index) {
+            let byte_free_repeat = button
+                .filter(|button: &WindowsKeyRecord| button.virtual_key_code == 0x20)
+                .is_some()
+                && repeat.chance(3, 4);
+            let record = if byte_free_repeat {
+                WindowsKeyRecord {
+                    repeat_count: record.repeat_count,
+                    ..key_record(0x20, 0x39, 0, LEFT_CTRL_PRESSED)
+                }
+            } else {
+                record
+            };
             case.push_nested(record_gap(&mut side), record);
             if side.chance(1, 3) {
                 case.push_nested(side.range(0, 5), released(record));
+            } else if byte_free_repeat && repeat.chance(3, 4) {
+                late_release = Some(released(record));
             }
             keys.push(nested_keys(record));
             kept.push(nested_keys(record));
@@ -637,10 +695,16 @@ fn nested_x10_report(rng: &mut Rng, case: &mut Case) {
             }
         };
         case.push_nested(record_gap(rng), record);
+        if index == 0 {
+            button = Some(record);
+        }
         if rng.chance(1, 3) {
             case.push_nested(rng.range(0, 5), released(record));
         }
         keys.push(nested_keys(record));
+    }
+    if let Some(record) = late_release {
+        case.push_nested(repeat.range(0, 5), record);
     }
     case.expected.push(Unit {
         bytes: keys.concat(),
@@ -1532,7 +1596,8 @@ fn decode(driver: Driver, chunks: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 /// What a pump event typed, in the notation of the expectations: the
 /// native record stands as `SEMANTIC`, the key of a nested record as
-/// `NESTED` and its character. Releases of console keys are not checked.
+/// `NESTED` and its character. Releases of console keys are left out of
+/// this stream; I6 (`Harness::check_releases`) judges them by press cycle.
 fn pump_event_bytes(event: &ClientInputEvent) -> Option<Vec<u8>> {
     match event {
         ClientInputEvent::Key {
@@ -1669,6 +1734,278 @@ struct Harness<'a> {
     /// earlier when a semantic key came while a lone ESC was pending (the
     /// pump's host-reply Escape rule).
     default_window_end: u64,
+    /// Every console key event the pump reported, as kind and record (I6).
+    key_events: Vec<(ClientKeyKind, WindowsKeyRecord)>,
+    /// Every key record handed to the pump, in order: the case's records
+    /// and the Shift presses of pump flushes (I6).
+    key_inputs: Vec<WindowsKeyRecord>,
+}
+
+/// Where the pump's ledger sent one input key record (I6, ADR-0013
+/// amendment 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    Pane,
+    Consumed,
+}
+
+/// I6 for one key: whether the fates follow its press cycles. A release
+/// reaches the pane exactly when a press of its cycle did; a release with
+/// no press before it in the input (a key held when the run began) may go
+/// either way.
+fn fates_follow_cycles(input: &[(WindowsKeyRecord, Fate)]) -> bool {
+    let (mut pressed, mut pane) = (false, false);
+    for (record, fate) in input {
+        if record.key_down {
+            pressed = true;
+            pane |= *fate == Fate::Pane;
+        } else {
+            if pressed && (*fate == Fate::Pane) != pane {
+                return false;
+            }
+            (pressed, pane) = (false, false);
+        }
+    }
+    true
+}
+
+/// I6 for one key: whether its console events, each attributed to the
+/// input record it came from (its index in `input`, which the pump
+/// records as it emits the event), follow that record and its press cycle.
+/// Events come in input order and each carries its own record. A consumed
+/// record has none; a press that reached the pane has 0 to repeat-count
+/// (the record itself, Press or Repeat first and Repeat after); a release
+/// that reached it has exactly one Release when a press of its cycle (the
+/// presses since the previous release) has an event, none when no press
+/// has. A release with no press before it in its cycle may have one or
+/// none. Provenance makes the judgement per record: no event can stand in
+/// for another identical record's (codex hvqok-r4fix P2, herdr-vqok r5).
+fn records_follow_provenance(
+    input: &[(WindowsKeyRecord, Fate)],
+    events: &[(ClientKeyKind, WindowsKeyRecord, usize)],
+) -> bool {
+    let in_order = events.windows(2).all(|pair| pair[0].2 <= pair[1].2);
+    let own = events
+        .iter()
+        .all(|(_, record, from)| input.get(*from).is_some_and(|(input, _)| input == record));
+    if !in_order || !own {
+        return false;
+    }
+    let (mut in_cycle, mut reported) = (false, false);
+    for (index, (record, fate)) in input.iter().enumerate() {
+        let kinds: Vec<ClientKeyKind> = events
+            .iter()
+            .filter(|(_, _, from)| *from == index)
+            .map(|(kind, _, _)| *kind)
+            .collect();
+        if *fate == Fate::Consumed && !kinds.is_empty() {
+            return false;
+        }
+        if record.key_down {
+            let repeats = usize::from(record.repeat_count.max(1));
+            let shaped = kinds.iter().enumerate().all(|(k, kind)| {
+                if k == 0 {
+                    *kind != ClientKeyKind::Release
+                } else {
+                    *kind == ClientKeyKind::Repeat
+                }
+            });
+            if kinds.len() > repeats || !shaped {
+                return false;
+            }
+            in_cycle = true;
+            reported |= !kinds.is_empty();
+        } else {
+            if kinds.len() > 1 || kinds.iter().any(|kind| *kind != ClientKeyKind::Release) {
+                return false;
+            }
+            if in_cycle && kinds.len() != usize::from(reported) {
+                return false;
+            }
+            (in_cycle, reported) = (false, false);
+        }
+    }
+    true
+}
+
+/// Whether some attribution of `events` to the input records, in order,
+/// passes `records_follow_provenance`: what a check that cannot see
+/// provenance can decide at best (the r1-r4 I6). The unit cases below hold
+/// I6 to rejecting every attribution where the r4 check did.
+fn some_attribution_passes(
+    input: &[(WindowsKeyRecord, Fate)],
+    events: &[(ClientKeyKind, WindowsKeyRecord)],
+) -> bool {
+    fn walk(
+        input: &[(WindowsKeyRecord, Fate)],
+        events: &[(ClientKeyKind, WindowsKeyRecord)],
+        chosen: &mut Vec<(ClientKeyKind, WindowsKeyRecord, usize)>,
+    ) -> bool {
+        let Some(&(kind, record)) = events.get(chosen.len()) else {
+            return records_follow_provenance(input, chosen);
+        };
+        let first = chosen.last().map_or(0, |(_, _, from)| *from);
+        (first..input.len()).any(|from| {
+            if input[from].0 != record {
+                return false;
+            }
+            chosen.push((kind, record, from));
+            let passes = walk(input, events, chosen);
+            chosen.pop();
+            passes
+        })
+    }
+    walk(input, events, &mut Vec::new())
+}
+
+#[test]
+fn i6_release_cycles_align_sees_lost_and_swapped_releases() {
+    let p1 = key_record(0x20, 0x39, 0x20, 0);
+    let p2 = key_record(0x20, 0x39, 0, LEFT_CTRL_PRESSED);
+    let (r1, r2) = (released(p1), released(p2));
+    let input = [p1, r1, p2, r2].map(|record| (record, Fate::Pane));
+    let press = |record| (ClientKeyKind::Press, record);
+    let release = |record| (ClientKeyKind::Release, record);
+    // The cycles as they happened, and with presses whose bytes reached
+    // the pane as text (reported 0 times).
+    assert!(some_attribution_passes(
+        &input,
+        &[press(p1), release(r1), press(p2), release(r2)]
+    ));
+    assert!(some_attribution_passes(&input, &[press(p1), release(r1)]));
+    assert!(some_attribution_passes(&input, &[]));
+    // codex hvqok-r1 P3: the intermediate release lost, the releases
+    // swapped, a release of a cycle the pane never saw.
+    assert!(!some_attribution_passes(
+        &input,
+        &[press(p1), press(p2), release(r2)]
+    ));
+    assert!(!some_attribution_passes(
+        &input,
+        &[press(p1), release(r2), press(p2), release(r1)]
+    ));
+    assert!(!some_attribution_passes(
+        &input,
+        &[press(p1), release(r1), release(r2)]
+    ));
+    assert!(!some_attribution_passes(&input, &[press(p1)]));
+    // A key-up with no press before it in the input: either way.
+    assert!(some_attribution_passes(&[(r1, Fate::Pane)], &[release(r1)]));
+    assert!(some_attribution_passes(&[(r1, Fate::Pane)], &[]));
+    assert!(fates_follow_cycles(&[(r1, Fate::Consumed)]));
+}
+
+/// codex hvqok-r2 P3 (herdr-vqok r3): `P1, R1, P2, R2` with identical
+/// presses and distinguishable releases; P1 reached the pane, the report
+/// consumed P2 (so its cycle's release R2 is consumed too). Output `P1, R2`
+/// lost R1 and leaked R2, but the round-2 search read the press as P2's.
+/// The fates pin each press to its own cycle (ADR-0013 amendment 5).
+#[test]
+fn i6_release_cycles_align_holds_an_emitted_press_to_its_own_cycle() {
+    let p1 = key_record(0x20, 0x39, 0x20, 0);
+    let r1 = released(p1);
+    let r2 = released(key_record(0x20, 0x39, 0x20, LEFT_CTRL_PRESSED));
+    let input = [
+        (p1, Fate::Pane),
+        (r1, Fate::Pane),
+        (p1, Fate::Consumed),
+        (r2, Fate::Consumed),
+    ];
+    assert!(fates_follow_cycles(&input));
+    assert!(!some_attribution_passes(
+        &input,
+        &[(ClientKeyKind::Press, p1), (ClientKeyKind::Release, r2)]
+    ));
+    assert!(some_attribution_passes(
+        &input,
+        &[(ClientKeyKind::Press, p1), (ClientKeyKind::Release, r1)]
+    ));
+    // A ledger that let R1 go with the report, or R2 reach the pane, breaks
+    // the cycle rule itself.
+    assert!(!fates_follow_cycles(&[
+        (p1, Fate::Pane),
+        (r1, Fate::Consumed),
+    ]));
+    assert!(!fates_follow_cycles(&[
+        (p1, Fate::Consumed),
+        (r2, Fate::Pane),
+    ]));
+}
+
+/// codex hvqok-r3 P3 (herdr-vqok r4): `P1, R1, P2, R2` with identical
+/// records, each press with a repeat count of 2, every fate Pane. Output
+/// `P1, P2, R2` lost R1, but the search read both presses as the two
+/// repeats of P1, R2 as R1 and P2 as reported 0 times. A record's reports
+/// after its first are repeats, so a second Press starts the next record:
+/// each emitted press is held to its own cycle.
+#[test]
+fn i6_release_cycles_align_holds_a_second_press_to_its_own_record() {
+    let p = WindowsKeyRecord {
+        repeat_count: 2,
+        ..key_record(0x20, 0x39, 0x20, 0)
+    };
+    let r = released(p);
+    let input = [p, r, p, r].map(|record| (record, Fate::Pane));
+    let press = (ClientKeyKind::Press, p);
+    let repeat = (ClientKeyKind::Repeat, p);
+    let release = (ClientKeyKind::Release, r);
+    assert!(fates_follow_cycles(&input));
+    assert!(!some_attribution_passes(&input, &[press, press, release]));
+    // The cycles as they happened, with and without the repeats.
+    assert!(some_attribution_passes(
+        &input,
+        &[press, repeat, release, press, repeat, release]
+    ));
+    assert!(some_attribution_passes(
+        &input,
+        &[press, release, press, release]
+    ));
+    assert!(some_attribution_passes(&input, &[press, repeat, release]));
+}
+
+/// codex hvqok-r4fix P2 (herdr-vqok r5): identical presses `P` (Space,
+/// scan code 0), releases R1 and R2 told apart by control state 0 and 8.
+/// Input native P1, native R1, serialized P2 (it reaches the pane as raw
+/// text), native P3, native R2, every fate Pane. Output `P1, P3, R2` lost
+/// R1; a check that does not know which record each event came from reads
+/// the first press as P2's and accepts it. I6 must reject it: with each
+/// event held to its record the first cycle has a press and no release.
+#[test]
+fn i6_rejects_a_lost_release_across_cycles() {
+    let p = key_record(0x20, 0, 0x20, 0);
+    let r1 = released(p);
+    let r2 = released(key_record(0x20, 0, 0x20, LEFT_CTRL_PRESSED));
+    let input = [p, r1, p, p, r2].map(|record| (record, Fate::Pane));
+    let press = |from| (ClientKeyKind::Press, p, from);
+    let release = |record, from| (ClientKeyKind::Release, record, from);
+    assert!(fates_follow_cycles(&input));
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(0), press(3), release(r2, 4)]
+    ));
+    // Blind to provenance, the loss reads as a legal stream.
+    assert!(some_attribution_passes(
+        &input,
+        &[
+            (ClientKeyKind::Press, p),
+            (ClientKeyKind::Press, p),
+            (ClientKeyKind::Release, r2),
+        ]
+    ));
+    // The stream as it happened, and with the same events claimed by the
+    // wrong records.
+    assert!(records_follow_provenance(
+        &input,
+        &[press(0), release(r1, 1), press(3), release(r2, 4)]
+    ));
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(2), release(r1, 1), press(3), release(r2, 4)]
+    ));
+    assert!(!records_follow_provenance(
+        &input,
+        &[press(0), release(r1, 4), press(3), release(r2, 1)]
+    ));
 }
 
 impl<'a> Harness<'a> {
@@ -1706,6 +2043,8 @@ impl<'a> Harness<'a> {
             },
             rng: Rng(seed),
             default_window_end: DEFAULT_COLOR_WINDOW,
+            key_events: Vec::new(),
+            key_inputs: Vec::new(),
         };
         let config = case.config;
         let framer = harness.byte_framer_mut();
@@ -1846,6 +2185,9 @@ impl<'a> Harness<'a> {
         } else {
             pump.idle()
         };
+        if record {
+            self.key_inputs.push(SHIFT_PRESS);
+        }
         let emitted = pump.framer().released - released;
         if self.byte_framer().pushed != pushed {
             return Err(format!(
@@ -1867,6 +2209,7 @@ impl<'a> Harness<'a> {
         } else {
             "after an idle tick"
         };
+        self.observe_releases(&events)?;
         self.settle(what, pump_events(&events))
     }
 
@@ -1941,6 +2284,7 @@ impl<'a> Harness<'a> {
             Some(record) => pump.serialized_key(record),
             None => pump.key(NATIVE_RECORD),
         };
+        self.key_inputs.push(read.nested.unwrap_or(NATIVE_RECORD));
         let grew = self.byte_framer().pushed - pushed;
         if grew > 0 {
             if !staged || grew != read.bytes.len() as u64 {
@@ -1980,6 +2324,7 @@ impl<'a> Harness<'a> {
                 ));
             }
         }
+        self.observe_releases(&events)?;
         self.settle("after a key record", pump_events(&events))
     }
 
@@ -1993,9 +2338,137 @@ impl<'a> Harness<'a> {
         )
     }
 
+    /// I6: records every console key event the pump reports, in order;
+    /// `check_releases` judges them against the input once the run ends.
+    fn observe_releases(&mut self, events: &[ClientInputEvent]) -> Result<(), String> {
+        for event in events {
+            if let ClientInputEvent::Key {
+                kind,
+                source: ClientKeySource::WindowsConsole { record },
+                ..
+            } = event
+            {
+                self.key_events.push((*kind, *record));
+            }
+        }
+        Ok(())
+    }
+
+    /// I6: per console key (virtual key and scan code), the pump's ledger
+    /// saw every input record in order and left none pending, its fates
+    /// follow the press cycles (`fates_follow_cycles`), and every console
+    /// event, held to the record the pump says it came from, follows that
+    /// record (`records_follow_provenance`). Records with neither a virtual
+    /// key nor a scan code are raw bytes the ledger does not track; an
+    /// event from one has no provenance and fails (ADR-0013 amendments 5
+    /// and 6).
+    fn check_releases(&self) -> Result<(), String> {
+        let input = &self.key_inputs;
+        let (fates, emitted_from) = self
+            .pump
+            .as_ref()
+            .map(|pump| (pump.record_fates(), pump.emitted_from().to_vec()))
+            .unwrap_or_default();
+        if emitted_from.len() != self.key_events.len() {
+            return Err(format!(
+                "I6: the pump traced {} console key events and reported {}",
+                emitted_from.len(),
+                self.key_events.len()
+            ));
+        }
+        let mut keys: Vec<(u16, u16)> = Vec::new();
+        for record in input
+            .iter()
+            .chain(self.key_events.iter().map(|(_, r)| r))
+            .chain(fates.iter().map(|(r, _)| r))
+        {
+            let key = (record.virtual_key_code, record.virtual_scan_code);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let show = |record: &WindowsKeyRecord| {
+            format!(
+                "{}{:#x}/{:#x}x{}",
+                if record.key_down { "down " } else { "up " },
+                record.unicode,
+                record.control_key_state,
+                record.repeat_count
+            )
+        };
+        for key in keys {
+            let of_key = |record: &WindowsKeyRecord| {
+                (record.virtual_key_code, record.virtual_scan_code) == key
+            };
+            let records: Vec<WindowsKeyRecord> =
+                input.iter().copied().filter(|r| of_key(r)).collect();
+            // The fate-log index of each of the key's records, in order.
+            let logged: Vec<usize> = (0..fates.len()).filter(|&i| of_key(&fates[i].0)).collect();
+            let judged: Vec<(WindowsKeyRecord, Fate)> = if key == (0, 0) {
+                records.iter().map(|record| (*record, Fate::Pane)).collect()
+            } else {
+                let of_key_fates: Vec<(WindowsKeyRecord, Option<bool>)> =
+                    logged.iter().map(|&i| fates[i]).collect();
+                let seen: Vec<WindowsKeyRecord> = of_key_fates.iter().map(|(r, _)| *r).collect();
+                if seen != records || of_key_fates.iter().any(|(_, fate)| fate.is_none()) {
+                    return Err(format!(
+                        "I6: key {key:?} ledger fates {:?} for its input records {:?}",
+                        of_key_fates
+                            .iter()
+                            .map(|(record, fate)| format!("{} {fate:?}", show(record)))
+                            .collect::<Vec<_>>(),
+                        records.iter().map(show).collect::<Vec<_>>()
+                    ));
+                }
+                of_key_fates
+                    .into_iter()
+                    .map(|(record, fate)| {
+                        let fate = if fate == Some(true) {
+                            Fate::Pane
+                        } else {
+                            Fate::Consumed
+                        };
+                        (record, fate)
+                    })
+                    .collect()
+            };
+            let mut events: Vec<(ClientKeyKind, WindowsKeyRecord, usize)> = Vec::new();
+            for ((kind, record), from) in self.key_events.iter().zip(&emitted_from) {
+                if !of_key(record) {
+                    continue;
+                }
+                let Some(from) = from.and_then(|from| logged.iter().position(|&i| i == from))
+                else {
+                    return Err(format!(
+                        "I6: key {key:?} reported {kind:?} {} with no record of the key behind it \
+                         (provenance {from:?})",
+                        show(record)
+                    ));
+                };
+                events.push((*kind, *record, from));
+            }
+            if !fates_follow_cycles(&judged) || !records_follow_provenance(&judged, &events) {
+                let records: Vec<String> = judged
+                    .iter()
+                    .map(|(record, fate)| format!("{} {fate:?}", show(record)))
+                    .collect();
+                let events: Vec<String> = events
+                    .iter()
+                    .map(|(kind, record, from)| format!("{kind:?} {} from #{from}", show(record)))
+                    .collect();
+                return Err(format!(
+                    "I6: key {key:?} reported {events:?} for its input records {records:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn finish(&self) -> Result<(), String> {
         if self.byte_framer().has_pending_input() || self.filter_pending() {
             Err(self.stranded())
+        } else if self.pump.is_some() {
+            self.check_releases()
         } else {
             Ok(())
         }
@@ -2105,6 +2578,7 @@ impl<'a> Harness<'a> {
                     return Err("no pump".to_string());
                 };
                 let events = pump.bytes(&raw);
+                self.observe_releases(&events)?;
                 self.settle("after a read", pump_events(&events))?;
                 if self.rng.chance(1, 4) {
                     self.flush(true)?;
@@ -2731,10 +3205,26 @@ struct ExtendedCoverage {
     staged_report_keys: usize,
     standalone_keys: usize,
     staged_silent_keys: usize,
+    /// herdr-vqok: byte-free Ctrl+Space repeats of a Space button record,
+    /// and their releases.
+    byte_free_repeats: usize,
+    byte_free_repeat_releases: usize,
 }
 
 impl ExtendedCoverage {
     fn count(&mut self, case: &Case) {
+        for record in case.reads.iter().filter_map(|read| read.nested) {
+            if record.virtual_key_code == 0x20
+                && record.unicode == 0
+                && record.control_key_state == LEFT_CTRL_PRESSED
+            {
+                if record.key_down {
+                    self.byte_free_repeats += 1;
+                } else {
+                    self.byte_free_repeat_releases += 1;
+                }
+            }
+        }
         self.staged_silent_keys += case
             .reads
             .iter()
@@ -2834,6 +3324,8 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_report_keys,
         standalone_keys,
         staged_silent_keys,
+        byte_free_repeats,
+        byte_free_repeat_releases,
     } = extended;
     for count in [
         unterminated_colors,
@@ -2845,6 +3337,9 @@ fn property_generators_cover_graphics_streams_and_both_streams() {
         staged_silent_keys,
     ] {
         assert!(count > 1_000, "{extended:?}");
+    }
+    for count in [byte_free_repeats, byte_free_repeat_releases] {
+        assert!(count > 100, "{extended:?}");
     }
 }
 

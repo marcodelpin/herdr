@@ -368,20 +368,214 @@ struct WindowsInputPump {
     framer: crate::raw_input::RawInputFramer,
     pending_escape_origin: Option<EscapeOrigin>,
     paste_from_win32_key_records: bool,
-    pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
+    pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool, Provenance)>,
     default_mouse_candidate: DefaultMouseCandidate,
-    consumed_default_mouse_keys: Vec<WindowsKeyRecord>,
+    /// The open press cycle of every key and who owns it: the one place a
+    /// release learns where it goes (ADR-0013 amendment 5).
+    key_cycles: KeyCycleLedger,
+    /// Test builds: the provenance of every console key event the pump
+    /// emitted, in emission order (property I6, herdr-vqok r5).
+    #[cfg(test)]
+    emitted_from: Vec<Provenance>,
 }
+
+/// The record a console key event came from: in test builds, its index in
+/// the ledger's fate log when the ledger tracks its key; always `None` in
+/// production (ADR-0013 amendment 6).
+type Provenance = Option<usize>;
 
 #[derive(Default)]
 struct DefaultMouseCandidate {
     active: bool,
-    /// The staged events in arrival order, each with whether its record
-    /// pushed bytes the report can take (a release: whether its press did).
-    /// An accepted report consumes only those; a record that pushed none
-    /// (an arrow key) stays semantic input (ADR-0013 amendment 3, D4).
-    events: Vec<(crate::protocol::ClientInputEvent, bool)>,
-    unreleased_keys: Vec<WindowsKeyRecord>,
+    /// The staged events in arrival order, each with the fate of its
+    /// record: `Pane` events stay input whatever the report does, `Staged`
+    /// ones go with the report (consumed when it is accepted, replayed when
+    /// it is not). A record that pushed no bytes (an arrow key) gives the
+    /// report nothing (ADR-0013 amendment 3, D4; amendment 5).
+    events: Vec<(crate::protocol::ClientInputEvent, RecordFate, Provenance)>,
+}
+
+/// Who owns the open press cycle of a key: the presses since its last
+/// release (ADR-0013 amendment 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleOwner {
+    /// A press of the cycle reached the pane, or reaches it whatever the
+    /// pending report does.
+    Pane,
+    /// Every press went to a report, some to the pending one.
+    Staged,
+    /// Every press went to reports that were accepted.
+    Consumed,
+    /// Every press became paste text: the pane saw no key of the cycle, and
+    /// its release outside a paste is dropped (codex hvqok-r3 P2).
+    Text,
+}
+
+/// Where one key record goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordFate {
+    /// It reaches the pane.
+    Pane,
+    /// It goes with the pending report: consumed if the report is
+    /// accepted, replayed to the pane if it is not.
+    Staged,
+    /// It is dropped: it ends a cycle accepted reports consumed.
+    Consumed,
+}
+
+/// One ledger of press cycles that every tracked key record joins in
+/// arrival order, nested or native, inside a report or outside one. A
+/// release ends exactly its key's open cycle and takes that cycle's owner
+/// as its fate (ADR-0013 amendment 5).
+#[derive(Default)]
+struct KeyCycleLedger {
+    /// Per key (virtual key and scan code), its open cycle's owner.
+    open: Vec<((u16, u16), CycleOwner)>,
+    /// Test builds: the fate of every tracked record, in arrival order;
+    /// `Staged` until its report ends (property I6 judges by these).
+    #[cfg(test)]
+    fates: Vec<(WindowsKeyRecord, RecordFate)>,
+    /// Test builds: the fate-log index of the record the last note logged.
+    #[cfg(test)]
+    noted: Option<usize>,
+}
+
+impl KeyCycleLedger {
+    /// The key a record belongs to; records with neither a virtual key nor
+    /// a scan code (raw bytes) are not tracked.
+    fn key(record: WindowsKeyRecord) -> Option<(u16, u16)> {
+        (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
+            .then_some((record.virtual_key_code, record.virtual_scan_code))
+    }
+
+    /// Notes one record and returns its fate with its provenance, the index
+    /// the note gave it in the fate log (test builds, tracked keys only).
+    fn traced(&mut self, note: impl FnOnce(&mut Self) -> RecordFate) -> (RecordFate, Provenance) {
+        #[cfg(test)]
+        {
+            self.noted = None;
+            let fate = note(self);
+            (fate, self.noted.take())
+        }
+        #[cfg(not(test))]
+        {
+            (note(self), None)
+        }
+    }
+
+    fn owner(&self, record: WindowsKeyRecord) -> Option<CycleOwner> {
+        let key = Self::key(record)?;
+        self.open
+            .iter()
+            .find(|(open, _)| *open == key)
+            .map(|(_, owner)| *owner)
+    }
+
+    /// A press joins its key's cycle, opening one if none is open. A
+    /// `staged` press goes with the pending report; any other reaches the
+    /// pane, and then so does the cycle's release.
+    fn press(&mut self, record: WindowsKeyRecord, staged: bool) -> RecordFate {
+        let fate = if staged {
+            RecordFate::Staged
+        } else {
+            RecordFate::Pane
+        };
+        let Some(key) = Self::key(record) else {
+            return fate;
+        };
+        let joined = if staged {
+            CycleOwner::Staged
+        } else {
+            CycleOwner::Pane
+        };
+        match self.open.iter_mut().find(|(open, _)| *open == key) {
+            Some((_, owner)) if *owner != CycleOwner::Pane => *owner = joined,
+            Some(_) => {}
+            None => self.open.push((key, joined)),
+        }
+        self.log(record, fate);
+        fate
+    }
+
+    /// A release ends its key's open cycle and goes where its owner says;
+    /// with no open cycle (a key held before the client attached) it
+    /// reaches the pane.
+    fn release(&mut self, record: WindowsKeyRecord) -> RecordFate {
+        let Some(key) = Self::key(record) else {
+            return RecordFate::Pane;
+        };
+        let fate = match self.open.iter().position(|(open, _)| *open == key) {
+            Some(index) => match self.open.remove(index).1 {
+                CycleOwner::Pane => RecordFate::Pane,
+                CycleOwner::Staged => RecordFate::Staged,
+                CycleOwner::Consumed | CycleOwner::Text => RecordFate::Consumed,
+            },
+            None => RecordFate::Pane,
+        };
+        self.log(record, fate);
+        fate
+    }
+
+    /// A record that reaches the pane whatever happens.
+    fn note_pane(&mut self, record: WindowsKeyRecord) -> RecordFate {
+        if record.key_down {
+            self.press(record, false)
+        } else {
+            self.release(record)
+        }
+    }
+
+    /// A record whose bytes become paste text: the pane never sees its key.
+    /// A press takes no ownership of its key's cycle; with none open it opens
+    /// a `Text` one. A release ends its cycle as any other (codex hvqok-r3
+    /// P2, herdr-vqok r4).
+    fn note_paste_text(&mut self, record: WindowsKeyRecord) -> RecordFate {
+        if !record.key_down {
+            return self.release(record);
+        }
+        let Some(key) = Self::key(record) else {
+            return RecordFate::Consumed;
+        };
+        if !self.open.iter().any(|(open, _)| *open == key) {
+            self.open.push((key, CycleOwner::Text));
+        }
+        self.log(record, RecordFate::Consumed);
+        RecordFate::Consumed
+    }
+
+    /// The pending report ended: what went with it is consumed when it was
+    /// accepted and reaches the pane when it was not.
+    fn end_report(&mut self, accepted: bool) {
+        let owner = if accepted {
+            CycleOwner::Consumed
+        } else {
+            CycleOwner::Pane
+        };
+        for (_, open) in &mut self.open {
+            if *open == CycleOwner::Staged {
+                *open = owner;
+            }
+        }
+        #[cfg(test)]
+        for (_, fate) in &mut self.fates {
+            if *fate == RecordFate::Staged {
+                *fate = if accepted {
+                    RecordFate::Consumed
+                } else {
+                    RecordFate::Pane
+                };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn log(&mut self, record: WindowsKeyRecord, fate: RecordFate) {
+        self.noted = Some(self.fates.len());
+        self.fates.push((record, fate));
+    }
+
+    #[cfg(not(test))]
+    fn log(&mut self, _record: WindowsKeyRecord, _fate: RecordFate) {}
 }
 
 impl Default for WindowsInputPump {
@@ -392,7 +586,9 @@ impl Default for WindowsInputPump {
             paste_from_win32_key_records: false,
             pending_physical_escape: None,
             default_mouse_candidate: DefaultMouseCandidate::default(),
-            consumed_default_mouse_keys: Vec::new(),
+            key_cycles: KeyCycleLedger::default(),
+            #[cfg(test)]
+            emitted_from: Vec::new(),
         }
     }
 }
@@ -449,7 +645,7 @@ impl WindowsInputPump {
 
     fn process(&mut self, item: PlatformInputItem) -> Vec<crate::protocol::ClientInputEvent> {
         let mut events = Vec::new();
-        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+        if let Some((escape, open_bracket, from)) = self.pending_physical_escape.take() {
             let raw_bytes = item.raw_bytes();
             let continues_sgr = if open_bracket {
                 raw_bytes.is_some_and(|bytes| bytes.starts_with(b"<"))
@@ -461,9 +657,10 @@ impl WindowsInputPump {
                 let raw_events = self.framer.push(prefix);
                 events.extend(self.process_raw_events(raw_events));
             } else if !open_bracket && raw_bytes == Some(b"[") {
-                self.pending_physical_escape = Some((escape, true));
+                self.pending_physical_escape = Some((escape, true, from));
                 return events;
             } else {
+                self.emit(from, std::slice::from_ref(&escape));
                 events.push(escape);
                 if open_bracket {
                     let raw_events = self.framer.push(b"[");
@@ -475,7 +672,11 @@ impl WindowsInputPump {
             if !self.framer.has_pending_bracketed_paste() {
                 let raw_events = self.flush_before_semantic();
                 events.extend(self.process_raw_events(raw_events));
-                self.pending_physical_escape = Some((escape, false));
+                // The press is noted now and emitted later, unless an SGR
+                // report takes it.
+                let from = console_record(&escape)
+                    .and_then(|record| self.key_cycles.traced(|ledger| ledger.note_pane(record)).1);
+                self.pending_physical_escape = Some((escape, false, from));
                 return events;
             }
         }
@@ -494,7 +695,7 @@ impl WindowsInputPump {
             PlatformInputItem::Semantic(event) => {
                 let raw_events = self.flush_before_semantic();
                 let mut events = self.process_raw_events(raw_events);
-                events.push(event);
+                events.extend(self.note_native_key_events(vec![event]));
                 events
             }
             PlatformInputItem::PasteAwareBytes {
@@ -503,12 +704,18 @@ impl WindowsInputPump {
                 win32_paste_bytes,
                 nested_record,
             } => {
-                if self.consume_default_mouse_key_event(nested_record) {
+                if self.drops_consumed_release(nested_record) {
                     Vec::new()
                 } else {
                     let pending_paste = self.framer.has_pending_bracketed_paste();
-                    if !pending_paste && self.framer.has_pending_default_mouse_sequence() {
+                    if pending_paste {
+                        self.key_cycles.note_paste_text(nested_record);
+                    } else if self.framer.has_pending_default_mouse_sequence() {
                         self.stage_default_mouse_record(nested_record, &raw_bytes);
+                    } else {
+                        // Raw bytes reach the framer in order with the
+                        // flushes before them, so the record joins now.
+                        self.key_cycles.note_pane(nested_record);
                     }
                     let decode_win32_record = self.paste_from_win32_key_records || !pending_paste;
                     self.pending_escape_origin = if decode_win32_record && !pending_paste {
@@ -537,11 +744,20 @@ impl WindowsInputPump {
                 events,
                 nested_record,
             } => {
-                let suppress_consumed_key = nested_record
-                    .is_some_and(|record| self.consume_default_mouse_key_event(record));
+                let suppress_consumed_key =
+                    nested_record.is_some_and(|record| self.drops_consumed_release(record));
                 if suppress_consumed_key {
                     Vec::new()
                 } else if self.framer.has_pending_bracketed_paste() {
+                    // The key's bytes become paste text and its events are
+                    // dropped, so it takes no pane ownership (codex
+                    // hvqok-r3 P2).
+                    match nested_record {
+                        Some(record) => {
+                            self.key_cycles.note_paste_text(record);
+                        }
+                        None => self.note_paste_key_events(&events),
+                    }
                     let bytes = if self.paste_from_win32_key_records {
                         &win32_paste_bytes
                     } else {
@@ -571,8 +787,20 @@ impl WindowsInputPump {
                     } else {
                         self.flush_before_semantic()
                     };
+                    // The flush may end an older report and commit its
+                    // staged records, so the record joins the ledger after
+                    // it, in the order the pane gets the events (codex
+                    // hvqok-r2 P2).
                     let mut output = self.process_raw_events(raw_events);
-                    output.extend(events);
+                    match nested_record {
+                        Some(record) => {
+                            let (_, from) =
+                                self.key_cycles.traced(|ledger| ledger.note_pane(record));
+                            self.emit(from, &events);
+                            output.extend(events);
+                        }
+                        None => output.extend(self.note_native_key_events(events)),
+                    }
                     output
                 }
             }
@@ -583,7 +811,8 @@ impl WindowsInputPump {
 
     fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
         let mut events = Vec::new();
-        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+        if let Some((escape, open_bracket, from)) = self.pending_physical_escape.take() {
+            self.emit(from, std::slice::from_ref(&escape));
             events.push(escape);
             if open_bracket {
                 let raw_events = self.framer.push(b"[");
@@ -629,19 +858,19 @@ impl WindowsInputPump {
         {
             self.default_mouse_candidate.active = false;
             self.framer.end_staged_records();
-            let staged = std::mem::take(&mut self.default_mouse_candidate.events);
-            let mut staged: Vec<_> = if accepted_default_mouse {
-                self.consumed_default_mouse_keys
-                    .append(&mut self.default_mouse_candidate.unreleased_keys);
-                staged
-                    .into_iter()
-                    .filter(|(_, has_report_bytes)| !has_report_bytes)
-                    .map(|(event, _)| event)
-                    .collect()
-            } else {
-                self.default_mouse_candidate.unreleased_keys.clear();
-                staged.into_iter().map(|(event, _)| event).collect()
-            };
+            self.key_cycles.end_report(accepted_default_mouse);
+            let mut staged = Vec::new();
+            for (event, fate, from) in std::mem::take(&mut self.default_mouse_candidate.events) {
+                let replayed = match fate {
+                    RecordFate::Pane => true,
+                    RecordFate::Staged => !accepted_default_mouse,
+                    RecordFate::Consumed => false,
+                };
+                if replayed {
+                    self.emit(from, std::slice::from_ref(&event));
+                    staged.push(event);
+                }
+            }
             staged.append(&mut output);
             output = staged;
         }
@@ -654,39 +883,110 @@ impl WindowsInputPump {
         raw_bytes: &[u8],
         events: Vec<crate::protocol::ClientInputEvent>,
     ) {
-        // A release goes with its press: it belongs to the report when the
-        // press pushed bytes the report can take.
-        let has_report_bytes = if record.key_down {
-            !raw_bytes.is_empty()
-        } else {
-            matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_some()
-        };
+        let (fate, from) = self.stage_default_mouse_record(record, raw_bytes);
         self.default_mouse_candidate
             .events
-            .extend(events.into_iter().map(|event| (event, has_report_bytes)));
-        self.stage_default_mouse_record(record, raw_bytes);
+            .extend(events.into_iter().map(|event| (event, fate, from)));
     }
 
-    fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) {
+    /// Stages a record for the pending report and returns its fate from the
+    /// ledger. A press goes with the report when it pushed bytes the report
+    /// can take; a release goes where the owner of the cycle it ends says
+    /// (ADR-0013 amendment 5).
+    fn stage_default_mouse_record(
+        &mut self,
+        record: WindowsKeyRecord,
+        raw_bytes: &[u8],
+    ) -> (RecordFate, Provenance) {
         self.default_mouse_candidate.active = true;
-        if record.key_down
-            && !raw_bytes.is_empty()
-            && (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
-        {
-            if matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_none() {
-                self.default_mouse_candidate.unreleased_keys.push(record);
+        let staged = !raw_bytes.is_empty();
+        self.key_cycles.traced(|ledger| {
+            if record.key_down {
+                ledger.press(record, staged)
+            } else {
+                ledger.release(record)
             }
-        } else if !record.key_down {
-            remove_matching_key(&mut self.default_mouse_candidate.unreleased_keys, record);
-        }
+        })
     }
 
-    fn consume_default_mouse_key_event(&mut self, record: WindowsKeyRecord) -> bool {
-        let Some(index) = matching_key_index(&self.consumed_default_mouse_keys, record) else {
+    /// Outside a paste, a nested release that ends a cycle accepted reports
+    /// consumed or a cycle of paste text is dropped whole. Inside a paste
+    /// its bytes are paste text whatever owns the cycle, so it is never
+    /// dropped: it ends the cycle as paste text (codex hvqok-r4fix P1,
+    /// herdr-vqok r5).
+    fn drops_consumed_release(&mut self, record: WindowsKeyRecord) -> bool {
+        if record.key_down || self.framer.has_pending_bracketed_paste() {
             return false;
-        };
-        self.consumed_default_mouse_keys.remove(index);
-        !record.key_down
+        }
+        let drops = matches!(
+            self.key_cycles.owner(record),
+            Some(CycleOwner::Consumed | CycleOwner::Text)
+        );
+        if !drops {
+            return false;
+        }
+        self.key_cycles.release(record);
+        true
+    }
+
+    /// Native console key events join the ledger through the record of
+    /// their `WindowsConsole` source, once per record (a repeated press
+    /// reports several events of one record); a release of a consumed
+    /// cycle is dropped. Returns the events that reach the pane.
+    fn note_native_key_events(
+        &mut self,
+        events: Vec<crate::protocol::ClientInputEvent>,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut last: Option<(WindowsKeyRecord, RecordFate, Provenance)> = None;
+        let mut output = Vec::with_capacity(events.len());
+        for event in events {
+            let Some(record) = console_record(&event) else {
+                output.push(event);
+                continue;
+            };
+            let (fate, from) = match last {
+                Some((noted, fate, from)) if noted == record => (fate, from),
+                _ => self.key_cycles.traced(|ledger| ledger.note_pane(record)),
+            };
+            last = Some((record, fate, from));
+            if fate != RecordFate::Consumed {
+                self.emit(from, std::slice::from_ref(&event));
+                output.push(event);
+            }
+        }
+        output
+    }
+
+    /// Test builds: records the provenance of the console key events among
+    /// `events`, which the pump emits now (property I6).
+    #[cfg(test)]
+    fn emit(&mut self, from: Provenance, events: &[crate::protocol::ClientInputEvent]) {
+        let emitted = events
+            .iter()
+            .filter(|event| console_record(event).is_some())
+            .count();
+        self.emitted_from.extend(std::iter::repeat_n(from, emitted));
+    }
+
+    #[cfg(not(test))]
+    fn emit(&mut self, _from: Provenance, _events: &[crate::protocol::ClientInputEvent]) {}
+
+    /// Native console key events whose bytes become paste text join the
+    /// ledger through their record, once per record, as paste text.
+    fn note_paste_key_events(&mut self, events: &[crate::protocol::ClientInputEvent]) {
+        let mut last: Option<WindowsKeyRecord> = None;
+        for event in events {
+            if let crate::protocol::ClientInputEvent::Key {
+                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                ..
+            } = event
+            {
+                if last != Some(*record) {
+                    self.key_cycles.note_paste_text(*record);
+                }
+                last = Some(*record);
+            }
+        }
     }
 
     fn raw_events_to_client_events(
@@ -699,19 +999,15 @@ impl WindowsInputPump {
     }
 }
 
-fn matching_key_index(keys: &[WindowsKeyRecord], record: WindowsKeyRecord) -> Option<usize> {
-    keys.iter().position(|candidate| {
-        candidate.virtual_key_code == record.virtual_key_code
-            && candidate.virtual_scan_code == record.virtual_scan_code
-    })
-}
-
-fn remove_matching_key(keys: &mut Vec<WindowsKeyRecord>, record: WindowsKeyRecord) -> bool {
-    let Some(index) = matching_key_index(keys, record) else {
-        return false;
-    };
-    keys.remove(index);
-    true
+/// The console record a key event carries, if it came from one.
+fn console_record(event: &crate::protocol::ClientInputEvent) -> Option<WindowsKeyRecord> {
+    match event {
+        crate::protocol::ClientInputEvent::Key {
+            source: crate::protocol::ClientKeySource::WindowsConsole { record },
+            ..
+        } => Some(*record),
+        _ => None,
+    }
 }
 
 impl PlatformInputItem {
@@ -890,6 +1186,33 @@ impl PumpUnderTest {
 
     pub(crate) fn framer_mut(&mut self) -> &mut crate::raw_input::RawInputFramer {
         &mut self.0.pump.framer
+    }
+
+    /// The fate of every tracked key record the pump's ledger saw, in
+    /// arrival order: `Some(true)` reached the pane, `Some(false)` was
+    /// consumed, `None` still waits for its report (ADR-0013 amendment 5).
+    pub(crate) fn record_fates(&self) -> Vec<(WindowsKeyRecord, Option<bool>)> {
+        self.0
+            .pump
+            .key_cycles
+            .fates
+            .iter()
+            .map(|(record, fate)| {
+                let fate = match fate {
+                    RecordFate::Pane => Some(true),
+                    RecordFate::Consumed => Some(false),
+                    RecordFate::Staged => None,
+                };
+                (*record, fate)
+            })
+            .collect()
+    }
+
+    /// For every console key event the pump emitted, in emission order, the
+    /// index in `record_fates` of the record it came from; `None` for a
+    /// record the ledger does not track (property I6, herdr-vqok r5).
+    pub(crate) fn emitted_from(&self) -> &[Option<usize>] {
+        &self.0.pump.emitted_from
     }
 
     /// Raw input bytes, as the mapper's win32-input-mode framer passes them
@@ -5128,6 +5451,598 @@ mod tests {
             event_summary_with_repeats(&events),
             vec!["Upx1", "Enterx1"],
             "{events:?}"
+        );
+    }
+
+    /// Each event as kind, key and modifiers (`mouse` for a Mouse event),
+    /// releases included.
+    fn event_summary_with_kinds(events: &[crate::protocol::ClientInputEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                crate::protocol::ClientInputEvent::Key {
+                    code,
+                    modifiers,
+                    kind,
+                    ..
+                } => format!("{kind:?} {code:?} mods {modifiers}"),
+                crate::protocol::ClientInputEvent::Mouse { .. } => "mouse".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// Raw `ESC [ M`, then the given serialized key records, raw `d 2` after
+    /// the first `before_d2` of them, the rest, then idle ticks to the end
+    /// of every hold.
+    fn x10_report_with_d2_after(
+        records: &[WindowsKeyRecord],
+        before_d2: usize,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut translator = WindowsInputTranslator::default();
+        x10_report_with_d2_after_on(&mut translator, records, before_d2)
+    }
+
+    /// `x10_report_with_d2_after` on the caller's translator.
+    fn x10_report_with_d2_after_on(
+        translator: &mut WindowsInputTranslator,
+        records: &[WindowsKeyRecord],
+        before_d2: usize,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+            events.extend(translator.translate(record));
+        }
+        for (index, record) in records.iter().copied().enumerate() {
+            if index == before_d2 {
+                for record in win32_input_mode_encoded_raw_bytes(b"d2") {
+                    events.extend(translator.translate(record));
+                }
+            }
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        if before_d2 >= records.len() {
+            for record in win32_input_mode_encoded_raw_bytes(b"d2") {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex f5251-r8fix (herdr-vqok): a release belongs to the press it
+    /// ends, the latest press of its key. Raw `ESC [ M`, a Space press that
+    /// gives the report its button byte, a Ctrl+Space press of the same
+    /// held key with no bytes, its release, raw `d 2`. The report takes
+    /// Space; Ctrl+Space, which gave it nothing, reaches the pane pressed
+    /// and released. Before, the release matched Space's entry by virtual
+    /// key and scan code and went with the report: a press with no release.
+    #[test]
+    fn review_vqok_release_of_byte_free_repeat_before_report_end_survives() {
+        let space = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x20,
+            virtual_scan_code: 0x39,
+            unicode: 0x20,
+            control_key_state: 0,
+        };
+        let ctrl_space = WindowsKeyRecord {
+            unicode: 0,
+            control_key_state: 0x0008,
+            ..space
+        };
+        let ctrl_space_up = WindowsKeyRecord {
+            key_down: false,
+            ..ctrl_space
+        };
+        let events = x10_report_with_d2_after(&[space, ctrl_space, ctrl_space_up], 3);
+        let ctrl = crossterm::event::KeyModifiers::CONTROL.bits();
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                format!("Press Char(' ') mods {ctrl}"),
+                format!("Release Char(' ') mods {ctrl}"),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok, the release after the report: the same burst with raw
+    /// `d 2` before the Ctrl+Space release. The accepted report consumes
+    /// Space's press only; the later release ends Ctrl+Space, which reached
+    /// the pane, so it reaches the pane too. Before, Space's stale entry
+    /// moved to the consumed keys and the release was dropped there.
+    #[test]
+    fn review_vqok_release_of_byte_free_repeat_after_report_end_survives() {
+        let space = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x20,
+            virtual_scan_code: 0x39,
+            unicode: 0x20,
+            control_key_state: 0,
+        };
+        let ctrl_space = WindowsKeyRecord {
+            unicode: 0,
+            control_key_state: 0x0008,
+            ..space
+        };
+        let ctrl_space_up = WindowsKeyRecord {
+            key_down: false,
+            ..ctrl_space
+        };
+        let events = x10_report_with_d2_after(&[space, ctrl_space, ctrl_space_up], 2);
+        let ctrl = crossterm::event::KeyModifiers::CONTROL.bits();
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                format!("Press Char(' ') mods {ctrl}"),
+                "mouse".to_string(),
+                format!("Release Char(' ') mods {ctrl}"),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok, found by property I6: a held key whose first press
+    /// reached the pane (typed on its own) and whose repeat press gives an
+    /// X10 report its button byte. Its one release ends the press the pane
+    /// saw, so it reaches the pane; before, the report took it with the
+    /// repeat and the pane kept the key down.
+    #[test]
+    fn review_vqok_release_of_key_the_pane_saw_pressed_survives_the_report() {
+        let hash = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x33,
+            virtual_scan_code: 0x04,
+            unicode: u16::from(b'#'),
+            control_key_state: 0x0010,
+        };
+        let hash_up = WindowsKeyRecord {
+            key_down: false,
+            ..hash
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(hash) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[hash, hash_up],
+            2,
+        ));
+        // The press the pane saw, its one release, then the report (codex
+        // hvqok-r1: a count of releases let `[Release, Mouse]` pass).
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char('#') mods 1".to_string(),
+                "Release Char('#') mods 1".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// The Space press record (vk 0x20, scan 0x39) of the herdr-vqok tests.
+    const VQOK_SPACE: WindowsKeyRecord = WindowsKeyRecord {
+        key_down: true,
+        repeat_count: 1,
+        virtual_key_code: 0x20,
+        virtual_scan_code: 0x39,
+        unicode: 0x20,
+        control_key_state: 0,
+    };
+
+    /// codex hvqok-r1 P2 (herdr-vqok r2): Space pressed on its own reaches
+    /// the pane; inside an X10 report its release is staged, then a second
+    /// Space press gives the report its button byte and is released, then
+    /// raw `d 2`. The staged release ends the press the pane saw, so the
+    /// second press starts a cycle the report owns whole: the pane sees
+    /// Press, Release, Mouse. Before, the second press consulted the pane
+    /// state from before the report, still held, and kept its release:
+    /// Press, Release, Release, Mouse.
+    #[test]
+    fn review_vqok_r2_cycle_after_a_staged_release_goes_with_the_report() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[space_up, VQOK_SPACE, space_up],
+            3,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok r2, the same burst with the second release after raw
+    /// `d 2`: the accepted report consumed the second press, so it consumes
+    /// that release too. Before, it escaped: Press, Release, Mouse, Release.
+    #[test]
+    fn review_vqok_r2_release_after_report_end_of_a_cycle_the_report_owned_is_consumed() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[space_up, VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r1 P2 (herdr-vqok r2): a native console Space press
+    /// reaches the pane, then raw `ESC [ M`, a serialized Space repeat that
+    /// gives the report its button byte, its serialized release, raw `d 2`.
+    /// The release ends the press the pane saw natively, so it reaches the
+    /// pane. Before, a native press was not tracked as held by the pane,
+    /// the repeat owned the release and the pane kept Space down: Press,
+    /// Mouse.
+    #[test]
+    fn review_vqok_r2_release_of_a_key_pressed_natively_survives_the_report() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = translator.translate(WindowsInputRecord::Key(VQOK_SPACE));
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// The serialized records of `records`, then idle ticks to the end of
+    /// every hold, on the caller's translator.
+    fn serialized_records_on(
+        translator: &mut WindowsInputTranslator,
+        records: &[WindowsKeyRecord],
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in records.iter().copied() {
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        events
+    }
+
+    /// codex hvqok-r2 P2 (herdr-vqok r3, ADR-0013 amendment 5): serialized
+    /// Space down, raw `ESC [ M`, serialized Space up (staged), native
+    /// Space down (it interrupts the report), raw `ESC [ M`, serialized
+    /// Space repeat that gives the report its button byte, serialized Space
+    /// up, raw `d 2`. The native press reaches the pane after the staged
+    /// release of the first cycle, so the second cycle is the pane's and its
+    /// release reaches it. Before, the native press was noted before the
+    /// staged release was committed, the release erased it and the report
+    /// took the second release: Press, Release, Press, Mouse.
+    #[test]
+    fn review_vqok_r3_native_press_after_a_staged_release_keeps_its_release() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for record in win32_input_mode_encoded_record(VQOK_SPACE) {
+            events.extend(translator.translate(record));
+        }
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[M") {
+            events.extend(translator.translate(record));
+        }
+        for record in win32_input_mode_encoded_record(space_up) {
+            events.extend(translator.translate(record));
+        }
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[VQOK_SPACE, space_up],
+            2,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r2 P2 (herdr-vqok r3): raw `ESC [ M`, serialized Space
+    /// down (the button byte), raw `d 2`, then a native Space press and a
+    /// serialized Space release. The accepted report consumed the first
+    /// press; the native press starts the pane's cycle, so the release
+    /// reaches the pane. Before, the consumed-key entry survived the native
+    /// press and swallowed the release: Mouse, Press.
+    #[test]
+    fn review_vqok_r3_native_press_after_an_accepted_report_keeps_its_release() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "mouse".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r2 P2, the native release (herdr-vqok r3): as above with
+    /// a native Space release before the native press. It ends the cycle
+    /// the accepted report consumed, so it is dropped; the next cycle is the
+    /// pane's and keeps its release. Before, the native release bypassed
+    /// the consumed key and the consumed entry swallowed the second
+    /// release: Mouse, Release, Press.
+    #[test]
+    fn review_vqok_r3_native_release_of_a_consumed_cycle_is_dropped() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(translator.translate(WindowsInputRecord::Key(space_up)));
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "mouse".to_string(),
+                "Press Char(' ') mods 0".to_string(),
+                "Release Char(' ') mods 0".to_string(),
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// codex hvqok-r3 P2 (herdr-vqok r4): raw `ESC [ M`, serialized Space
+    /// down (the button byte), raw `d 2`, raw `ESC [ 200 ~`, a native Space
+    /// press, raw `ESC [ 201 ~`, serialized Space up. The native press is
+    /// paste text, never a key the pane sees, so it takes no ownership of
+    /// the cycle the accepted report consumed and the release is dropped.
+    /// Before, the paste press moved the cycle to the pane and the release
+    /// escaped with no press: Mouse, Paste, Release.
+    #[test]
+    fn review_vqok_r4_native_press_inside_a_paste_takes_no_pane_ownership() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[200~") {
+            events.extend(translator.translate(record));
+        }
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[201~") {
+            events.extend(translator.translate(record));
+        }
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        let summary = event_summary_with_kinds(&events);
+        assert_eq!(summary.len(), 2, "{events:?}");
+        assert_eq!(summary[0], "mouse", "{events:?}");
+        assert!(
+            matches!(
+                &events[1],
+                crate::protocol::ClientInputEvent::Paste { text } if text == " "
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// Feeds raw text as one native character record per byte, the way
+    /// WezTerm delivers bracketed-paste delimiters.
+    fn raw_chars_on(
+        translator: &mut WindowsInputTranslator,
+        text: &str,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let mut events = Vec::new();
+        for record in text.chars().map(key_char) {
+            events.extend(translator.translate(record));
+        }
+        events
+    }
+
+    /// codex hvqok-r4fix P1 (herdr-vqok r5): raw `ESC [ M`, serialized
+    /// Space down that gives the report its button byte, raw `d 2`, then
+    /// raw paste delimiters around a serialized Space down and up. The
+    /// accepted report leaves Space's cycle consumed; inside the paste the
+    /// release's serialized bytes are paste text, so they must reach the
+    /// paste decoder whatever owns the cycle. Before, the release was
+    /// dropped whole and the paste decoded `ESC[32;57;32;1;0;1_` as text.
+    #[test]
+    fn review_vqok_r5_release_inside_a_paste_after_a_consumed_cycle_keeps_its_bytes() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        events.extend(raw_chars_on(&mut translator, "\x1b[200~"));
+        for record in [VQOK_SPACE, space_up] {
+            for record in win32_input_mode_encoded_record(record) {
+                events.extend(translator.translate(record));
+            }
+        }
+        events.extend(raw_chars_on(&mut translator, "\x1b[201~"));
+        for _ in 0..150 {
+            events.extend(translator.idle());
+        }
+        let summary = event_summary_with_kinds(&events);
+        assert_eq!(summary.len(), 2, "{events:?}");
+        assert_eq!(summary[0], "mouse", "{events:?}");
+        assert_eq!(
+            events[1],
+            crate::protocol::ClientInputEvent::Paste { text: " ".into() },
+            "{events:?}"
+        );
+    }
+
+    /// herdr-vqok r5 companion: the same paste with no report before it
+    /// (a fresh `Text` cycle) and with Enter instead of Space both decode
+    /// the serialized pair to its text, and the paste leaves no cycle open
+    /// that would swallow a later native Space press and release.
+    #[test]
+    fn review_vqok_r5_fresh_text_and_enter_pairs_inside_a_paste_decode() {
+        let enter = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x0d,
+            virtual_scan_code: 0x1c,
+            unicode: 0x0d,
+            control_key_state: 0,
+        };
+        for (press, text) in [(VQOK_SPACE, " "), (enter, "\r")] {
+            let release = WindowsKeyRecord {
+                key_down: false,
+                ..press
+            };
+            let mut translator = WindowsInputTranslator::default();
+            let mut events = raw_chars_on(&mut translator, "\x1b[200~");
+            for record in [press, release] {
+                for record in win32_input_mode_encoded_record(record) {
+                    events.extend(translator.translate(record));
+                }
+            }
+            events.extend(raw_chars_on(&mut translator, "\x1b[201~"));
+            for _ in 0..150 {
+                events.extend(translator.idle());
+            }
+            assert_eq!(
+                events,
+                vec![crate::protocol::ClientInputEvent::Paste { text: text.into() }],
+                "{text:?}"
+            );
+            let mut after = translator.translate(WindowsInputRecord::Key(VQOK_SPACE));
+            after.extend(
+                translator.translate(WindowsInputRecord::Key(WindowsKeyRecord {
+                    key_down: false,
+                    ..VQOK_SPACE
+                })),
+            );
+            assert_eq!(
+                event_summary_with_kinds(&after).len(),
+                2,
+                "{text:?} {after:?}"
+            );
+        }
+    }
+
+    /// herdr-vqok r4 (codex hvqok-r3 residual): a serialized Shift press
+    /// opens its cycle, a native Shift release emits nothing so the ledger
+    /// never sees it, and focus changes clear nothing. The entry is bounded,
+    /// one per key however often it happens, and the pane sees no modifier
+    /// key events either way; a later Space cycle through a report is
+    /// judged as on a fresh ledger (ADR-0013 amendment 5).
+    #[test]
+    fn review_vqok_r4_unseen_modifier_release_leaves_one_bounded_entry() {
+        let shift = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x10,
+            virtual_scan_code: 0x2a,
+            unicode: 0,
+            control_key_state: 0x0010,
+        };
+        let shift_up = WindowsKeyRecord {
+            key_down: false,
+            control_key_state: 0,
+            ..shift
+        };
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            events.extend(serialized_records_on(&mut translator, &[shift]));
+            events.extend(translator.translate(WindowsInputRecord::Key(shift_up)));
+        }
+        events.extend(translator.translate(WindowsInputRecord::Focus(false)));
+        events.extend(translator.translate(WindowsInputRecord::Focus(true)));
+        assert_eq!(
+            translator.pump.key_cycles.open,
+            vec![((0x10, 0x2a), CycleOwner::Pane)]
+        );
+        events.extend(x10_report_with_d2_after_on(
+            &mut translator,
+            &[VQOK_SPACE, space_up],
+            1,
+        ));
+        assert_eq!(
+            event_summary_with_kinds(&events),
+            vec![
+                "FocusLost".to_string(),
+                "FocusGained".to_string(),
+                "mouse".to_string(),
+            ],
+            "{events:?}"
+        );
+        assert_eq!(
+            translator.pump.key_cycles.open,
+            vec![((0x10, 0x2a), CycleOwner::Pane)]
         );
     }
 }
