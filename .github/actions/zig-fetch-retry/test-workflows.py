@@ -4,8 +4,10 @@ must run the zig-fetch-retry action after Install Zig and before the first cargo
 so no build can die on a one-off package download failure. When Install Zig and the first
 build step share one `if` (the job skips its toolchain and its build together, as the
 preview preflight does when should_publish is false), the prefetch must carry that `if`
-too, so a skipped toolchain never meets a prefetch. An Install Zig gated on a cache hit,
-with an unconditional build, keeps an unconditional prefetch. Paths resolve from this file, and
+too, so a skipped toolchain never meets a prefetch. Otherwise (an Install Zig gated on a
+cache hit, with an unconditional build) the prefetch must run whenever the first build step
+runs: no `if`, or exactly the first build step's `if`; any other condition (`if: false`)
+fails. Paths resolve from this file, and
 a scan that checks no job fails. Run: python3 test-workflows.py [workflows dir]
 Self-test: test-workflows-guard.sh."""
 import pathlib
@@ -39,11 +41,15 @@ for path in sorted(workflows.glob("*.yml")):
             bad.append(f"MISSING zig-fetch-retry before first build step: {path.name}: job {name}")
             continue
         zig_if = steps[zig[0]].get("if")
-        if zig_if is None or steps[build[0]].get("if") != zig_if:
-            continue
+        build_if = steps[build[0]].get("if")
+        shared = zig_if is not None and build_if == zig_if
         for r in placed:
-            if steps[r].get("if") != zig_if:
-                bad.append(f"UNGUARDED zig-fetch-retry (if={steps[r].get('if')!r}, Install Zig if={zig_if!r}): {path.name}: job {name}")
+            r_if = steps[r].get("if", None)
+            if shared:
+                if r_if != zig_if:
+                    bad.append(f"UNGUARDED zig-fetch-retry (if={r_if!r}, Install Zig if={zig_if!r}): {path.name}: job {name}")
+            elif "if" in steps[r] and r_if != build_if:
+                bad.append(f"CONDITIONED zig-fetch-retry (if={r_if!r}, first build step if={build_if!r}): {path.name}: job {name}")
 for b in bad:
     print(b)
 print(f"checked {checked} jobs, {len(bad)} missing")

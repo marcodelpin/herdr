@@ -17,14 +17,21 @@ function Invoke-Checked {
 # Fork change (bd herdr-zs55): the retry is allowed ONLY for a transient Zig package fetch,
 # with the same allowlist as .github/actions/zig-fetch-retry/fetch.sh (ADR-0020 in the
 # herdr-AGENT wrapper). A build.zig.zon fetch error must name an allowlisted cause at the
-# end of its line; any other diagnostic (a rustc or clippy error, a Zig compile error, a
-# hash mismatch, a permanent fetch cause) fails at once, so a second run can never turn a
-# code verdict green. Offline suite: scripts/test_windows_check.sh.
+# end of its line. Every other error diagnostic, located or plain (a rustc or clippy error, a
+# Zig compile error, a hash mismatch, a permanent fetch cause, a missing system library, a
+# linker error, another crate's build script), fails at once, so a second run can never
+# turn a code verdict green. The only other error line admitted is cargo's wrapper for the
+# ghostty-vt build script, which is how the fetch failure reaches cargo's output.
+# Offline suite: scripts/test_windows_check.sh.
 $ZonFetchError = 'build\.zig\.zon:[0-9]+:[0-9]+: error: '
 $TransientZigFetch = $ZonFetchError + '(unable to connect to server: (NameServerFailure|ConnectionRefused|ConnectionResetByPeer|HostUnreachable|NetworkUnreachable|NetworkDown|Timeout)' +
     '|HTTP request failed: WriteFailed' +
     '|HTTP response read failure: (ConnectionResetByPeer|NetworkDown|Timeout)' +
     "|bad HTTP response code: '(408|429|5[0-9][0-9])( [^']*)?')\s*$"
+# Any error diagnostic: `error:` or `error[CODE]:` at the start of a line or after a space or
+# a location colon.
+$ErrorDiagnostic = '(^|[\s:])error(\[[A-Za-z0-9]+\])?: '
+$GhosttyBuildScriptWrapper = '^error: failed to run custom build command for `ghostty-vt v[0-9][^`]*`\s*$'
 
 function Test-TransientZigFetchFailure {
     param([string[]]$Lines)
@@ -35,11 +42,11 @@ function Test-TransientZigFetchFailure {
             $transient++
             continue
         }
-        # Any other located error (rustc, a .zig source, another zon cause), a rustc error
-        # code, or cargo's own compile failure is a verdict, not a fetch failure.
-        if ($line -cmatch ':[0-9]+:[0-9]+: error: ' -or
-            $line -cmatch '(^|\s)error\[E[0-9]+\]' -or
-            $line -cmatch '(^|\s)error: could not compile') {
+        if ($line -cmatch $GhosttyBuildScriptWrapper) {
+            continue
+        }
+        # Any other error diagnostic is a verdict, not a fetch failure.
+        if ($line -cmatch $ErrorDiagnostic) {
             return $false
         }
     }
