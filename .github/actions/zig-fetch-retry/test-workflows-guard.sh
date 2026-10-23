@@ -38,12 +38,13 @@ expect() {
 
 # mutate NAME MODE: copy the workflows and apply MODE to the first job that runs the retry.
 #   drop    remove that job's zig-fetch-retry step
-#   unguard remove the 'if' of the first retry step whose Install Zig step has one
+#   unguard remove the 'if' of the first retry step in a job whose Install Zig and first
+#           build step share one 'if'
 mutate() {
   local dst="$work/$1"
   mkdir -p "$dst"
   python3 -I - "$workflows" "$dst" "$2" <<'PY'
-import pathlib, sys
+import pathlib, re, sys
 import yaml
 src, dst, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 done = False
@@ -52,13 +53,15 @@ for path in sorted(src.glob("*.yml")):
     for job in (doc.get("jobs") or {}).values():
         steps = job.get("steps") or []
         zig = [s for s in steps if "setup-zig" in str(s.get("uses", ""))]
+        build = [s for s in steps if re.search(r"^\s*(?:[A-Za-z_]+=\S+\s+)*(?:cargo|just)\s", str(s.get("run", "")), re.M)]
+        gated = bool(zig and build and "if" in zig[0] and build[0].get("if") == zig[0]["if"])
         for i, s in enumerate(steps):
             if done or "zig-fetch-retry" not in str(s.get("uses", "")):
                 continue
             if mode == "drop":
                 del steps[i]
                 done = True
-            elif mode == "unguard" and zig and "if" in zig[0] and "if" in s:
+            elif mode == "unguard" and gated and "if" in s:
                 del s["if"]
                 done = True
             break

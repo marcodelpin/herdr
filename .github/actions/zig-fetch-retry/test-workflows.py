@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """Guard (bd herdr-zs55): every workflow job that installs Zig and then runs cargo or just
 must run the zig-fetch-retry action after Install Zig and before the first cargo/just step,
-so no build can die on a one-off package download failure. Run: python3 test-workflows.py"""
-import glob
+so no build can die on a one-off package download failure. When Install Zig and the first
+build step share one `if` (the job skips its toolchain and its build together, as the
+preview preflight does when should_publish is false), the prefetch must carry that `if`
+too, so a skipped toolchain never meets a prefetch. An Install Zig gated on a cache hit,
+with an unconditional build, keeps an unconditional prefetch. Paths resolve from this file, and
+a scan that checks no job fails. Run: python3 test-workflows.py [workflows dir]
+Self-test: test-workflows-guard.sh."""
+import pathlib
 import re
 import sys
 
 import yaml
 
+HERE = pathlib.Path(__file__).resolve().parent
+workflows = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parents[1] / "workflows"
+if not workflows.is_dir():
+    print(f"INFRA: workflows dir not found: {workflows}")
+    sys.exit(2)
+
 # A cargo or just invocation at the start of a command line (optionally after VAR=value words).
 CMD = re.compile(r"^\s*(?:[A-Za-z_]+=\S+\s+)*(?:cargo|just)\s", re.M)
 bad = []
 checked = 0
-for path in sorted(glob.glob(".github/workflows/*.yml")):
-    jobs = (yaml.safe_load(open(path)) or {}).get("jobs") or {}
+for path in sorted(workflows.glob("*.yml")):
+    jobs = (yaml.safe_load(path.read_text()) or {}).get("jobs") or {}
     for name, job in jobs.items():
         steps = job.get("steps") or []
         zig = [i for i, s in enumerate(steps) if "setup-zig" in str(s.get("uses", ""))]
@@ -22,9 +34,20 @@ for path in sorted(glob.glob(".github/workflows/*.yml")):
             continue
         checked += 1
         retry = [i for i, s in enumerate(steps) if "zig-fetch-retry" in str(s.get("uses", ""))]
-        if not any(zig[0] < r < build[0] for r in retry):
-            bad.append(f"{path}: job {name}")
+        placed = [r for r in retry if zig[0] < r < build[0]]
+        if not placed:
+            bad.append(f"MISSING zig-fetch-retry before first build step: {path.name}: job {name}")
+            continue
+        zig_if = steps[zig[0]].get("if")
+        if zig_if is None or steps[build[0]].get("if") != zig_if:
+            continue
+        for r in placed:
+            if steps[r].get("if") != zig_if:
+                bad.append(f"UNGUARDED zig-fetch-retry (if={steps[r].get('if')!r}, Install Zig if={zig_if!r}): {path.name}: job {name}")
 for b in bad:
-    print("MISSING zig-fetch-retry before first build step:", b)
+    print(b)
 print(f"checked {checked} jobs, {len(bad)} missing")
+if checked == 0:
+    print(f"FAIL: no job checked under {workflows}")
+    sys.exit(1)
 sys.exit(1 if bad else 0)
