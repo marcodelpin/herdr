@@ -1915,6 +1915,37 @@ fn i6_release_cycles_align_holds_an_emitted_press_to_its_own_cycle() {
     ]));
 }
 
+/// codex hvqok-r3 P3 (herdr-vqok r4): `P1, R1, P2, R2` with identical
+/// records, each press with a repeat count of 2, every fate Pane. Output
+/// `P1, P2, R2` lost R1, but the search read both presses as the two
+/// repeats of P1, R2 as R1 and P2 as reported 0 times. A record's reports
+/// after its first are repeats, so a second Press starts the next record:
+/// each emitted press is held to its own cycle.
+#[test]
+fn i6_release_cycles_align_holds_a_second_press_to_its_own_record() {
+    let p = WindowsKeyRecord {
+        repeat_count: 2,
+        ..key_record(0x20, 0x39, 0x20, 0)
+    };
+    let r = released(p);
+    let input = [p, r, p, r].map(|record| (record, Fate::Pane));
+    let press = (ClientKeyKind::Press, p);
+    let repeat = (ClientKeyKind::Repeat, p);
+    let release = (ClientKeyKind::Release, r);
+    assert!(fates_follow_cycles(&input));
+    assert!(!release_cycles_align(&input, &[press, press, release]));
+    // The cycles as they happened, with and without the repeats.
+    assert!(release_cycles_align(
+        &input,
+        &[press, repeat, release, press, repeat, release]
+    ));
+    assert!(release_cycles_align(
+        &input,
+        &[press, release, press, release]
+    ));
+    assert!(release_cycles_align(&input, &[press, repeat, release]));
+}
+
 impl<'a> Harness<'a> {
     fn new(case: &'a Case, seed: u64) -> Self {
         let base = Instant::now();

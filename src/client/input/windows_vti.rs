@@ -5729,4 +5729,39 @@ mod tests {
             "{events:?}"
         );
     }
+
+    /// codex hvqok-r3 P2 (herdr-vqok r4): raw `ESC [ M`, serialized Space
+    /// down (the button byte), raw `d 2`, raw `ESC [ 200 ~`, a native Space
+    /// press, raw `ESC [ 201 ~`, serialized Space up. The native press is
+    /// paste text, never a key the pane sees, so it takes no ownership of
+    /// the cycle the accepted report consumed and the release is dropped.
+    /// Before, the paste press moved the cycle to the pane and the release
+    /// escaped with no press: Mouse, Paste, Release.
+    #[test]
+    fn review_vqok_r4_native_press_inside_a_paste_takes_no_pane_ownership() {
+        let space_up = WindowsKeyRecord {
+            key_down: false,
+            ..VQOK_SPACE
+        };
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = x10_report_with_d2_after_on(&mut translator, &[VQOK_SPACE], 1);
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[200~") {
+            events.extend(translator.translate(record));
+        }
+        events.extend(translator.translate(WindowsInputRecord::Key(VQOK_SPACE)));
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b[201~") {
+            events.extend(translator.translate(record));
+        }
+        events.extend(serialized_records_on(&mut translator, &[space_up]));
+        let summary = event_summary_with_kinds(&events);
+        assert_eq!(summary.len(), 2, "{events:?}");
+        assert_eq!(summary[0], "mouse", "{events:?}");
+        assert!(
+            matches!(
+                &events[1],
+                crate::protocol::ClientInputEvent::Paste { text } if text == " "
+            ),
+            "{events:?}"
+        );
+    }
 }
