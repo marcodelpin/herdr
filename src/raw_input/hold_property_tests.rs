@@ -1771,7 +1771,8 @@ fn fates_follow_cycles(input: &[(WindowsKeyRecord, Fate)]) -> bool {
 /// I6 for one key: whether its reported console events can be read as its
 /// input records in order, by their fates. A consumed record is never
 /// reported; a press that reached the pane is reported 0 to repeat-count
-/// times (Press or Repeat, the record itself), and a release that reached
+/// times (the record itself, Press or Repeat first and Repeat after, so a
+/// second Press is never one record's repeat), and a release that reached
 /// it once (as Release, the record itself) exactly when a press since the
 /// previous release was reported, not at all when none was. A release with
 /// no press before it in the input may be reported or not. Wrong release
@@ -1801,11 +1802,18 @@ fn release_cycles_align(
             } else {
                 0
             };
+            // A record's reports after its first are repeats: a later Press
+            // is the next record's (codex hvqok-r3 P3).
             (0..=repeats)
                 .take_while(|&k| {
                     k == 0
                         || events.get(j + k - 1).is_some_and(|(kind, event)| {
-                            *kind != ClientKeyKind::Release && *event == record
+                            let own = if k == 1 {
+                                *kind != ClientKeyKind::Release
+                            } else {
+                                *kind == ClientKeyKind::Repeat
+                            };
+                            own && *event == record
                         })
                 })
                 .any(|k| {
