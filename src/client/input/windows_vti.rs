@@ -866,16 +866,20 @@ impl WindowsInputPump {
         }
     }
 
-    /// A nested release that ends a cycle accepted reports consumed is
-    /// dropped whole, wherever it arrives; one that ends a cycle of paste
-    /// text is dropped outside a paste and is paste text inside one.
+    /// Outside a paste, a nested release that ends a cycle accepted reports
+    /// consumed or a cycle of paste text is dropped whole. Inside a paste
+    /// its bytes are paste text whatever owns the cycle, so it is never
+    /// dropped: it ends the cycle as paste text (codex hvqok-r4fix P1,
+    /// herdr-vqok r5).
     fn drops_consumed_release(&mut self, record: WindowsKeyRecord) -> bool {
-        let drops = match self.key_cycles.owner(record) {
-            Some(CycleOwner::Consumed) => true,
-            Some(CycleOwner::Text) => !self.framer.has_pending_bracketed_paste(),
-            _ => false,
-        };
-        if record.key_down || !drops {
+        if record.key_down || self.framer.has_pending_bracketed_paste() {
+            return false;
+        }
+        let drops = matches!(
+            self.key_cycles.owner(record),
+            Some(CycleOwner::Consumed | CycleOwner::Text)
+        );
+        if !drops {
             return false;
         }
         self.key_cycles.release(record);
