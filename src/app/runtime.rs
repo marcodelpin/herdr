@@ -38,6 +38,9 @@ impl App {
         for terminal_id in terminal_ids {
             self.shutdown_terminal_runtime(terminal_id);
         }
+        // herdr-3cr r5 (codex h3cr-r4fix P2): a removed terminal may have been
+        // the pending owner other panes parked their fallback behind.
+        self.release_orphaned_agent_resume_keys();
     }
 
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {

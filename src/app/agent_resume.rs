@@ -537,7 +537,7 @@ impl App {
 
         let mut input = resume_command;
         input.push('\r');
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
+        if let Err(err) = send_agent_resume_command(&runtime, Bytes::from(input)) {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -619,6 +619,23 @@ impl App {
         }
     }
 
+    /// herdr-3cr r5 (codex h3cr-r4fix P2): releases every parked key whose
+    /// pending owner is gone. A pending owner can also end without starting
+    /// by being removed - its pane closed, or its pane died after a failed
+    /// enqueue - and that drops its plan with its terminal, past
+    /// `fail_pending_agent_resume`. `release_agent_resume_key` keeps a key
+    /// that a started resume or a still-pending plan holds, so a live owner
+    /// is never overtaken.
+    pub(crate) fn release_orphaned_agent_resume_keys(&mut self) {
+        if self.yielded_agent_resumes.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self.yielded_agent_resumes.keys().cloned().collect();
+        for key in keys {
+            self.release_agent_resume_key(&key);
+        }
+    }
+
     /// herdr-3cr r3: whether `key` is already resumed by a deferred launch,
     /// or still pending as another terminal's plan.
     fn agent_resume_key_taken(&self, terminal_id: &crate::terminal::TerminalId, key: &str) -> bool {
@@ -631,6 +648,25 @@ impl App {
                         .is_some_and(|plan| plan.dedupe_key == key)
             })
     }
+}
+
+/// herdr-3cr r5: types the deferred resume command into the fresh shell.
+/// Tests can make the enqueue fail, the exit codex h3cr-r4fix traced to a
+/// stranded fallback once the pane then dies.
+fn send_agent_resume_command(
+    runtime: &crate::terminal::TerminalRuntime,
+    input: Bytes,
+) -> Result<(), tokio::sync::mpsc::error::TrySendError<Bytes>> {
+    #[cfg(test)]
+    if FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.get()) {
+        return Err(tokio::sync::mpsc::error::TrySendError::Closed(input));
+    }
+    runtime.try_send_bytes(input)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_AGENT_RESUME_ENQUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn derived_pending_agent_resume_pane_infos(
@@ -1642,6 +1678,126 @@ mod tests {
                 runtime.shutdown();
             }
         }
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2): the r4 setup with every directory
+    // but X intact. A launches first: X is gone, so A's native fallback
+    // yields S to B's still-pending native plan and is parked under S.
+    fn r5_parked_fallback_app(
+        label: &str,
+        recorder: &NrrLaunchRecorder,
+    ) -> (
+        App,
+        Vec<crate::terminal::TerminalId>,
+        [std::path::PathBuf; 2],
+    ) {
+        let agent_dir = recorder.dir("agent-x");
+        let pane_dirs = [recorder.dir("pane-a"), recorder.dir("pane-b")];
+        let (mut app, terminal_ids) = r3_codex_app(label, 2, recorder);
+        let session = r3_codex_session(&format!("codex-{label}"), &agent_dir);
+        let native =
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                .unwrap();
+        let first = app.state.terminals.get_mut(&terminal_ids[0]).unwrap();
+        first.cwd = pane_dirs[0].clone();
+        first.persisted_agent_session = Some(session.clone());
+        first.pending_agent_resume_plan = Some(r3_codex_reported().plan(&agent_dir));
+        let second = app.state.terminals.get_mut(&terminal_ids[1]).unwrap();
+        second.cwd = pane_dirs[1].clone();
+        second.persisted_agent_session = Some(session);
+        second.pending_agent_resume_plan = Some(native);
+
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_none());
+        let parked = &app.state.terminals[&terminal_ids[0]];
+        assert!(parked.pending_agent_resume_plan.is_none());
+        assert!(parked.restore_error.is_some());
+        (app, terminal_ids, pane_dirs)
+    }
+
+    // A, parked behind B, must resume S once B is gone without starting.
+    async fn r5_assert_parked_fallback_resumes(
+        app: &mut App,
+        terminal_ids: &[crate::terminal::TerminalId],
+        pane_dirs: &[std::path::PathBuf; 2],
+        recorder: &NrrLaunchRecorder,
+        label: &str,
+    ) {
+        assert!(!app.state.terminals.contains_key(&terminal_ids[1]));
+        assert!(
+            app.state.terminals[&terminal_ids[0]]
+                .pending_agent_resume_plan
+                .is_some(),
+            "A's parked fallback must be pending again once B is gone"
+        );
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[0], 24, 80, true);
+        assert!(app.terminal_runtimes.get(&terminal_ids[0]).is_some());
+        assert!(app.state.terminals[&terminal_ids[0]]
+            .restore_error
+            .is_none());
+        let _ = recorder.wait_for_launches(1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let launches = recorder.wait_for_launches(1).await;
+        assert_eq!(
+            launches,
+            vec![format!("{}|resume codex-{label}", pane_dirs[0].display())],
+            "session S is resumed once, by A"
+        );
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2, terminal removal): pane B, the
+    // pending owner of S, is closed before it launches (the pane.close path:
+    // its workspace closes, `remove_unattached_terminal_ids` drops B's
+    // terminal, the runtimes are shut down). A's parked fallback is usable
+    // and must resume S.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r5_closed_pending_owner_releases_the_session() {
+        let label = "3cr-r5-close";
+        let recorder = NrrLaunchRecorder::new(label);
+        let (mut app, terminal_ids, pane_dirs) = r5_parked_fallback_app(label, &recorder);
+
+        app.state.selected = 1;
+        app.state.close_selected_workspace();
+        app.shutdown_detached_terminal_runtimes();
+
+        r5_assert_parked_fallback_resumes(&mut app, &terminal_ids, &pane_dirs, &recorder, label)
+            .await;
+    }
+
+    // herdr-3cr r5 (codex h3cr-r4fix P2, enqueue failure): B's shell spawns
+    // but typing the resume command fails, so B keeps its plan for a retry.
+    // B's pane then dies before any retry. A's parked fallback must resume S.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_restore_3cr_r5_failed_enqueue_then_pane_died_releases_the_session() {
+        let label = "3cr-r5-enqueue";
+        let recorder = NrrLaunchRecorder::new(label);
+        let (mut app, terminal_ids, pane_dirs) = r5_parked_fallback_app(label, &recorder);
+        let pane_b = app.state.workspaces[1].tabs[0].root_pane;
+
+        super::FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.set(true));
+        app.start_pending_agent_resume_for_terminal(&terminal_ids[1], 24, 80, true);
+        super::FAIL_AGENT_RESUME_ENQUEUE.with(|fail| fail.set(false));
+        assert!(app.terminal_runtimes.get(&terminal_ids[1]).is_none());
+        assert!(
+            app.state.terminals[&terminal_ids[1]]
+                .pending_agent_resume_plan
+                .is_some(),
+            "a failed enqueue keeps B's plan for a retry"
+        );
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: pane_b,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+
+        r5_assert_parked_fallback_resumes(&mut app, &terminal_ids, &pane_dirs, &recorder, label)
+            .await;
     }
 
     // herdr-3cr r4 (codex h3cr-r3fix finding 1, missing ordering): pane B's
