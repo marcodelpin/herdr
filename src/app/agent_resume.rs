@@ -1683,6 +1683,7 @@ mod tests {
     // herdr-3cr r5 (codex h3cr-r4fix P2): the r4 setup with every directory
     // but X intact. A launches first: X is gone, so A's native fallback
     // yields S to B's still-pending native plan and is parked under S.
+    #[cfg(unix)]
     fn r5_parked_fallback_app(
         label: &str,
         recorder: &NrrLaunchRecorder,
@@ -1717,6 +1718,7 @@ mod tests {
     }
 
     // A, parked behind B, must resume S once B is gone without starting.
+    #[cfg(unix)]
     async fn r5_assert_parked_fallback_resumes(
         app: &mut App,
         terminal_ids: &[crate::terminal::TerminalId],
