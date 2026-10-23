@@ -79,6 +79,11 @@ pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std
 /// never spawned into the other directory and never replaced by a
 /// fallback. A real directory recreated at the same canonical path is not
 /// detected, nor is a change between this check and the spawn (ADR-0022).
+///
+/// The `Err` hands the plan back by value on a refusal that runs at most once
+/// per pane restore, so boxing it buys nothing; on x86_64-pc-windows-msvc the
+/// larger `PathBuf` puts it over clippy's 128-byte line (herdr-3cr r5b).
+#[allow(clippy::result_large_err)]
 fn deferred_resume_launch(
     terminal: &crate::terminal::TerminalState,
     plan: crate::agent_resume::AgentResumePlan,
