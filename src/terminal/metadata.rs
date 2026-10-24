@@ -82,7 +82,7 @@ impl TerminalState {
         agent_label: Option<&str>,
         applies_to_source: Option<&str>,
     ) -> bool {
-        let Some(exit) = self.recent_agent_process_exit else {
+        let Some(exit) = self.recent_agent_process_exit.as_ref() else {
             return false;
         };
         let exited_agent_label = crate::detect::agent_label(exit.agent);

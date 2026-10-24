@@ -126,10 +126,26 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
     observed_at: Instant,
+    // herdr-c1o5: the custom sources that held the pane for `agent` when its
+    // process exited. Their late reports belong to the dead process; any other
+    // custom source reports an agent herdr cannot see (a claude inside a tmux
+    // client in the pane) and is not hidden by this exit.
+    exited_reporter_sources: Vec<String>,
+}
+
+impl RecentAgentProcessExit {
+    fn drops_report(&self, source: &str, agent_label: &str) -> bool {
+        crate::detect::parse_agent_label(agent_label) == Some(self.agent)
+            && (crate::agent_resume::is_official_agent_source(source, agent_label)
+                || self
+                    .exited_reporter_sources
+                    .iter()
+                    .any(|exited| exited == source))
+    }
 }
 
 /// Pure state for a server-owned terminal.
@@ -314,6 +330,7 @@ impl TerminalState {
     #[cfg(any(windows, test))]
     pub(crate) fn agent_process_exited_within(&self, now: Instant, max_age: Duration) -> bool {
         self.recent_agent_process_exit
+            .as_ref()
             .is_some_and(|exit| now.saturating_duration_since(exit.observed_at) <= max_age)
     }
 
@@ -427,6 +444,7 @@ impl TerminalState {
             && agent.is_some()
             && self
                 .recent_agent_process_exit
+                .as_ref()
                 .is_some_and(|exit| Some(exit.agent) == agent && exit.observed_at < now);
         if !process_exited && self.detected_state_observed_before_release_suppression(agent, now) {
             return TerminalStateMutation {
@@ -466,9 +484,23 @@ impl TerminalState {
         self.fallback_observed_at = Some(now);
         if process_exited {
             if let Some(agent) = agent {
+                let agent_label = crate::detect::agent_label(agent);
+                let exited_reporter_sources = self
+                    .hook_authority
+                    .iter()
+                    .filter(|authority| authority.agent_label == agent_label)
+                    .map(|authority| authority.source.clone())
+                    .chain(
+                        self.persisted_agent_session
+                            .iter()
+                            .filter(|session| session.agent == agent_label)
+                            .map(|session| session.source.clone()),
+                    )
+                    .collect();
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
                     agent,
                     observed_at: now,
+                    exited_reporter_sources,
                 });
             }
         } else if agent.is_some() {
@@ -732,9 +764,10 @@ impl TerminalState {
             return None;
         }
         if !crate::detect::full_lifecycle_hook_authority(&source, &agent_label)
-            && self.recent_agent_process_exit.is_some_and(|exit| {
-                crate::detect::parse_agent_label(&agent_label) == Some(exit.agent)
-            })
+            && self
+                .recent_agent_process_exit
+                .as_ref()
+                .is_some_and(|exit| exit.drops_report(&source, &agent_label))
         {
             return None;
         }
@@ -4982,6 +5015,77 @@ mod tests {
         assert_eq!(terminal.detected_agent, None);
         assert_eq!(terminal.effective_agent_label(), None);
         assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
+    // herdr-c1o5: a native claude ran in the pane, quit, and a tmux client
+    // took the foreground. herdr never sees claude in the foreground again, so
+    // the recorded exit must not hide a live claude another reporter (the tmux
+    // bridge) reports into the pane.
+    #[test]
+    fn foreign_source_report_after_native_agent_exit_is_applied() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_hook_authority(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        terminal.set_hook_authority(
+            "tmux-bridge:claude-7cbd633a2afc".into(),
+            "claude".into(),
+            AgentState::Blocked,
+            None,
+            Some(1_792_824_213_173_431_999),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // herdr-c1o5 guard: the exit still drops a late report of the reporter
+    // that held the pane when its agent exited (upstream e608a751).
+    #[test]
+    fn late_report_of_exited_reporter_stays_dropped_after_native_agent_exit() {
+        for source in ["herdr:claude", "custom:claude-hook"] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            terminal.set_hook_authority(
+                source.into(),
+                "claude".into(),
+                AgentState::Working,
+                None,
+                Some(1),
+            );
+            terminal.set_detected_state_with_visible_blocker(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                true,
+            );
+            terminal.set_detected_state(None, AgentState::Unknown);
+
+            terminal.set_hook_authority(
+                source.into(),
+                "claude".into(),
+                AgentState::Idle,
+                None,
+                Some(2),
+            );
+
+            assert_eq!(terminal.effective_agent_label(), None, "{source}");
+        }
     }
 
     #[test]
