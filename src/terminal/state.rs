@@ -760,6 +760,35 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        self.set_hook_authority_naming_agent_at(
+            source,
+            agent_label,
+            state,
+            message,
+            session_ref,
+            seq,
+            None,
+            now,
+        )
+    }
+
+    /// herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): a report that
+    /// names the agent process it is about (`pane.report_agent` `agent_pid`
+    /// and `agent_start`). `reporter_agent_alive` is the API layer's verdict
+    /// on that process at report time, `None` when the report names none.
+    #[allow(clippy::too_many_arguments)] // one report's fields plus its verdict
+    pub fn set_hook_authority_naming_agent_at(
+        &mut self,
+        source: String,
+        agent_label: String,
+        state: AgentState,
+        message: Option<String>,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        reporter_agent_alive: Option<bool>,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
+        let _ = reporter_agent_alive;
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
@@ -5041,12 +5070,13 @@ mod tests {
         );
         terminal.set_detected_state(None, AgentState::Unknown);
 
-        terminal.set_hook_authority(
-            "tmux-bridge:claude-7cbd633a2afc".into(),
-            "claude".into(),
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
             AgentState::Blocked,
-            None,
-            Some(1_792_824_213_173_431_999),
+            1_792_824_213_173_431_999,
+            true,
+            Instant::now(),
         );
 
         assert_eq!(terminal.effective_agent_label(), Some("claude"));
@@ -5086,6 +5116,220 @@ mod tests {
 
             assert_eq!(terminal.effective_agent_label(), None, "{source}");
         }
+    }
+
+    // herdr-c1o5 round 2: the tmux bridge's source, shared by every claude of
+    // one tmux socket.
+    const BRIDGE_SOURCE: &str = "tmux-bridge:claude-7cbd633a2afc";
+
+    fn report_naming_agent(
+        terminal: &mut TerminalState,
+        source: &str,
+        state: AgentState,
+        seq: u64,
+        agent_alive: bool,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
+        terminal.set_hook_authority_naming_agent_at(
+            source.into(),
+            "claude".into(),
+            state,
+            None,
+            None,
+            Some(seq),
+            Some(agent_alive),
+            now,
+        )
+    }
+
+    fn native_claude_exits(terminal: &mut TerminalState) {
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_hook_authority(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+    }
+
+    // codex c1o5-r1 P1-1: the bridge report lands BEFORE the detector clear.
+    #[test]
+    fn exit_then_live_bridge_report_survives_detector_clear() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            1,
+            true,
+            Instant::now(),
+        );
+
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // Scope guard for P1-1: the detector seeing another agent still clears it.
+    #[test]
+    fn live_bridge_authority_still_yields_to_a_detected_other_agent() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            1,
+            true,
+            Instant::now(),
+        );
+
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+
+        assert_eq!(terminal.effective_agent_label(), Some("codex"));
+    }
+
+    // codex c1o5-r1 P1-2: custom:a and custom:b both report the native claude,
+    // custom:b holds the slot at exit; a delayed report of custom:a, or a
+    // delayed first report of another source, names no process and stays
+    // dropped.
+    #[test]
+    fn exit_drops_unnamed_reports_of_every_custom_reporter() {
+        for (late_source, late_seq) in [("custom:a", 11), ("custom:c", 1), (BRIDGE_SOURCE, 1)] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            for source in ["custom:a", "custom:b"] {
+                terminal.set_hook_authority(
+                    source.into(),
+                    "claude".into(),
+                    AgentState::Working,
+                    None,
+                    Some(10),
+                );
+            }
+            terminal.set_detected_state_with_visible_blocker(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                true,
+            );
+            terminal.set_detected_state(None, AgentState::Unknown);
+
+            terminal.set_hook_authority(
+                late_source.into(),
+                "claude".into(),
+                AgentState::Working,
+                None,
+                Some(late_seq),
+            );
+
+            assert_eq!(terminal.effective_agent_label(), None, "{late_source}");
+            assert_ne!(terminal.state, AgentState::Working, "{late_source}");
+        }
+    }
+
+    // codex c1o5-r1 P1-3: exit observed at t1, bridge report at t2, the exit
+    // processed late with observed_at t1, then the bridge's next report.
+    #[test]
+    fn delayed_exit_keeps_applying_newer_live_bridge_reports() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        let exit_observed_at = Instant::now();
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            exit_observed_at + Duration::from_millis(5),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            exit_observed_at,
+        );
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            2,
+            true,
+            exit_observed_at + Duration::from_millis(10),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // codex c1o5-r1 P2-4: the bridge source held the pane when the native
+    // claude exited; the same source then reports a new, live claude.
+    #[test]
+    fn recorded_bridge_source_reporting_a_new_live_claude_is_applied() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            Instant::now(),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            2,
+            true,
+            Instant::now(),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // A report naming a dead agent process never shows it after an exit.
+    #[test]
+    fn exit_drops_report_naming_a_dead_agent_process() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            false,
+            Instant::now(),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), None);
     }
 
     #[test]
