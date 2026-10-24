@@ -7,7 +7,9 @@ preview preflight does when should_publish is false), the prefetch must carry th
 too, so a skipped toolchain never meets a prefetch. Otherwise (an Install Zig gated on a
 cache hit, with an unconditional build) the prefetch must run whenever the first build step
 runs: no `if`, or exactly the first build step's `if`; any other condition (`if: false`)
-fails. Paths resolve from this file, and
+fails. In a matrix job (`strategy.matrix`) the prefetch must carry no `if` at all, whatever
+the other rules allow: an `if` matching one leg's first build step skips the prefetch on the
+other legs (ADR-0020 amendment 1, codex zs55-r3fix P3). Paths resolve from this file, and
 a scan that checks no job fails. Run: python3 test-workflows.py [workflows dir]
 Self-test: test-workflows-guard.sh."""
 import pathlib
@@ -43,9 +45,13 @@ for path in sorted(workflows.glob("*.yml")):
         zig_if = steps[zig[0]].get("if")
         build_if = steps[build[0]].get("if")
         shared = zig_if is not None and build_if == zig_if
+        matrix = "matrix" in (job.get("strategy") or {})
         for r in placed:
             r_if = steps[r].get("if", None)
-            if shared:
+            if matrix:
+                if "if" in steps[r]:
+                    bad.append(f"CONDITIONED zig-fetch-retry in a matrix job (if={r_if!r}, must be unconditional): {path.name}: job {name}")
+            elif shared:
                 if r_if != zig_if:
                     bad.append(f"UNGUARDED zig-fetch-retry (if={r_if!r}, Install Zig if={zig_if!r}): {path.name}: job {name}")
             elif "if" in steps[r] and r_if != build_if:
