@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Self-test for test-workflows.py (bd herdr-zs55): the coverage guard must check the real
 # workflows from any working directory, refuse an empty scan, and FAIL on a mutated copy
-# of the workflows that lacks the retry step or runs it outside the Install Zig guard.
+# of the workflows that lacks the retry step, runs it outside the Install Zig guard, disables
+# it, or conditions it in a matrix job (ADR-0020 amendment 1: unconditional there).
 # Usage: test-workflows-guard.sh [test-workflows.py subject] [workflows dir]
 set -uo pipefail
 
@@ -42,6 +43,8 @@ expect() {
 #           build step share one 'if'
 #   disable set 'if: false' on the first retry step in a job whose Install Zig and first
 #           build step do NOT share one 'if' (codex zs55-r2 P3: a disabled prefetch)
+#   matrixleg in a matrix job whose first build step carries an 'if', give the first retry
+#           step that same 'if' (codex zs55-r3fix P3: the other matrix legs skip the prefetch)
 mutate() {
   local dst="$work/$1"
   mkdir -p "$dst"
@@ -69,6 +72,9 @@ for path in sorted(src.glob("*.yml")):
             elif mode == "disable" and zig and build and not gated:
                 s["if"] = False
                 done = True
+            elif mode == "matrixleg" and "matrix" in (job.get("strategy") or {}) and build and "if" in build[0]:
+                s["if"] = build[0]["if"]
+                done = True
             break
     (dst / path.name).write_text(yaml.safe_dump(doc, sort_keys=False))
 sys.exit(0 if done else 3)
@@ -83,6 +89,7 @@ expect empty-scan-refused 1 "$work" "$work/empty"
 if mutate dropped drop; then expect dropped-retry-detected 1 "$work" "$work/dropped"; else ko dropped-retry-detected "mutation found no retry step"; fi
 if mutate unguarded unguard; then expect unguarded-retry-detected 1 "$work" "$work/unguarded"; else ko unguarded-retry-detected "mutation found no guarded retry step"; fi
 if mutate disabled disable; then expect disabled-retry-detected 1 "$work" "$work/disabled"; else ko disabled-retry-detected "mutation found no ungated retry step"; fi
+if mutate matrixleg matrixleg; then expect matrix-leg-skipped-detected 1 "$work" "$work/matrixleg"; else ko matrix-leg-skipped-detected "mutation found no matrix job with a conditioned first build step"; fi
 
 # Codex zs55-r1 P2: in preview.yml the prefetch must carry the same 'if' as Install Zig,
 # else a should_publish=false no-op runs a Zig build without the toolchain.

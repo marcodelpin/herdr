@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Offline suite for scripts/windows_check.ps1 (bd herdr-zs55): the clippy step may be
-# retried ONLY when its output carries a transient Zig package fetch error from the
-# ADR-0020 allowlist (herdr-AGENT wrapper) and no other error. A fake cargo replays one
-# canned output per clippy call; each case asserts on the exit code and on the number of
-# clippy calls. Needs pwsh; no network, no real cargo.
+# Offline suite for scripts/windows_check.ps1 (bd herdr-zs55, ADR-0020 amendment 1 in the
+# herdr-AGENT wrapper): the script runs each cargo command ONCE. Only the zig-fetch-retry
+# prefetch retries; a failed clippy is never run again, whatever its output says (a transient
+# Zig fetch error, a fatal diagnostic, colored or not). A fake cargo replays one canned output
+# per clippy call; each case asserts on the exit code and on the number of clippy calls.
+# Needs pwsh; no network, no real cargo.
 #
 # Usage: test_windows_check.sh [windows_check.ps1 subject]
 set -uo pipefail
@@ -47,6 +48,8 @@ zigsrc="  C:\\a\\herdr\\vendor\\libghostty-vt\\src\\lib_vt.zig:10:5: error: use 
 nolib="error: unable to find dynamic system library 'c' with path 'C:\\a\\lib'"
 otherwrap='error: failed to run custom build command for `ring v0.17.8`'
 linker='error: linking with `link.exe` failed: exit code: 1120'
+# Codex zs55-r3fix P2: cargo's colored diagnostic (CARGO_TERM_COLOR=always) splits 'error:'.
+colored=$'\e[1m\e[91merror\e[0m\e[1m: linking with `link.exe` failed: exit code: 1120\e[0m'
 
 # run_case NAME WANT_RC(0|nonzero) WANT_CALLS OUT1 [OUT2 ...]; '-' = a successful call.
 run_case() {
@@ -72,8 +75,8 @@ run_case() {
 }
 
 run_case clean-pass 0 1 -
-run_case dns-then-pass 0 2 "$wrap"$'\n'"$dns" -
-run_case dns-twice-fails 1 2 "$wrap"$'\n'"$dns" "$wrap"$'\n'"$dns"
+run_case dns-not-retried 1 1 "$wrap"$'\n'"$dns" -
+run_case dns-twice-not-retried 1 1 "$wrap"$'\n'"$dns" "$wrap"$'\n'"$dns"
 run_case rustc-error-not-retried 1 1 "$rustc" -
 run_case lint-error-not-retried 1 1 "$lint" -
 run_case dns-plus-mismatch-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$mismatch" -
@@ -84,6 +87,7 @@ run_case no-error-line-not-retried 1 1 "something went wrong" -
 run_case dns-plus-plain-error-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$nolib" -
 run_case dns-plus-other-build-script-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$otherwrap" -
 run_case dns-plus-linker-error-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$linker" -
+run_case colored-fatal-plus-dns-not-retried 1 1 "$wrap"$'\n'"$dns"$'\n'"$colored" -
 
 echo "test_windows_check: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
