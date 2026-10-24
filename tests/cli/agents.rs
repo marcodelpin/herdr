@@ -29,10 +29,7 @@ fn agent_explain_missing_file_reports_json_error() {
         .contains(missing.to_str().unwrap()));
 }
 
-fn write_delayed_shell_and_fake_pi(
-    base: &Path,
-    shell_delay_seconds: &str,
-) -> (PathBuf, PathBuf, PathBuf) {
+fn write_delayed_shell_and_fake_pi(base: &Path, shell_wait: &str) -> (PathBuf, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
 
     let bin = base.join("bin");
@@ -42,7 +39,7 @@ fn write_delayed_shell_and_fake_pi(
     fs::create_dir_all(&bin).unwrap();
     fs::write(
         &delayed_shell,
-        format!("#!/bin/sh\n/bin/sleep {shell_delay_seconds}\nexec /bin/sh\n"),
+        format!("#!/bin/sh\n{shell_wait}\nexec /bin/sh\n"),
     )
     .unwrap();
     fs::write(
@@ -65,7 +62,8 @@ fn agent_start_waits_for_a_new_pane_shell_to_finish_initializing() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("herdr.sock");
-    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "0.4");
+    let (bin, delayed_shell, invocations) =
+        write_delayed_shell_and_fake_pi(&base, "/bin/sleep 0.4");
     let config = format!(
         "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
         delayed_shell.to_str().unwrap()
@@ -146,7 +144,23 @@ fn agent_start_stops_retrying_when_the_pane_shell_stays_busy() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("herdr.sock");
-    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(&base, "2.3");
+    // The pane shell stays busy until this test releases it, not for a fixed
+    // time: a shell that slept 2.3 s raced the CLI's 2 s retry window, which
+    // opens only at the first busy response, so under full-suite load the
+    // shell became ready inside the window and the first start succeeded
+    // (herdr-mrs5). One blocking child keeps the pane busy with no gap in
+    // which the shell runs alone and reads as available.
+    fs::create_dir_all(&base).unwrap();
+    let shell_gate = base.join("shell-gate");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&shell_gate)
+        .status()
+        .unwrap();
+    assert!(mkfifo.success());
+    let (bin, delayed_shell, invocations) = write_delayed_shell_and_fake_pi(
+        &base,
+        &format!("/bin/head -c 1 '{}' >/dev/null", shell_gate.display()),
+    );
     let config = format!(
         "onboarding = false\n[terminal]\ndefault_shell = {:?}\nshell_mode = \"non_login\"\n",
         delayed_shell.to_str().unwrap()
@@ -184,8 +198,17 @@ fn agent_start_stops_retrying_when_the_pane_shell_stays_busy() {
     let error: serde_json::Value = serde_json::from_slice(&unavailable.stderr).unwrap();
     assert_eq!(error["error"]["code"], "agent_pane_busy");
     assert!(started_at.elapsed() >= Duration::from_secs(2));
-    assert!(started_at.elapsed() < Duration::from_secs(4));
+    // Well under the 8 s --timeout: the CLI gave up at the end of its retry
+    // window instead of retrying until the agent timeout.
+    assert!(started_at.elapsed() < Duration::from_secs(6));
     assert!(!invocations.exists());
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&shell_gate)
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
 
     let retried = run_cli_json(
         &socket_path,
