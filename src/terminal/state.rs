@@ -23,6 +23,11 @@ pub struct HookAuthority {
     #[serde(skip, default = "Instant::now")]
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    /// herdr-c1o5: the report named its agent process and the API layer found
+    /// it alive (ADR-0008 amendment 2026-10-24, round 2). Never serialized: a
+    /// restored or handed-off authority names no live process.
+    #[serde(skip)]
+    pub reporter_agent_alive: bool,
 }
 
 #[cfg(unix)]
@@ -126,26 +131,10 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
     observed_at: Instant,
-    // herdr-c1o5: the custom sources that held the pane for `agent` when its
-    // process exited. Their late reports belong to the dead process; any other
-    // custom source reports an agent herdr cannot see (a claude inside a tmux
-    // client in the pane) and is not hidden by this exit.
-    exited_reporter_sources: Vec<String>,
-}
-
-impl RecentAgentProcessExit {
-    fn drops_report(&self, source: &str, agent_label: &str) -> bool {
-        crate::detect::parse_agent_label(agent_label) == Some(self.agent)
-            && (crate::agent_resume::is_official_agent_source(source, agent_label)
-                || self
-                    .exited_reporter_sources
-                    .iter()
-                    .any(|exited| exited == source))
-    }
 }
 
 /// Pure state for a server-owned terminal.
@@ -330,7 +319,6 @@ impl TerminalState {
     #[cfg(any(windows, test))]
     pub(crate) fn agent_process_exited_within(&self, now: Instant, max_age: Duration) -> bool {
         self.recent_agent_process_exit
-            .as_ref()
             .is_some_and(|exit| now.saturating_duration_since(exit.observed_at) <= max_age)
     }
 
@@ -444,7 +432,6 @@ impl TerminalState {
             && agent.is_some()
             && self
                 .recent_agent_process_exit
-                .as_ref()
                 .is_some_and(|exit| Some(exit.agent) == agent && exit.observed_at < now);
         if !process_exited && self.detected_state_observed_before_release_suppression(agent, now) {
             return TerminalStateMutation {
@@ -484,23 +471,9 @@ impl TerminalState {
         self.fallback_observed_at = Some(now);
         if process_exited {
             if let Some(agent) = agent {
-                let agent_label = crate::detect::agent_label(agent);
-                let exited_reporter_sources = self
-                    .hook_authority
-                    .iter()
-                    .filter(|authority| authority.agent_label == agent_label)
-                    .map(|authority| authority.source.clone())
-                    .chain(
-                        self.persisted_agent_session
-                            .iter()
-                            .filter(|session| session.agent == agent_label)
-                            .map(|session| session.source.clone()),
-                    )
-                    .collect();
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
                     agent,
                     observed_at: now,
-                    exited_reporter_sources,
                 });
             }
         } else if agent.is_some() {
@@ -664,6 +637,7 @@ impl TerminalState {
                     && self.hook_authority.as_ref().is_some_and(|authority| {
                         crate::detect::parse_agent_label(&authority.agent_label)
                             == previous_detected_agent
+                            && !self.authority_outlived_exited_agent(authority)
                     })))
         {
             let durable_session = self.hook_authority.as_ref().and_then(|authority| {
@@ -730,6 +704,7 @@ impl TerminalState {
         .and_then(|mutation| mutation.effective_state_change)
     }
 
+    #[cfg(test)]
     pub fn set_hook_authority_with_session_ref(
         &mut self,
         source: String,
@@ -750,6 +725,7 @@ impl TerminalState {
         )
     }
 
+    #[cfg(test)]
     pub fn set_hook_authority_at(
         &mut self,
         source: String,
@@ -788,15 +764,18 @@ impl TerminalState {
         reporter_agent_alive: Option<bool>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
-        let _ = reporter_agent_alive;
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
+        // herdr-c1o5: a recorded exit of agent X drops a report for X unless
+        // the report names an agent process that is alive: a live process is
+        // not the exited one, and a report naming none may be its late report
+        // (upstream e608a751).
         if !crate::detect::full_lifecycle_hook_authority(&source, &agent_label)
-            && self
-                .recent_agent_process_exit
-                .as_ref()
-                .is_some_and(|exit| exit.drops_report(&source, &agent_label))
+            && reporter_agent_alive != Some(true)
+            && self.recent_agent_process_exit.is_some_and(|exit| {
+                crate::detect::parse_agent_label(&agent_label) == Some(exit.agent)
+            })
         {
             return None;
         }
@@ -887,6 +866,7 @@ impl TerminalState {
             message,
             reported_at: now,
             session_ref,
+            reporter_agent_alive: reporter_agent_alive == Some(true),
         });
         let current_session = self.current_session_identity_for_persistence();
         let effective_state_change = self.recompute_effective_state(
@@ -911,6 +891,18 @@ impl TerminalState {
         self.hook_authority
             .as_ref()
             .is_none_or(|authority| authority.reported_at <= observed_at)
+    }
+
+    /// herdr-c1o5: an authority from a report naming a live agent process,
+    /// accepted at or after the recorded exit of the agent it names, belongs
+    /// to another process than the exited one (ADR-0008 amendment 2026-10-24,
+    /// round 2): the exited agent leaving the foreground does not clear it.
+    fn authority_outlived_exited_agent(&self, authority: &HookAuthority) -> bool {
+        authority.reporter_agent_alive
+            && self.recent_agent_process_exit.is_some_and(|exit| {
+                crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
+                    && exit.observed_at <= authority.reported_at
+            })
     }
 
     fn fallback_not_older_than_hook(&self) -> bool {
@@ -1136,6 +1128,7 @@ impl TerminalState {
         if replace_pending {
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
+                    reporter_agent_alive: false,
                     source: source.to_string(),
                     agent_label: agent_label.to_string(),
                     state,

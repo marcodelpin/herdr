@@ -110,6 +110,10 @@ pub enum AppEvent {
         message: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// herdr-c1o5: whether the agent process the report names
+        /// (`agent_pid`, `agent_start`) was alive at report time, judged once
+        /// at the API layer. `None` when the report names no process.
+        reporter_agent_alive: Option<bool>,
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {

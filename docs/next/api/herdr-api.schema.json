@@ -2888,6 +2888,15 @@
             "agent": {
               "type": "string"
             },
+            "agent_pid": {
+              "description": "The agent process this report is about (herdr-c1o5), for a reporter\noutside that process such as a tmux bridge. Once Herdr saw the pane's\nown agent process exit, a report for that agent is applied only when it\nnames a process that is alive. Optional and additive: a report without\nit keeps today's behavior.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "agent_session_id": {
               "type": [
                 "string",
@@ -2897,6 +2906,15 @@
             "agent_session_path": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "agent_start": {
+              "description": "Start token of `agent_pid` (Linux: `/proc/<pid>/stat` field 22). When\nsent, the named process counts as alive only with this start token.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             },

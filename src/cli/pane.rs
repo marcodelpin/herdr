@@ -1275,6 +1275,8 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
     };
 
     super::send_ok_request(Method::PaneReportAgent(PaneReportAgentParams {
+        agent_pid: None,
+        agent_start: None,
         pane_id,
         source,
         agent,

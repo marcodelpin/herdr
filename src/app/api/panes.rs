@@ -1574,7 +1574,16 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        // herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): whether the agent
+        // process the report names is alive, judged here, where the process
+        // table may be read, never inside TerminalState. `None` when the report
+        // names no process.
+        let reporter_agent_alive = params.agent_pid.map(|pid| {
+            crate::platform::process_start_token(pid)
+                .is_some_and(|token| params.agent_start.is_none_or(|start| start == token))
+        });
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
+            reporter_agent_alive,
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),

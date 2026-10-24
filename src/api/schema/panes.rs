@@ -376,6 +376,17 @@ pub struct PaneReportAgentParams {
     /// first element must be a plain command name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_argv: Option<Vec<String>>,
+    /// The agent process this report is about (herdr-c1o5), for a reporter
+    /// outside that process such as a tmux bridge. Once Herdr saw the pane's
+    /// own agent process exit, a report for that agent is applied only when it
+    /// names a process that is alive. Optional and additive: a report without
+    /// it keeps today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pid: Option<u32>,
+    /// Start token of `agent_pid` (Linux: `/proc/<pid>/stat` field 22). When
+    /// sent, the named process counts as alive only with this start token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_start: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
