@@ -1275,6 +1275,68 @@ mod tests {
         }
     }
 
+    // herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): after herdr saw a
+    // native claude exit, pane.report_agent shows a claude only when it names a
+    // live agent process. The test process's own pid is alive; the same pid
+    // with another start token, or no pid at all, keeps the report dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn report_agent_after_native_exit_is_applied_only_naming_a_live_process() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("claude-c1o5-live");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let observed_at = std::time::Instant::now();
+        for process_exited in [false, true] {
+            app.handle_internal_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Claude),
+                state: crate::detect::AgentState::Idle,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited,
+                observed_at,
+            });
+        }
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let own_pid = std::process::id();
+        let own_start = crate::platform::process_start_token(own_pid).unwrap();
+        let cases = [
+            (1, None, None, None),
+            (2, Some(own_pid), Some(own_start.wrapping_add(1)), None),
+            (3, Some(own_pid), Some(own_start), Some("claude")),
+        ];
+        for (seq, agent_pid, agent_start, expected) in cases {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: format!("report-{seq}"),
+                method: crate::api::schema::Method::PaneReportAgent(
+                    crate::api::schema::PaneReportAgentParams {
+                        pane_id: public_pane_id.clone(),
+                        source: "tmux-bridge:claude-7cbd633a2afc".into(),
+                        agent: "claude".into(),
+                        state: crate::api::schema::PaneAgentState::Blocked,
+                        message: None,
+                        seq: Some(seq),
+                        agent_session_id: None,
+                        agent_session_path: None,
+                        resume_argv: None,
+                        agent_pid,
+                        agent_start,
+                    },
+                ),
+            });
+            assert!(!response.contains("\"error\""), "{response}");
+            assert_eq!(
+                app.state.terminals[&terminal_id].effective_agent_label(),
+                expected,
+                "seq {seq}"
+            );
+        }
+    }
+
     // herdr-nrr (codex nrr-r1): a reported resume command runs only in the
     // directory its dedupe key reserved at restore time. These tests route
     // the typed command through an `agent_launchers` recorder script that
