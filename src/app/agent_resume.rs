@@ -1567,7 +1567,8 @@ mod tests {
             "a refuted report must not record its resume_argv"
         );
         assert!(
-            pane.terminal().hook_report_is_newer("herdr:claude", Some(11)),
+            pane.terminal()
+                .hook_report_is_newer("herdr:claude", Some(11)),
             "a refuted report must not advance the sequence watermark"
         );
 

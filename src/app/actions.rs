@@ -1499,7 +1499,15 @@ impl AppState {
                 named_agent,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
+                    // herdr-c1o5 (ADR-0008 round 2, rule 11): the API's gate.
                     self.update_terminal_state(pane_id, |terminal| {
+                        if terminal.report_dropped_by_named_agent_rule(
+                            &source,
+                            &agent_label,
+                            named_agent,
+                        ) {
+                            return None;
+                        }
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
                     })
                     .into_iter()

@@ -1580,12 +1580,15 @@ impl App {
         );
         // A report the state setter drops by that rule changes nothing, so the
         // API records neither its sequence nor its resume command (codex
-        // c1o5-r2 P2).
+        // c1o5-r2 P2). Every source goes through that gate (codex c1o5-r3 P2-2).
         let dropped_by_named_agent_rule =
-            !crate::agent_resume::is_reserved_native_state_source(&params.source, &agent_label)
-                && self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
-                    terminal.named_agent_rule_drops(&params.source, &agent_label, named_agent)
-                });
+            self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
+                terminal.report_dropped_by_named_agent_rule(
+                    &params.source,
+                    &agent_label,
+                    named_agent,
+                )
+            });
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             named_agent,
             pane_id,
@@ -1637,10 +1640,7 @@ impl App {
             .lookup_runtime(ws_idx, pane_id)
             .and_then(|(runtime, _)| runtime.child_incarnation())
             .map(
-                |(pid, start_token)| crate::app::named_agent::ShellIncarnation {
-                    pid,
-                    start_token,
-                },
+                |(pid, start_token)| crate::app::named_agent::ShellIncarnation { pid, start_token },
             );
         let others: Vec<u32> = self
             .terminal_runtimes

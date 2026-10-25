@@ -821,7 +821,11 @@ mod tests {
         let mut detached = detached.spawn().expect("spawn detached");
         let read = process_job_read(detached.id()).expect("a live process reads");
         assert_eq!(Some(read.start_token), process_start_token(detached.id()));
-        assert_eq!(read.session, detached.id(), "a session leader names its session");
+        assert_eq!(
+            read.session,
+            detached.id(),
+            "a session leader names its session"
+        );
         assert_eq!(read.process_group, detached.id());
         assert!(!read.exited);
         let runner = process_job_read(std::process::id()).expect("the runner reads");
@@ -864,7 +868,11 @@ mod tests {
         while group(agent_pid) == Some((job, false)) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(group(agent_pid), Some((job, true)), "killed, not yet reaped");
+        assert_eq!(
+            group(agent_pid),
+            Some((job, true)),
+            "killed, not yet reaped"
+        );
         let _ = agent.wait();
         let _ = wrapper.kill();
         let _ = wrapper.wait();

@@ -99,51 +99,67 @@ fn named_agent_is_shown(
     let Some(claimed) = report.claimed else {
         return false;
     };
-    // Classify first, then confirm the identity: a pid reused between the
-    // two reads fails the start token.
-    if table.agent(agent_pid) != Some(claimed)
-        || table.read(agent_pid).map(|read| read.start_token) != Some(agent_start)
-        || table.is_zombie(agent_pid)
-    {
+    // Classify first, then confirm the identity in the agent's one reading
+    // below: a pid reused between the reads fails the start token.
+    if table.agent(agent_pid) != Some(claimed) || table.is_zombie(agent_pid) {
         return false;
     }
-    let Some(pane_shell) = shells.pane.map(|shell| shell.pid) else {
+    // Rule 10: P's shell by its incarnation; P's session and foreground come
+    // from that reading.
+    let Some(pane) = shells.pane else {
         return false;
     };
-    let Some(foreground) = table
-        .read(pane_shell)
-        .and_then(|read| read.foreground_group)
-    else {
+    let Some(shell) = live_read(table, pane.pid, pane.start_token) else {
         return false;
     };
-    // Native: the agent runs in this pane and is shown only in its foreground.
-    if let Some(group) = live_process_group(table, pane_shell, agent_pid, agent_start) {
-        return group == foreground;
-    }
-    // Carried: shown through a carrier in this pane's foreground, and not the
-    // agent of another pane.
+    let Some(foreground) = shell.foreground_group else {
+        return false;
+    };
+    // Rule 8: the agent's one reading; every membership test below uses it.
+    let Some(agent) = live_read(table, agent_pid, agent_start) else {
+        return false;
+    };
+    let shown = if agent.session == shell.session {
+        // Native: the agent runs in this pane and is shown only in its
+        // foreground.
+        agent.process_group == foreground
+    } else {
+        carried(table, report, agent, shell, foreground, shells.others)
+    };
+    // Rule 10: P's shell held its pid through the reads above.
+    shown
+        && live_read(table, pane.pid, pane.start_token).is_some_and(|again| {
+            again.session == shell.session && again.foreground_group == Some(foreground)
+        })
+}
+
+/// Carried: shown through a carrier in this pane's foreground, and not the
+/// agent of another pane. Rule 9: the session of pane Q is the one whose id is
+/// Q's shell pid, so no read of Q is needed.
+fn carried(
+    table: &impl ProcessTable,
+    report: NamedAgentReport,
+    agent: ProcessJobRead,
+    shell: ProcessJobRead,
+    foreground: u32,
+    others: &[u32],
+) -> bool {
     let (Some(carrier_pid), Some(carrier_start)) = (report.carrier_pid, report.carrier_start)
     else {
         return false;
     };
-    live_process_group(table, pane_shell, carrier_pid, carrier_start) == Some(foreground)
-        && !shells.others.iter().any(|&shell| {
-            live_process_group(table, shell, agent_pid, agent_start).is_some()
+    !others.contains(&agent.session)
+        && live_read(table, carrier_pid, carrier_start).is_some_and(|carrier| {
+            carrier.session == shell.session && carrier.process_group == foreground
         })
 }
 
-/// The group of `pid` while it is alive with `start_token` in the session of
-/// `shell_pid`.
-fn live_process_group(
-    table: &impl ProcessTable,
-    shell_pid: u32,
-    pid: u32,
-    start_token: u64,
-) -> Option<u32> {
-    let read = table.read(pid)?;
-    let shell_session = table.read(shell_pid)?.session;
-    (!read.exited && read.start_token == start_token && read.session == shell_session)
-        .then_some(read.process_group)
+/// One read of `pid` while it is alive with `start_token`. A read that fails
+/// refutes (rule 8).
+fn live_read(table: &impl ProcessTable, pid: u32, start_token: u64) -> Option<ProcessJobRead> {
+    table
+        .read(pid)
+        .filter(|read| read.start_token == start_token && !read.exited)
 }
 
 #[cfg(test)]
@@ -408,8 +424,12 @@ mod tests {
             pane: None,
             others: &[],
         };
-        let verdict =
-            judge_named_agent(&fixture(), report(NAMED_CLAUDE, CARRIER), no_shell, Instant::now);
+        let verdict = judge_named_agent(
+            &fixture(),
+            report(NAMED_CLAUDE, CARRIER),
+            no_shell,
+            Instant::now,
+        );
         assert_eq!(verdict, NamedAgentVerdict::Refuted, "pane without a shell");
     }
 

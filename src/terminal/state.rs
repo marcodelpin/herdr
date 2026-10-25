@@ -791,6 +791,7 @@ impl TerminalState {
         if self.named_agent_rule_drops(&source, &agent_label, named_agent) {
             return None;
         }
+        // ADR-0008 round 2, rule 12: a buffered report keeps its witness.
         let reanchor_sequence = match self.route_full_lifecycle_hook_report(
             &source,
             &agent_label,
@@ -798,7 +799,8 @@ impl TerminalState {
             message.as_deref(),
             &session_ref,
             seq,
-            now,
+            named_agent.witnessed_at().unwrap_or(now),
+            named_agent.witnessed_at().is_some(),
         ) {
             FullLifecycleHookReportRoute::Accept { reanchor_sequence } => reanchor_sequence,
             FullLifecycleHookReportRoute::Ignore => return None,
@@ -919,11 +921,13 @@ impl TerminalState {
         agent_label: &str,
         named_agent: NamedAgentVerdict,
     ) -> bool {
-        if crate::detect::session_identity_only_integration(source, agent_label) {
-            return false;
-        }
+        // ADR-0008 round 2, rule 11: a refuted report is dropped for every
+        // source.
         if named_agent == NamedAgentVerdict::Refuted {
             return true;
+        }
+        if crate::detect::session_identity_only_integration(source, agent_label) {
+            return false;
         }
         !crate::detect::full_lifecycle_hook_authority(source, agent_label)
             && self.recent_agent_process_exit.is_some_and(|exit| {
@@ -932,6 +936,22 @@ impl TerminalState {
                         .witnessed_at()
                         .is_none_or(|observed_at| observed_at <= exit.observed_at)
             })
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 2, rule 11): the gate the API and the state
+    /// setters both ask. A reserved native-state source records only its
+    /// session, so only a refuted verdict drops it; every other source is
+    /// judged by `named_agent_rule_drops`.
+    pub fn report_dropped_by_named_agent_rule(
+        &self,
+        source: &str,
+        agent_label: &str,
+        named_agent: NamedAgentVerdict,
+    ) -> bool {
+        if crate::agent_resume::is_reserved_native_state_source(source, agent_label) {
+            return named_agent == NamedAgentVerdict::Refuted;
+        }
+        self.named_agent_rule_drops(source, agent_label, named_agent)
     }
 
     /// herdr-c1o5: an authority witnessed after the recorded exit of the agent
@@ -1050,6 +1070,7 @@ impl TerminalState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // one report's fields plus its witness
     fn route_full_lifecycle_hook_report(
         &mut self,
         source: &str,
@@ -1059,6 +1080,7 @@ impl TerminalState {
         session_ref: &Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         reported_at: Instant,
+        named_agent_witnessed: bool,
     ) -> FullLifecycleHookReportRoute {
         if !crate::detect::full_lifecycle_hook_authority(source, agent_label) {
             return FullLifecycleHookReportRoute::Accept {
@@ -1169,7 +1191,7 @@ impl TerminalState {
         if replace_pending {
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
-                    named_agent_witnessed: false,
+                    named_agent_witnessed,
                     source: source.to_string(),
                     agent_label: agent_label.to_string(),
                     state,

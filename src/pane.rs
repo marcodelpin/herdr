@@ -2559,8 +2559,9 @@ impl PaneRuntime {
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
-        let child_start_token =
-            (child_pid > 0).then(|| crate::platform::process_start_token(child_pid)).flatten();
+        let child_start_token = (child_pid > 0)
+            .then(|| crate::platform::process_start_token(child_pid))
+            .flatten();
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
         let cwd_process_exited = Arc::new(AtomicBool::new(false));
