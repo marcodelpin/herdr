@@ -6459,6 +6459,220 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Working);
     }
 
+    // codex c1o5-r7 P2-1 (ADR-0008 round 6, rule 18): custom:pi witnessed at
+    // t2; a native Claude observation from t1 < t2 is deferred; the release of
+    // custom:pi replays it. The release speaks for pi only: Claude stays.
+    #[test]
+    fn a_release_keeps_another_agent_its_replay_restores() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Claude, t0);
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert_eq!(
+            terminal.deferred_detection.map(|deferred| deferred.agent),
+            Some(Some(Agent::Claude)),
+            "the Claude observation is deferred"
+        );
+
+        let mutation = terminal
+            .release_agent_with_mutation("custom:pi", "pi", Some(2))
+            .expect("the release is applied");
+        assert!(mutation.agent_released, "{mutation:?}");
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.detected_agent, Some(Agent::Claude));
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    // codex c1o5-r7 P2-1, bridge variant: herdr:pi session S, witnessed at t0,
+    // is buffered (no pi detected); a bridge claude is witnessed at t2; a pi
+    // detection from t1 < t2 is deferred; the release of the bridge claude
+    // replays it, which releases S's buffered authority. Pi stays effective.
+    #[test]
+    fn a_bridge_release_keeps_the_pi_authority_its_replay_installs() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "S's report is buffered");
+        terminal.set_hook_authority_naming_agent_at(
+            BRIDGE_SOURCE.into(),
+            "claude".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert_eq!(
+            terminal.deferred_detection.map(|deferred| deferred.agent),
+            Some(Some(Agent::Pi)),
+            "the pi detection is deferred"
+        );
+
+        let mutation = terminal
+            .release_agent_with_mutation(BRIDGE_SOURCE, "claude", Some(2))
+            .expect("the release is applied");
+        assert!(mutation.agent_released, "{mutation:?}");
+        assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report");
+        assert_witnessed_authority(&terminal, t0);
+    }
+
+    // codex c1o5-r7 P2-2 (ADR-0008 round 6, rule 15 amended): herdr:pi session
+    // S, seq 2, witnessed at t2, is buffered; S's SessionStart seq 1 is
+    // accepted while pi is undetected; S's seq 3 Working, naming no process,
+    // replaces the buffered report; a pi exit observed at t1 < t2 is consumed;
+    // pi is detected idle at t4. The successor keeps the buffered witness.
+    #[test]
+    fn an_unnamed_buffered_successor_keeps_the_buffered_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(15);
+        let t4 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("s-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            session_ref,
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+        assert!(
+            terminal.hook_authority.is_none(),
+            "S's reports are buffered"
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Idle, t4);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "S's seq 3");
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.witnessed_at),
+            Some(t2)
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+    }
+
+    // codex c1o5-r7 P3: the snapshot tells session kinds apart, and reads the
+    // persisted session's agent and cwd.
+    #[test]
+    fn the_snapshot_reads_session_kinds_and_the_persisted_session() {
+        use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind, PersistedAgentSession};
+        let t0 = Instant::now();
+        let id = AgentSessionRef {
+            kind: AgentSessionRefKind::Id,
+            value: "/tmp/pi.jsonl".into(),
+        };
+        let path = AgentSessionRef {
+            kind: AgentSessionRefKind::Path,
+            ..id.clone()
+        };
+        let with_authority = |session_ref: &AgentSessionRef| {
+            let mut terminal = test_terminal();
+            terminal.hook_authority = Some(HookAuthority {
+                source: "herdr:pi".into(),
+                agent_label: "pi".into(),
+                state: AgentState::Working,
+                message: None,
+                reported_at: t0,
+                session_ref: Some(session_ref.clone()),
+                witnessed_at: None,
+            });
+            terminal
+        };
+        assert_ne!(
+            pane_parts(&with_authority(&id)),
+            pane_parts(&with_authority(&path))
+        );
+
+        let with_persisted = |agent: &str, cwd: Option<&str>| {
+            let mut terminal = test_terminal();
+            terminal.persisted_agent_session = Some(PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: agent.into(),
+                session_ref: id.clone(),
+                cwd: cwd.map(str::to_string),
+            });
+            terminal
+        };
+        let base = pane_parts(&with_persisted("pi", None));
+        assert_ne!(base, pane_parts(&with_persisted("pi", Some("/tmp"))));
+        assert_ne!(base, pane_parts(&with_persisted("omp", None)));
+    }
+
     // ADR-0008 round 4, rule 14, and round 5: every part of the pane state,
     // compared as one value by the complete-state tests below.
     type AuthorityPart = (
