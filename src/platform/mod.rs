@@ -600,6 +600,12 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     )
 }
 
+/// herdr-c1o5: one process read for the detector's classifier, Linux only.
+#[cfg(not(target_os = "linux"))]
+pub fn process_snapshot(_pid: u32) -> Option<ForegroundProcess> {
+    None
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None

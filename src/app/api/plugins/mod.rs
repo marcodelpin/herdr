@@ -3468,6 +3468,8 @@ action = "missing"
             crate::api::schema::PaneReportAgentParams {
                 agent_pid: None,
                 agent_start: None,
+                carrier_pid: None,
+                carrier_start: None,
                 pane_id: pane_public.clone(),
                 source: "test".into(),
                 agent: "codex".into(),

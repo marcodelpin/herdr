@@ -19,6 +19,7 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
+mod named_agent;
 mod popup;
 mod runtime;
 mod session;

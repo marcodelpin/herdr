@@ -1275,65 +1275,255 @@ mod tests {
         }
     }
 
-    // herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): after herdr saw a
-    // native claude exit, pane.report_agent shows a claude only when it names a
-    // live agent process. The test process's own pid is alive; the same pid
-    // with another start token, or no pid at all, keeps the report dropped.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn report_agent_after_native_exit_is_applied_only_naming_a_live_process() {
-        let mut app = test_app();
-        let workspace = crate::workspace::Workspace::test_new("claude-c1o5-live");
-        let pane_id = workspace.tabs[0].root_pane;
-        let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
-        app.state.workspaces = vec![workspace];
-        app.state.active = Some(0);
-        app.state.ensure_test_terminals();
-        let observed_at = std::time::Instant::now();
-        for process_exited in [false, true] {
-            app.handle_internal_event(crate::events::AppEvent::StateChanged {
-                pane_id,
-                agent: Some(crate::detect::Agent::Claude),
-                state: crate::detect::AgentState::Idle,
-                visible_blocker: false,
-                visible_working: false,
-                process_exited,
-                observed_at,
+    // herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): a pane
+    // with a real shell whose foreground job is the carrier, a native claude
+    // exit recorded in it, and processes the test names in its reports.
+    #[cfg(target_os = "linux")]
+    struct C1o5Pane {
+        app: App,
+        pane_id: crate::layout::PaneId,
+        terminal_id: crate::terminal::TerminalId,
+        public_pane_id: String,
+        carrier: (u32, u64),
+        children: Vec<std::process::Child>,
+        dir: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl C1o5Pane {
+        fn new(label: &str) -> Self {
+            let mut app = test_app();
+            let workspace = crate::workspace::Workspace::test_new(label);
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "claude".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 60".into()],
+                dedupe_key: label.into(),
+                launch_dir: None,
             });
+            app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+            let shell_pid = app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|runtime| runtime.child_pid())
+                .expect("the pane needs a real shell");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < deadline
+                && crate::detect::foreground_process_group_id(shell_pid) == Some(shell_pid)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let carrier_pid = crate::detect::foreground_process_group_id(shell_pid)
+                .expect("the pane has a foreground job");
+            let carrier_start = crate::platform::process_start_token(carrier_pid)
+                .expect("the foreground job is alive");
+            let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("herdr-c1o5-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                app,
+                pane_id,
+                terminal_id,
+                public_pane_id,
+                carrier: (carrier_pid, carrier_start),
+                children: Vec::new(),
+                dir,
+            }
         }
-        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
-        let own_pid = std::process::id();
-        let own_start = crate::platform::process_start_token(own_pid).unwrap();
-        let cases = [
-            (1, None, None, None),
-            (2, Some(own_pid), Some(own_start.wrapping_add(1)), None),
-            (3, Some(own_pid), Some(own_start), Some("claude")),
-        ];
-        for (seq, agent_pid, agent_start, expected) in cases {
-            let response = app.handle_api_request(crate::api::schema::Request {
+
+        /// A live process whose comm is `name` (a link to `sleep`).
+        fn spawn(&mut self, name: &str) -> (u32, u64) {
+            let path = self.dir.join(name);
+            if !path.exists() {
+                let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+                    .into_iter()
+                    .find(|candidate| std::path::Path::new(candidate).exists())
+                    .expect("a sleep binary");
+                std::os::unix::fs::symlink(sleep, &path).unwrap();
+            }
+            let child = std::process::Command::new(&path)
+                .arg("600")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            self.children.push(child);
+            (pid, crate::platform::process_start_token(pid).unwrap())
+        }
+
+        fn record_native_claude_exit(&mut self) {
+            let observed_at = std::time::Instant::now();
+            for process_exited in [false, true] {
+                self.app
+                    .handle_internal_event(crate::events::AppEvent::StateChanged {
+                        pane_id: self.pane_id,
+                        agent: Some(crate::detect::Agent::Claude),
+                        state: crate::detect::AgentState::Idle,
+                        visible_blocker: false,
+                        visible_working: false,
+                        process_exited,
+                        observed_at,
+                    });
+            }
+        }
+
+        fn detector_clear(&mut self) {
+            self.app
+                .handle_internal_event(crate::events::AppEvent::StateChanged {
+                    pane_id: self.pane_id,
+                    agent: None,
+                    state: crate::detect::AgentState::Unknown,
+                    visible_blocker: false,
+                    visible_working: false,
+                    process_exited: false,
+                    observed_at: std::time::Instant::now(),
+                });
+        }
+
+        fn report(
+            &mut self,
+            seq: u64,
+            agent: Option<(u32, u64)>,
+            carrier: Option<(u32, u64)>,
+            resume_session: Option<&str>,
+        ) {
+            let response = self.app.handle_api_request(crate::api::schema::Request {
                 id: format!("report-{seq}"),
                 method: crate::api::schema::Method::PaneReportAgent(
                     crate::api::schema::PaneReportAgentParams {
-                        pane_id: public_pane_id.clone(),
-                        source: "tmux-bridge:claude-7cbd633a2afc".into(),
+                        pane_id: self.public_pane_id.clone(),
+                        source: "custom:a".into(),
                         agent: "claude".into(),
                         state: crate::api::schema::PaneAgentState::Blocked,
                         message: None,
                         seq: Some(seq),
                         agent_session_id: None,
                         agent_session_path: None,
-                        resume_argv: None,
-                        agent_pid,
-                        agent_start,
+                        resume_argv: resume_session.map(|session| {
+                            vec!["claude".into(), "--resume".into(), session.into()]
+                        }),
+                        agent_pid: agent.map(|(pid, _)| pid),
+                        agent_start: agent.map(|(_, start)| start),
+                        carrier_pid: carrier.map(|(pid, _)| pid),
+                        carrier_start: carrier.map(|(_, start)| start),
                     },
                 ),
             });
-            assert!(!response.contains("\"error\""), "{response}");
-            assert_eq!(
-                app.state.terminals[&terminal_id].effective_agent_label(),
-                expected,
-                "seq {seq}"
-            );
+            assert!(!response.contains("\"error\""), "seq {seq}: {response}");
+        }
+
+        fn terminal(&self) -> &crate::terminal::TerminalState {
+            &self.app.state.terminals[&self.terminal_id]
+        }
+
+        fn label(&self) -> Option<String> {
+            self.terminal().effective_agent_label().map(str::to_string)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for C1o5Pane {
+        fn drop(&mut self) {
+            for child in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            for (_, runtime) in self.app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // codex c1o5-r2 P2: after a native exit, seq 10 names a claude shown
+    // through the pane's foreground job; seq 11 names it with a wrong
+    // agent_start and a resume command; seq 11 then comes corrected.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn report_agent_refuted_identity_keeps_resume_and_sequence() {
+        let mut pane = C1o5Pane::new("r2-p2-resume");
+        let claude = pane.spawn("claude");
+        let carrier = Some(pane.carrier);
+        pane.record_native_claude_exit();
+
+        pane.report(10, Some(claude), carrier, None);
+        assert_eq!(pane.label().as_deref(), Some("claude"), "seq 10");
+        let wrong_start = Some((claude.0, claude.1.wrapping_add(1)));
+        pane.report(11, wrong_start, carrier, Some("stale-session"));
+        assert!(
+            pane.terminal().reported_resume().is_none(),
+            "a refuted report must not record its resume_argv, got {:?}",
+            pane.terminal().reported_resume()
+        );
+        assert!(
+            pane.terminal().hook_report_is_newer("custom:a", Some(11)),
+            "a refuted report must not advance the sequence watermark"
+        );
+
+        pane.report(11, Some(claude), carrier, Some("live-session"));
+        assert_eq!(
+            pane.terminal()
+                .reported_resume()
+                .map(|resume| resume.argv.clone()),
+            Some(vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "live-session".to_string()
+            ]),
+            "the corrected report at seq 11 is applied"
+        );
+    }
+
+    // codex c1o5-r2 P2: an unrelated live process named with its correct
+    // start token shows nothing, before or after a detector clear.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn report_agent_naming_an_unrelated_live_process_stays_dropped() {
+        let mut pane = C1o5Pane::new("r2-p2-sleep");
+        let sleep = pane.spawn("sleep");
+        let carrier = Some(pane.carrier);
+        pane.record_native_claude_exit();
+
+        pane.report(1, Some(sleep), carrier, None);
+        assert_eq!(pane.label(), None, "a sleep is not a claude");
+        pane.detector_clear();
+        assert_eq!(pane.label(), None, "after the detector clear");
+    }
+
+    // Replaces the round-2 test that expected the test runner's own pid to
+    // show claude: the runner is refuted; a claude-named process outside
+    // every pane is shown only through the pane's foreground job.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn report_agent_after_native_exit_shows_a_carried_claude() {
+        let mut pane = C1o5Pane::new("r2-carried");
+        let claude = pane.spawn("claude");
+        let carrier = Some(pane.carrier);
+        let runner = std::process::id();
+        let runner = (
+            runner,
+            crate::platform::process_start_token(runner).unwrap(),
+        );
+        pane.record_native_claude_exit();
+
+        for (seq, agent, carrier, expected) in [
+            (1, None, carrier, None),
+            (2, Some(runner), carrier, None),
+            (3, Some(claude), None, None),
+            (4, Some(claude), Some(runner), None),
+            (5, Some((claude.0, claude.1.wrapping_add(1))), carrier, None),
+            (6, Some(claude), carrier, Some("claude")),
+        ] {
+            pane.report(seq, agent, carrier, None);
+            assert_eq!(pane.label().as_deref(), expected, "seq {seq}");
         }
     }
 

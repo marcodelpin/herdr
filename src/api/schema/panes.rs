@@ -387,6 +387,16 @@ pub struct PaneReportAgentParams {
     /// sent, the named process counts as alive only with this start token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_start: Option<u64>,
+    /// The process in this pane through which the agent is shown (herdr-c1o5,
+    /// round-cap exit a]), for an agent outside every herdr pane such as a
+    /// tmux claude: for the tmux bridge, the tmux client in this pane. Counts
+    /// only with `carrier_start` and only in the pane's foreground process
+    /// group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_pid: Option<u32>,
+    /// Start token of `carrier_pid`, same format as `agent_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_start: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

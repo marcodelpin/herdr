@@ -841,6 +841,26 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
+/// herdr-c1o5: one process read the way a foreground job reads its members
+/// (comm, and argv when the process state allows reading it), so the
+/// detector's classifier can name the agent a report names.
+pub fn process_snapshot(pid: u32) -> Option<ForegroundProcess> {
+    if pid == 0 {
+        return None;
+    }
+    let (_, name, state) = process_pgrp_comm_and_state(pid)?;
+    let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
+        .then(|| process_argv(pid))
+        .flatten();
+    Some(ForegroundProcess {
+        pid,
+        name,
+        argv0: None,
+        cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+        argv,
+    })
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {

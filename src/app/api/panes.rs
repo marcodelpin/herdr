@@ -1565,6 +1565,10 @@ impl App {
         if let Err(message) = validate_optional_resume_argv(params.resume_argv.as_deref()) {
             return encode_error(id, "invalid_resume_argv", message);
         }
+        // herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): the
+        // agent process the report names is judged here, where the process
+        // table may be read, never inside TerminalState.
+        let named_agent = self.judge_named_agent(ws_idx, pane_id, &agent_label, &params);
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
@@ -1574,16 +1578,8 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
-        // herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): whether the agent
-        // process the report names is alive, judged here, where the process
-        // table may be read, never inside TerminalState. `None` when the report
-        // names no process.
-        let reporter_agent_alive = params.agent_pid.map(|pid| {
-            crate::platform::process_start_token(pid)
-                .is_some_and(|token| params.agent_start.is_none_or(|start| start == token))
-        });
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
-            reporter_agent_alive,
+            named_agent,
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),
@@ -1602,6 +1598,49 @@ impl App {
             agent_label,
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
+        )
+    }
+
+    fn judge_named_agent(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        agent_label: &str,
+        params: &PaneReportAgentParams,
+    ) -> crate::terminal::NamedAgentVerdict {
+        let report = crate::app::named_agent::NamedAgentReport {
+            claimed: crate::detect::parse_agent_label(agent_label),
+            agent_pid: params.agent_pid,
+            agent_start: params.agent_start,
+            carrier_pid: params.carrier_pid,
+            carrier_start: params.carrier_start,
+        };
+        if report.agent_pid.is_none() {
+            return crate::terminal::NamedAgentVerdict::Unnamed;
+        }
+        let pane_terminal = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned();
+        let pane = self
+            .lookup_runtime(ws_idx, pane_id)
+            .and_then(|(runtime, _)| runtime.child_pid());
+        let others: Vec<u32> = self
+            .terminal_runtimes
+            .iter()
+            .filter(|(terminal_id, _)| Some(*terminal_id) != pane_terminal.as_ref())
+            .filter_map(|(_, runtime)| runtime.child_pid())
+            .collect();
+        crate::app::named_agent::judge_named_agent(
+            &crate::app::named_agent::PlatformProcessTable,
+            report,
+            crate::app::named_agent::PaneShells {
+                pane,
+                others: &others,
+            },
+            std::time::Instant::now,
         )
     }
 

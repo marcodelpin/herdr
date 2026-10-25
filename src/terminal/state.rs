@@ -23,11 +23,33 @@ pub struct HookAuthority {
     #[serde(skip, default = "Instant::now")]
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
-    /// herdr-c1o5: the report named its agent process and the API layer found
-    /// it alive (ADR-0008 amendment 2026-10-24, round 2). Never serialized: a
-    /// restored or handed-off authority names no live process.
+    /// herdr-c1o5: the report named its agent process and the API layer
+    /// witnessed it (ADR-0008 amendment 2026-10-25, round-cap exit a]). Never
+    /// serialized: a restored or handed-off authority names no live process.
     #[serde(skip)]
-    pub reporter_agent_alive: bool,
+    pub named_agent_witnessed: bool,
+}
+
+/// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): the API
+/// layer's verdict on the agent process a `pane.report_agent` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedAgentVerdict {
+    /// The report names no agent process.
+    Unnamed,
+    /// The named process is not the claimed agent shown in this pane.
+    Refuted,
+    /// The named process is the claimed agent shown in this pane. It was
+    /// alive at `observed_at`, an instant taken before the first read.
+    Witnessed { observed_at: Instant },
+}
+
+impl NamedAgentVerdict {
+    pub fn witnessed_at(self) -> Option<Instant> {
+        match self {
+            Self::Witnessed { observed_at } => Some(observed_at),
+            Self::Unnamed | Self::Refuted => None,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -743,15 +765,13 @@ impl TerminalState {
             message,
             session_ref,
             seq,
-            None,
+            NamedAgentVerdict::Unnamed,
             now,
         )
     }
 
-    /// herdr-c1o5 (ADR-0008 amendment 2026-10-24, round 2): a report that
-    /// names the agent process it is about (`pane.report_agent` `agent_pid`
-    /// and `agent_start`). `reporter_agent_alive` is the API layer's verdict
-    /// on that process at report time, `None` when the report names none.
+    /// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): a
+    /// report with the API layer's verdict on the agent process it names.
     #[allow(clippy::too_many_arguments)] // one report's fields plus its verdict
     pub fn set_hook_authority_naming_agent_at(
         &mut self,
@@ -761,7 +781,7 @@ impl TerminalState {
         message: Option<String>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
-        reporter_agent_alive: Option<bool>,
+        named_agent: NamedAgentVerdict,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
@@ -772,7 +792,7 @@ impl TerminalState {
         // not the exited one, and a report naming none may be its late report
         // (upstream e608a751).
         if !crate::detect::full_lifecycle_hook_authority(&source, &agent_label)
-            && reporter_agent_alive != Some(true)
+            && named_agent.witnessed_at().is_none()
             && self.recent_agent_process_exit.is_some_and(|exit| {
                 crate::detect::parse_agent_label(&agent_label) == Some(exit.agent)
             })
@@ -866,7 +886,7 @@ impl TerminalState {
             message,
             reported_at: now,
             session_ref,
-            reporter_agent_alive: reporter_agent_alive == Some(true),
+            named_agent_witnessed: named_agent.witnessed_at().is_some(),
         });
         let current_session = self.current_session_identity_for_persistence();
         let effective_state_change = self.recompute_effective_state(
@@ -898,7 +918,7 @@ impl TerminalState {
     /// to another process than the exited one (ADR-0008 amendment 2026-10-24,
     /// round 2): the exited agent leaving the foreground does not clear it.
     fn authority_outlived_exited_agent(&self, authority: &HookAuthority) -> bool {
-        authority.reporter_agent_alive
+        authority.named_agent_witnessed
             && self.recent_agent_process_exit.is_some_and(|exit| {
                 crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
                     && exit.observed_at <= authority.reported_at
@@ -1128,7 +1148,7 @@ impl TerminalState {
         if replace_pending {
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
-                    reporter_agent_alive: false,
+                    named_agent_witnessed: false,
                     source: source.to_string(),
                     agent_label: agent_label.to_string(),
                     state,
@@ -5130,7 +5150,11 @@ mod tests {
             None,
             None,
             Some(seq),
-            Some(agent_alive),
+            if agent_alive {
+                NamedAgentVerdict::Witnessed { observed_at: now }
+            } else {
+                NamedAgentVerdict::Refuted
+            },
             now,
         )
     }
@@ -5323,6 +5347,58 @@ mod tests {
         );
 
         assert_eq!(terminal.effective_agent_label(), None);
+    }
+
+    // codex c1o5-r2 P1: custom:a names native claude A, read alive at t0; A
+    // exits and the detector observes it at t1; the report is applied at t2,
+    // before the queued exit is processed; then a detector clear at t3.
+    #[test]
+    fn witness_older_than_a_queued_exit_does_not_survive_it() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:a".into(),
+            "claude".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), None);
+        assert_ne!(terminal.state, AgentState::Blocked);
     }
 
     #[test]

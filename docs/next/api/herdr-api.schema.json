@@ -2918,6 +2918,24 @@
                 "null"
               ]
             },
+            "carrier_pid": {
+              "description": "The process in this pane through which the agent is shown (herdr-c1o5,\nround-cap exit a]), for an agent outside every herdr pane such as a\ntmux claude: for the tmux bridge, the tmux client in this pane. Counts\nonly with `carrier_start` and only in the pane's foreground process\ngroup.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "carrier_start": {
+              "description": "Start token of `carrier_pid`, same format as `agent_start`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "message": {
               "type": [
                 "string",

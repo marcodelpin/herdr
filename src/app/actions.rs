@@ -1496,7 +1496,7 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
-                reporter_agent_alive,
+                named_agent,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
                     self.update_terminal_state(pane_id, |terminal| {
@@ -1513,7 +1513,7 @@ impl AppState {
                             message,
                             session_ref,
                             seq,
-                            reporter_agent_alive,
+                            named_agent,
                             Instant::now(),
                         )
                     })
@@ -3295,7 +3295,7 @@ mod tests {
             (3, "new", AgentState::Idle),
         ] {
             app.handle_app_event(AppEvent::HookStateReported {
-                reporter_agent_alive: None,
+                named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
                 pane_id,
                 source: "custom:worker".into(),
                 agent_label: label.into(),
@@ -3664,7 +3664,7 @@ mod tests {
 
     fn report_custom_agent_with_resume(state: &mut AppState, pane_id: PaneId, argv: &[&str]) {
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "prime-agent".into(),
             agent_label: "prime-agent".into(),
@@ -3733,7 +3733,7 @@ mod tests {
         state.session_dirty = false;
 
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:other".into(),
             agent_label: "other".into(),
@@ -3837,7 +3837,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:pi".into(),
             agent_label: "pi".into(),
@@ -3867,7 +3867,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id: bg_pane_id,
             source: "custom:hermes".into(),
             agent_label: "hermes".into(),
@@ -3906,7 +3906,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id: bg_pane_id,
             source: "herdr:codex".into(),
             agent_label: "codex".into(),
@@ -3955,7 +3955,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:claude".into(),
             agent_label: "claude".into(),
@@ -4066,7 +4066,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:devin".into(),
             agent_label: "devin".into(),
@@ -4091,7 +4091,7 @@ mod tests {
         let second_session = test_dir.join("two.jsonl").display().to_string();
 
         let first_updates = state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
@@ -4104,7 +4104,7 @@ mod tests {
         state.session_dirty = false;
 
         let second_updates = state.handle_app_event(AppEvent::HookStateReported {
-            reporter_agent_alive: None,
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
