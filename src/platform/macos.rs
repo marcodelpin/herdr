@@ -918,27 +918,33 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
     process_bsdinfo(pid).map(|info| bsdinfo_start_token(&info))
 }
 
-/// Process group of `pid` while that same process, matched by its start
-/// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
-/// backgrounded job still counts.
+/// Liveness of `pid`, matched by its start token, on the terminal of the pane
+/// shell `shell_pid`. A stopped or backgrounded job still counts as alive.
 pub fn pane_process_liveness(
     shell_pid: u32,
     pid: u32,
     start_token: u64,
 ) -> super::PaneProcessLiveness {
-    live_pane_process_group(shell_pid, pid, start_token).map_or(
-        super::PaneProcessLiveness::Gone,
-        super::PaneProcessLiveness::Alive,
-    )
-}
+    use super::PaneProcessLiveness;
 
-fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
-    let process = process_bsdinfo(pid)?;
-    let shell = process_bsdinfo(shell_pid)?;
-    (process.pbi_status != libc::SZOMB
-        && bsdinfo_start_token(&process) == start_token
-        && process.e_tdev == shell.e_tdev)
-        .then_some(process.pbi_pgid)
+    let Some(process) = process_bsdinfo(pid) else {
+        // Only ESRCH proves the process gone; any other failure proves nothing.
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            PaneProcessLiveness::Gone
+        } else {
+            PaneProcessLiveness::Unknown
+        };
+    };
+    if process.pbi_status == libc::SZOMB || bsdinfo_start_token(&process) != start_token {
+        return PaneProcessLiveness::Gone;
+    }
+    let Some(shell) = process_bsdinfo(shell_pid) else {
+        return PaneProcessLiveness::Unknown;
+    };
+    if process.e_tdev != shell.e_tdev {
+        return PaneProcessLiveness::Gone;
+    }
+    PaneProcessLiveness::Alive(process.pbi_pgid)
 }
 
 fn bsdinfo_start_token(info: &libc::proc_bsdinfo) -> u64 {

@@ -688,6 +688,9 @@ fn read_process_stat(pid: u32) -> std::io::Result<String> {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
 }
 
+/// Only a definite read proves the agent gone: no `/proc` entry, a zombie, a
+/// later process on the pid, or a session other than the pane shell's. Any
+/// failed or malformed read, the shell's included, is `Unknown`.
 fn pane_process_liveness_from_stats(
     shell_stat: std::io::Result<String>,
     stat: std::io::Result<String>,
@@ -695,26 +698,38 @@ fn pane_process_liveness_from_stats(
 ) -> super::PaneProcessLiveness {
     use super::PaneProcessLiveness;
 
-    let Some(stat) = stat.ok().as_deref().and_then(process_job_stat_from_stat) else {
-        return PaneProcessLiveness::Gone;
+    let stat = match stat {
+        Ok(text) => match process_job_stat_from_stat(&text) {
+            Some(stat) => stat,
+            None => return PaneProcessLiveness::Unknown,
+        },
+        Err(err) if process_read_proves_exit(&err) => return PaneProcessLiveness::Gone,
+        Err(_) => return PaneProcessLiveness::Unknown,
     };
+    if matches!(stat.state, 'Z' | 'X') || stat.start_time != start_token {
+        return PaneProcessLiveness::Gone;
+    }
     let Some(shell_session) = shell_stat
         .ok()
         .as_deref()
         .and_then(process_job_stat_from_stat)
         .map(|shell| shell.session)
     else {
-        return PaneProcessLiveness::Gone;
+        return PaneProcessLiveness::Unknown;
     };
-    if !matches!(stat.state, 'Z' | 'X')
-        && stat.start_time == start_token
-        && stat.session == shell_session
-        && stat.pgrp > 0
-    {
-        PaneProcessLiveness::Alive(stat.pgrp as u32)
-    } else {
-        PaneProcessLiveness::Gone
+    if stat.session != shell_session {
+        // setsid: the process can never regain this pane's terminal.
+        return PaneProcessLiveness::Gone;
     }
+    if stat.pgrp <= 0 {
+        return PaneProcessLiveness::Unknown;
+    }
+    PaneProcessLiveness::Alive(stat.pgrp as u32)
+}
+
+/// ENOENT, or ESRCH when the process exits during the read.
+fn process_read_proves_exit(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

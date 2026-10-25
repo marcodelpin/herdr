@@ -241,7 +241,7 @@ pub fn pane_process_liveness(
     _pid: u32,
     _start_token: u64,
 ) -> super::PaneProcessLiveness {
-    super::PaneProcessLiveness::Gone
+    super::PaneProcessLiveness::Unknown
 }
 
 /// Unsupported platform stub.

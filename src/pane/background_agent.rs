@@ -70,9 +70,11 @@ impl AgentJobTracker {
                 AgentJobStatus::Background
             }
             PaneProcessLiveness::Alive(_) => AgentJobStatus::Unknown,
-            PaneProcessLiveness::Gone | PaneProcessLiveness::Unknown if self.in_background => {
-                AgentJobStatus::ExitedInBackground
-            }
+            PaneProcessLiveness::Gone if self.in_background => AgentJobStatus::ExitedInBackground,
+            // A failed read proves nothing, so it keeps what was known: a held
+            // agent stays held. `Unknown` would report its exit while the
+            // shell is in front.
+            PaneProcessLiveness::Unknown if self.in_background => AgentJobStatus::Background,
             PaneProcessLiveness::Gone | PaneProcessLiveness::Unknown => AgentJobStatus::Unknown,
         }
     }

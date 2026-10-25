@@ -665,8 +665,8 @@ mod tests {
         );
         assert_eq!(
             pane_process_liveness(gone_pid, detached.id(), token),
-            PaneProcessLiveness::Gone,
-            "a pane shell that is gone"
+            PaneProcessLiveness::Unknown,
+            "a pane shell that is gone proves nothing about the agent"
         );
         let _ = detached.kill();
         let _ = detached.wait();

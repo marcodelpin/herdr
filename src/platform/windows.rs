@@ -1804,33 +1804,46 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
     ProcessIdentity::open(pid)?.creation_time()
 }
 
-/// Returns `pid` while that same process, matched by its creation time, is
-/// still running for the pane shell `shell_pid`. Windows has no job control,
-/// so the process stands in for its own group.
+/// Liveness of `pid`, matched by its creation time, as a process running for
+/// the pane shell `shell_pid`. Windows has no job control, so the process
+/// stands in for its own group.
 pub fn pane_process_liveness(
     shell_pid: u32,
     pid: u32,
     start_token: u64,
 ) -> super::PaneProcessLiveness {
-    live_pane_process_group(shell_pid, pid, start_token).map_or(
-        super::PaneProcessLiveness::Gone,
-        super::PaneProcessLiveness::Alive,
-    )
-}
+    use super::PaneProcessLiveness;
 
-fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
-    let identity = ProcessIdentity::open(pid)?;
-    if !identity.running() || identity.creation_time() != Some(start_token) {
-        return None;
+    let Some(identity) = ProcessIdentity::open(pid) else {
+        // OpenProcess rejects a pid with no process as an invalid parameter;
+        // any other failure, such as access denied, proves nothing.
+        let no_such_process = std::io::Error::last_os_error().raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
+        return if no_such_process {
+            PaneProcessLiveness::Gone
+        } else {
+            PaneProcessLiveness::Unknown
+        };
+    };
+    if !identity.running() {
+        return PaneProcessLiveness::Gone;
     }
-    process_belongs_to_pane(
+    match identity.creation_time() {
+        Some(creation_time) if creation_time == start_token => {}
+        Some(_) => return PaneProcessLiveness::Gone,
+        None => return PaneProcessLiveness::Unknown,
+    }
+    if process_belongs_to_pane(
         shell_pid,
         pid,
         &cached_foreground_processes(),
         |shell| process_is_git_bash(shell.pid),
         |entry| process_runtime_marker(entry.pid),
-    )
-    .then_some(pid)
+    ) {
+        PaneProcessLiveness::Alive(pid)
+    } else {
+        PaneProcessLiveness::Gone
+    }
 }
 
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
