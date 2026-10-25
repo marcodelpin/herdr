@@ -5444,32 +5444,46 @@ mod tests {
         assert_ne!(terminal.state, AgentState::Blocked);
     }
 
-    // codex c1o5-r3 P2-3: a herdr:pi report witnessed at t0 is buffered, no pi
-    // being detected yet, and applied at t2; the detector saw pi working at
-    // t1, after the witness.
+    fn pi_session(id: &str) -> Option<crate::agent_resume::AgentSessionRef> {
+        crate::agent_resume::session_ref_from_report("herdr:pi", "pi", Some(id.into()), None)
+    }
+
+    fn assert_witnessed_authority(terminal: &TerminalState, witness: Instant) {
+        let authority = terminal.hook_authority.as_ref().expect("a hook authority");
+        assert!(authority.named_agent_witnessed, "{authority:?}");
+        assert_eq!(authority.reported_at, witness, "{authority:?}");
+    }
+
+    // codex c1o5-r3 P2-3 and c1o5-r4 P3: a herdr:pi report witnessed at t0 is
+    // buffered, no pi being detected yet, and applied at t2; S's startup report
+    // follows; the detector saw pi working at t1, after the witness. The
+    // release replays the buffered report with its witness.
     #[test]
     fn buffered_witnessed_report_is_released_by_a_detection_after_its_witness() {
         let mut terminal = test_terminal();
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_millis(5);
         let t2 = t0 + Duration::from_millis(10);
-        let session_ref = crate::agent_resume::session_ref_from_report(
-            "herdr:pi",
-            "pi",
-            Some("pi-session".into()),
-            None,
-        );
+        let session_ref = pi_session("pi-session");
         assert!(session_ref.is_some(), "the report carries a session");
         terminal.set_hook_authority_naming_agent_at(
             "herdr:pi".into(),
             "pi".into(),
-            AgentState::Working,
+            AgentState::Blocked,
             None,
-            session_ref,
-            Some(1),
+            session_ref.clone(),
+            Some(2),
             NamedAgentVerdict::Witnessed { observed_at: t0 },
             t2,
         );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "the report is buffered");
         terminal.set_detected_state_with_screen_signals_at(
             Some(Agent::Pi),
             AgentState::Working,
@@ -5481,7 +5495,224 @@ mod tests {
         );
 
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(
+            terminal.state,
+            AgentState::Blocked,
+            "the hook, not the detector"
+        );
+        assert_witnessed_authority(&terminal, t0);
+    }
+
+    // codex c1o5-r4 P2: herdr:pi session S, seq 2, Blocked, witnessed at t1,
+    // is buffered; S's startup report arrives at seq 1; a pi exit observed at
+    // t0 < t1 is consumed after them; the replacement pi is detected working
+    // at t3. Returns the witness.
+    fn buffered_report_then_older_exit(terminal: &mut TerminalState) -> Instant {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t1 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t0,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+        t1
+    }
+
+    #[test]
+    fn an_exit_older_than_a_buffered_witness_keeps_the_buffered_report() {
+        let mut terminal = test_terminal();
+        let witness = buffered_report_then_older_exit(&mut terminal);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, witness);
+    }
+
+    // ADR-0008 round 3, item 4: the same with a persisted herdr:pi session,
+    // whose process-exit suppression rewrites the source's entry.
+    #[test]
+    fn an_exit_older_than_a_buffered_witness_keeps_it_over_a_persisted_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("earlier-pi-session").expect("a pi session"),
+            cwd: None,
+        });
+        let witness = buffered_report_then_older_exit(&mut terminal);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, witness);
+    }
+
+    // ADR-0008 round 3, items 1, 2 and 7: a live herdr:pi authority witnessed
+    // at t2; a pi exit observed at t1 < t2 is consumed after it, then one
+    // observed at t3 > t2.
+    #[test]
+    fn an_exit_older_than_a_live_witness_keeps_the_official_authority() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref,
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "the report is applied");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, t2);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t3,
+        );
+        assert_eq!(
+            terminal.effective_agent_label(),
+            None,
+            "an exit after the witness"
+        );
+    }
+
+    // ADR-0008 round 3, item 5: a bridge claude witnessed at t2 holds the
+    // pane while a herdr:pi report is buffered; the detector saw pi at t1 < t2,
+    // then again at t3 > t2.
+    #[test]
+    fn a_detection_older_than_a_live_witness_releases_nothing() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Unnamed,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            t2,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
         assert_eq!(terminal.state, AgentState::Working);
+        assert_witnessed_authority(&terminal, t2);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+        assert_eq!(
+            terminal.effective_agent_label(),
+            Some("pi"),
+            "a detection after it"
+        );
+        assert_eq!(terminal.state, AgentState::Blocked);
     }
 
     #[test]

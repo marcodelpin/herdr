@@ -179,11 +179,13 @@ mod tests {
     }
 
     /// A process table read one stat line per pid. A pid in `readable_reads`
-    /// reads for that many reads and fails from then on.
+    /// reads for that many reads and fails from then on; a pid in `scripted`
+    /// reads its listed facts at its first reads, then its fixture facts.
     #[derive(Default)]
     struct FakeTable {
         processes: HashMap<u32, FakeProcess>,
         readable_reads: HashMap<u32, usize>,
+        scripted: HashMap<u32, Vec<FakeProcess>>,
         reads: RefCell<HashMap<u32, usize>>,
         first_read: Cell<Option<Instant>>,
     }
@@ -202,6 +204,13 @@ mod tests {
                 .is_some_and(|&readable| *count > readable)
             {
                 return None;
+            }
+            if let Some(scripted) = self
+                .scripted
+                .get(&pid)
+                .and_then(|reads| reads.get(*count - 1))
+            {
+                return Some(*scripted);
             }
             self.processes.get(&pid).copied()
         }
@@ -362,6 +371,43 @@ mod tests {
                 readable + 1
             );
         }
+    }
+
+    // codex c1o5-r4 P3: P's shell reads valid first and is readable again
+    // after the agent and carrier reads, but in front of another group, as
+    // another incarnation of its pid, or exited: rule 10's final comparison
+    // refutes each.
+    #[test]
+    fn a_pane_shell_that_changes_between_its_reads_is_refuted() {
+        let first = fixture().processes[&PANE];
+        let mut moved = first;
+        moved.foreground = Some(STRANGER_CLIENT);
+        let mut reused = first;
+        reused.start = 99;
+        let mut exited = first;
+        exited.zombie = true;
+        for (again, case) in [
+            (moved, "another foreground group"),
+            (reused, "another incarnation"),
+            (exited, "exited"),
+        ] {
+            let mut table = fixture();
+            table.scripted.insert(PANE, vec![first, again]);
+            let verdict = judge(&table, report(NAMED_CLAUDE, CARRIER));
+            assert_eq!(verdict, NamedAgentVerdict::Refuted, "{case}");
+            assert_eq!(
+                table.reads.borrow().get(&PANE),
+                Some(&2),
+                "{case}: two reads"
+            );
+        }
+        let mut table = fixture();
+        table.scripted.insert(PANE, vec![first, first]);
+        let verdict = judge(&table, report(NAMED_CLAUDE, CARRIER));
+        assert!(
+            verdict.witnessed_at().is_some(),
+            "unchanged shell: {verdict:?}"
+        );
     }
 
     #[test]
