@@ -6015,6 +6015,7 @@ mod tests {
             NamedAgentVerdict::Witnessed { observed_at: t2 },
             t2,
         );
+        assert!(terminal.record_reported_resume("herdr:pi", "pi", None, pi_resume_argv()));
         terminal.set_detected_state_with_screen_signals_at(
             Some(Agent::Pi),
             AgentState::Idle,
@@ -6204,53 +6205,322 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Working, "the detector's view");
     }
 
-    // ADR-0008 round 4, rule 14: the six parts of the pane state, compared as
-    // one value by the complete-state tests below.
-    type PendingPart = (u64, AgentState, Instant, bool);
+    // codex c1o5-r6 P2-1: S's seq 3 Working names no process; it replaces the
+    // witness-held authority of its source and session and keeps its witness.
+    #[test]
+    fn an_unnamed_successor_keeps_the_witness_it_replaces() {
+        let mut terminal = test_terminal();
+        let [_, t1, t2, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            pi_session("pi-session"),
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "seq 3 is applied");
+        assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&3));
+        let authority = terminal.hook_authority.as_ref().expect("a hook authority");
+        assert_eq!(authority.reported_at, t3, "its apply time");
+        assert!(authority.observed_before_witness(t1), "S's witness at t2");
+        assert!(
+            !authority.observed_before_witness(t2),
+            "not a witness at t3"
+        );
+    }
+
+    // codex c1o5-r6 P2-2: native pi detected; a custom:pi authority without a
+    // session witnessed at t2; the native exit at t1 consumed after it; a
+    // delayed herdr:pi SessionStart for the exited native session S.
+    #[test]
+    fn a_superseded_exit_grants_presence_to_its_own_source_only() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t0);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"), "custom:pi");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert_eq!(terminal.persisted_agent_session, None, "S stays buffered");
+        assert_eq!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .and_then(|entry| session_value(&entry.replacement_session_ref)),
+            Some("s-session".into())
+        );
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t3);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session"),
+            "a pi detection after the exit releases it"
+        );
+    }
+
+    // codex c1o5-r6 P2-3: custom:pi witnessed at t4; a Claude observation from
+    // t1 deferred; a pi SessionStart suppression at t5; the producer's newer pi
+    // observation from t2 dropped by it; then custom:pi cleared.
+    #[test]
+    fn a_dropped_newer_detection_supersedes_the_deferred_one() {
+        let mut terminal = test_terminal();
+        let base = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("a monotonic clock older than 200 ms");
+        let t1 = base + Duration::from_millis(5);
+        let t2 = base + Duration::from_millis(10);
+        let t4 = base + Duration::from_millis(20);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t4 },
+            t4,
+        );
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert!(terminal.deferred_detection.is_some(), "Claude is deferred");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .is_some_and(|entry| entry.observed_at > t4),
+            "a suppression at t5"
+        );
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t2);
+        assert_eq!(terminal.deferred_detection, None, "the newer observation");
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_ne!(terminal.effective_agent_label(), Some("claude"));
+        assert_ne!(terminal.detected_agent, Some(Agent::Claude));
+    }
+
+    // codex c1o5-r6 P2-4: S's seq 2 buffered with its seq 1 SessionStart; a
+    // witnessed custom:pi authority without a session; a pi detection after
+    // the entry and before the custom witness deferred; custom:pi cleared.
+    #[test]
+    fn a_replayed_detection_reports_the_session_it_installs() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(2),
+            NamedAgentVerdict::Unnamed,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "S's report is buffered");
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert!(
+            terminal.deferred_detection.is_some(),
+            "the detection is deferred"
+        );
+
+        let mutation = terminal
+            .clear_hook_authority_with_mutation(Some("custom:pi"), Some(2))
+            .expect("the clear is applied");
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report released");
+        assert!(mutation.session_ref_changed, "{mutation:?}");
+    }
+
+    // codex c1o5-r6 P2-5: witnessed custom:pi at t2; a native pi acquisition and
+    // Working observation from before t2 deferred; a name given; the custom
+    // source released while native pi runs.
+    #[test]
+    fn a_release_counts_the_deferred_detection_of_a_running_agent() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        terminal.set_agent_name("worker".into());
+
+        let mutation = terminal
+            .release_agent_with_mutation("custom:pi", "pi", Some(2))
+            .expect("the release is applied");
+        assert!(!mutation.agent_released, "{mutation:?}");
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    // ADR-0008 round 4, rule 14, and round 5: every part of the pane state,
+    // compared as one value by the complete-state tests below.
+    type AuthorityPart = (
+        String,
+        String,
+        AgentState,
+        Instant,
+        Option<Instant>,
+        Option<String>,
+    );
     type EntryPart = (
+        String,
         String,
         Option<String>,
         Instant,
         FullLifecycleHookSuppressionReason,
         Option<String>,
-        Option<PendingPart>,
+        Option<(u64, AuthorityPart)>,
     );
+    type ResumePart = (String, String, Vec<String>);
 
     #[derive(Debug, PartialEq)]
     struct PaneParts {
-        authority: Option<(String, AgentState, Instant, bool, Option<String>)>,
+        authority: Option<AuthorityPart>,
         exit: Option<(Agent, Instant)>,
         entries: Vec<EntryPart>,
         watermarks: Vec<(String, u64)>,
-        detector: (Option<Agent>, AgentState, Option<Instant>),
+        detector: (Option<Agent>, AgentState, bool, Option<Instant>),
         deferred: Option<DeferredDetection>,
         session: Option<(String, String)>,
+        resume: Option<ResumePart>,
+    }
+
+    fn session_value(session_ref: &Option<crate::agent_resume::AgentSessionRef>) -> Option<String> {
+        session_ref
+            .as_ref()
+            .map(|session_ref| session_ref.value.clone())
+    }
+
+    fn authority_part(authority: &HookAuthority) -> AuthorityPart {
+        (
+            authority.source.clone(),
+            authority.agent_label.clone(),
+            authority.state,
+            authority.reported_at,
+            authority
+                .named_agent_witnessed
+                .then_some(authority.reported_at),
+            session_value(&authority.session_ref),
+        )
+    }
+
+    fn authority_of(
+        source: &str,
+        agent_label: &str,
+        state: AgentState,
+        reported_at: Instant,
+        witness: Option<Instant>,
+        session: Option<&str>,
+    ) -> AuthorityPart {
+        (
+            source.into(),
+            agent_label.into(),
+            state,
+            reported_at,
+            witness,
+            session.map(str::to_string),
+        )
+    }
+
+    fn pi_resume_argv() -> Vec<String> {
+        vec!["pi".into(), "--session".into(), "pi-session".into()]
+    }
+
+    fn pi_resume() -> Option<ResumePart> {
+        Some(("herdr:pi".into(), "pi".into(), pi_resume_argv()))
     }
 
     fn pane_parts(terminal: &TerminalState) -> PaneParts {
-        let value = |session_ref: &Option<crate::agent_resume::AgentSessionRef>| {
-            session_ref
-                .as_ref()
-                .map(|session_ref| session_ref.value.clone())
-        };
         let mut entries: Vec<EntryPart> = terminal
             .suppressed_full_lifecycle_hook_reports
             .iter()
             .map(|(source, entry)| {
                 (
                     source.clone(),
-                    value(&entry.session_ref),
+                    entry.agent_label.clone(),
+                    session_value(&entry.session_ref),
                     entry.observed_at,
                     entry.reason,
-                    value(&entry.replacement_session_ref),
-                    entry.pending_replacement_report.as_ref().map(|pending| {
-                        (
-                            pending.seq,
-                            pending.authority.state,
-                            pending.authority.reported_at,
-                            pending.authority.named_agent_witnessed,
-                        )
-                    }),
+                    session_value(&entry.replacement_session_ref),
+                    entry
+                        .pending_replacement_report
+                        .as_ref()
+                        .map(|pending| (pending.seq, authority_part(&pending.authority))),
                 )
             })
             .collect();
@@ -6262,15 +6532,7 @@ mod tests {
             .collect();
         watermarks.sort();
         PaneParts {
-            authority: terminal.hook_authority.as_ref().map(|authority| {
-                (
-                    authority.source.clone(),
-                    authority.state,
-                    authority.reported_at,
-                    authority.named_agent_witnessed,
-                    value(&authority.session_ref),
-                )
-            }),
+            authority: terminal.hook_authority.as_ref().map(authority_part),
             exit: terminal
                 .recent_agent_process_exit
                 .map(|exit| (exit.agent, exit.observed_at)),
@@ -6279,6 +6541,7 @@ mod tests {
             detector: (
                 terminal.detected_agent,
                 terminal.fallback_state,
+                terminal.fallback_visible_blocker,
                 terminal.fallback_observed_at,
             ),
             deferred: terminal.deferred_detection,
@@ -6286,6 +6549,13 @@ mod tests {
                 .persisted_agent_session
                 .as_ref()
                 .map(|session| (session.source.clone(), session.session_ref.value.clone())),
+            resume: terminal.reported_resume.as_ref().map(|resume| {
+                (
+                    resume.source.clone(),
+                    resume.agent.clone(),
+                    resume.argv.clone(),
+                )
+            }),
         }
     }
 
@@ -6316,7 +6586,8 @@ mod tests {
         );
     }
 
-    // Consumer 1: an exit older than the live witness.
+    // Consumer 1: an exit older than the live witness, which keeps the
+    // authority's reported resume.
     #[test]
     fn complete_state_consumer_1_exit_older_than_the_live_witness() {
         let mut terminal = test_terminal();
@@ -6324,19 +6595,21 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some((
-                    "herdr:pi".into(),
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
                     AgentState::Blocked,
                     t2,
-                    true,
-                    Some("pi-session".into())
+                    Some(t2),
+                    Some("pi-session")
                 )),
                 exit: Some((Agent::Pi, t1)),
                 entries: vec![],
                 watermarks: vec![("herdr:pi".into(), 2)],
-                detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+                detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
                 deferred: None,
                 session: None,
+                resume: pi_resume(),
             }
         );
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
@@ -6352,19 +6625,21 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some((
-                    "herdr:pi".into(),
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
                     AgentState::Working,
                     t3,
-                    true,
-                    Some("pi-session".into())
+                    Some(t3),
+                    Some("pi-session")
                 )),
                 exit: Some((Agent::Pi, t1)),
                 entries: vec![],
                 watermarks: vec![("herdr:pi".into(), 3)],
-                detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+                detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
                 deferred: None,
                 session: None,
+                resume: pi_resume(),
             }
         );
     }
@@ -6379,19 +6654,21 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some((
-                    "herdr:pi".into(),
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
                     AgentState::Working,
                     t3,
-                    true,
-                    Some("pi-session".into())
+                    Some(t3),
+                    Some("pi-session")
                 )),
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("herdr:pi".into(), 3)],
-                detector: (Some(Agent::Pi), AgentState::Working, Some(t4)),
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t4)),
                 deferred: None,
                 session: None,
+                resume: pi_resume(),
             }
         );
         assert!(
@@ -6423,6 +6700,7 @@ mod tests {
                 exit: Some((Agent::Pi, t3)),
                 entries: vec![(
                     "herdr:pi".into(),
+                    "pi".into(),
                     Some("pi-session".into()),
                     t3,
                     FullLifecycleHookSuppressionReason::ProcessExit,
@@ -6430,9 +6708,10 @@ mod tests {
                     None
                 )],
                 watermarks: vec![],
-                detector: (None, AgentState::Unknown, Some(t3)),
+                detector: (None, AgentState::Unknown, false, Some(t3)),
                 deferred: None,
                 session: None,
+                resume: None,
             }
         );
     }
@@ -6484,16 +6763,28 @@ mod tests {
             exit: Some((Agent::Pi, t1)),
             entries: vec![(
                 "herdr:pi".into(),
+                "pi".into(),
                 Some("old-session".into()),
                 t1,
                 FullLifecycleHookSuppressionReason::ProcessExit,
                 Some("s-session".into()),
-                Some((20, AgentState::Blocked, t2, true)),
+                Some((
+                    20,
+                    authority_of(
+                        "herdr:pi",
+                        "pi",
+                        AgentState::Blocked,
+                        t2,
+                        Some(t2),
+                        Some("s-session"),
+                    ),
+                )),
             )],
             watermarks: vec![("herdr:pi".into(), 10)],
-            detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+            detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
             deferred: None,
             session: None,
+            resume: None,
         };
         assert_eq!(pane_parts(&terminal), after_exit);
 
@@ -6510,19 +6801,21 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some((
-                    "herdr:pi".into(),
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
                     AgentState::Blocked,
                     t2,
-                    true,
-                    Some("s-session".into())
+                    Some(t2),
+                    Some("s-session")
                 )),
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("herdr:pi".into(), 20)],
-                detector: (Some(Agent::Pi), AgentState::Working, Some(t3)),
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t3)),
                 deferred: None,
                 session: Some(("herdr:pi".into(), "s-session".into())),
+                resume: None,
             }
         );
     }
@@ -6550,11 +6843,18 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some(("custom:pi".into(), AgentState::Blocked, t2, true, None)),
+                authority: Some(authority_of(
+                    "custom:pi",
+                    "pi",
+                    AgentState::Blocked,
+                    t2,
+                    Some(t2),
+                    None
+                )),
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("custom:pi".into(), 1)],
-                detector: (None, AgentState::Unknown, None),
+                detector: (None, AgentState::Unknown, false, None),
                 deferred: Some(DeferredDetection {
                     agent: Some(Agent::Pi),
                     fallback_state: AgentState::Working,
@@ -6563,6 +6863,7 @@ mod tests {
                     acquisition: true,
                 }),
                 session: None,
+                resume: None,
             }
         );
 
@@ -6574,9 +6875,10 @@ mod tests {
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("custom:pi".into(), 2)],
-                detector: (Some(Agent::Pi), AgentState::Working, Some(t1)),
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t1)),
                 deferred: None,
                 session: None,
+                resume: None,
             }
         );
         assert!(!terminal.agent_process_acquisition_pending, "Working");
@@ -6609,17 +6911,18 @@ mod tests {
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
-                authority: Some((
-                    "custom:pi".into(),
+                authority: Some(authority_of(
+                    "custom:pi",
+                    "pi",
                     AgentState::Blocked,
                     t2,
-                    true,
-                    Some("custom-session".into())
+                    Some(t2),
+                    Some("custom-session")
                 )),
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("custom:pi".into(), 1)],
-                detector: (None, AgentState::Unknown, None),
+                detector: (None, AgentState::Unknown, false, None),
                 deferred: Some(DeferredDetection {
                     agent: Some(Agent::Claude),
                     fallback_state: AgentState::Working,
@@ -6628,6 +6931,7 @@ mod tests {
                     acquisition: false,
                 }),
                 session: None,
+                resume: None,
             }
         );
 
@@ -6639,9 +6943,10 @@ mod tests {
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("custom:pi".into(), 1)],
-                detector: (Some(Agent::Claude), AgentState::Working, Some(t3)),
+                detector: (Some(Agent::Claude), AgentState::Working, false, Some(t3)),
                 deferred: None,
                 session: Some(("custom:pi".into(), "custom-session".into())),
+                resume: None,
             }
         );
     }
@@ -6666,13 +6971,21 @@ mod tests {
             t2,
         );
         let held = PaneParts {
-            authority: Some(("custom:foo".into(), AgentState::Working, t2, true, None)),
+            authority: Some(authority_of(
+                "custom:foo",
+                "foo",
+                AgentState::Working,
+                t2,
+                Some(t2),
+                None,
+            )),
             exit: None,
             entries: vec![],
             watermarks: vec![("custom:foo".into(), 1)],
-            detector: (None, AgentState::Unknown, None),
+            detector: (None, AgentState::Unknown, false, None),
             deferred: None,
             session: None,
+            resume: None,
         };
         assert_eq!(pane_parts(&terminal), held);
         assert!(terminal.clear_self_reported_agent(t1).is_none());
@@ -6686,9 +6999,10 @@ mod tests {
                 exit: None,
                 entries: vec![],
                 watermarks: vec![("custom:foo".into(), 1)],
-                detector: (None, AgentState::Unknown, None),
+                detector: (None, AgentState::Unknown, false, None),
                 deferred: None,
                 session: None,
+                resume: None,
             }
         );
     }
