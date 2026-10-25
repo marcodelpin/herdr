@@ -23,11 +23,13 @@ pub struct HookAuthority {
     #[serde(skip, default = "Instant::now")]
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
-    /// herdr-c1o5: the report named its agent process and the API layer
-    /// witnessed it (ADR-0008 amendment 2026-10-25, round-cap exit a]). Never
-    /// serialized: a restored or handed-off authority names no live process.
+    /// herdr-c1o5: when the API layer witnessed the agent process the report
+    /// named (ADR-0008 amendment 2026-10-25, round-cap exit a]). An unnamed
+    /// successor of the same source and session keeps it (round 5, rule 15),
+    /// so it can be older than `reported_at`. Never serialized: a restored or
+    /// handed-off authority names no live process.
     #[serde(skip)]
-    pub named_agent_witnessed: bool,
+    pub witnessed_at: Option<Instant>,
 }
 
 /// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): the API
@@ -55,10 +57,7 @@ impl HookAuthority {
     /// `observed_at` predates this authority's witness, so it never removes,
     /// replaces, clears or hides this authority.
     fn observed_before_witness(&self, observed_at: Instant) -> bool {
-        observed_before(
-            observed_at,
-            self.named_agent_witnessed.then_some(self.reported_at),
-        )
+        observed_before(observed_at, self.witnessed_at)
     }
 }
 
@@ -560,9 +559,17 @@ impl TerminalState {
         if !process_exited && self.detection_predates_current_state(agent, now) {
             // ADR-0008 round 4, consumer 3: a detection older than the live
             // witness is deferred, not dropped; one older than a release
-            // suppression is dropped (upstream).
+            // suppression is dropped (upstream). Round 5, rule 16: either way
+            // it takes the deferred one.
+            let previous_deferred = self.deferred_detection.take();
             if !self.detected_state_observed_before_release_suppression(agent, now) {
-                self.defer_detection(agent, fallback_state, visible_blocker, now);
+                self.defer_detection(
+                    previous_deferred,
+                    agent,
+                    fallback_state,
+                    visible_blocker,
+                    now,
+                );
             }
             return TerminalStateMutation {
                 effective_state_change: self.recompute_effective_state(
@@ -924,7 +931,7 @@ impl TerminalState {
             &session_ref,
             seq,
             named_agent.witnessed_at().unwrap_or(now),
-            named_agent.witnessed_at().is_some(),
+            named_agent.witnessed_at(),
         ) {
             FullLifecycleHookReportRoute::Accept { reanchor_sequence } => reanchor_sequence,
             FullLifecycleHookReportRoute::Ignore => return None,
@@ -996,6 +1003,20 @@ impl TerminalState {
                 }
             }
         }
+        // ADR-0008 round 5, rule 15: a report of the same source and session
+        // naming no process keeps the witness of the authority it replaces.
+        let witnessed_at = named_agent.witnessed_at().or_else(|| {
+            self.hook_authority
+                .as_ref()
+                .filter(|previous| {
+                    previous.source == source
+                        && previous.agent_label == agent_label
+                        && session_ref.as_ref().is_none_or(|session_ref| {
+                            previous.session_ref.as_ref() == Some(session_ref)
+                        })
+                })
+                .and_then(|previous| previous.witnessed_at)
+        });
         self.persisted_agent_session = None;
         self.hook_authority = Some(HookAuthority {
             source,
@@ -1004,9 +1025,8 @@ impl TerminalState {
             message,
             reported_at: named_agent.witnessed_at().unwrap_or(now),
             session_ref,
-            named_agent_witnessed: named_agent.witnessed_at().is_some(),
+            witnessed_at,
         });
-        let current_session = self.current_session_identity_for_persistence();
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
@@ -1017,6 +1037,8 @@ impl TerminalState {
         if state == AgentState::Working && self.state == AgentState::Working {
             self.agent_process_acquisition_pending = false;
         }
+        // ADR-0008 round 5, rule 17: measured after the replay.
+        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change,
             session_ref_changed: previous_session != current_session,
@@ -1096,11 +1118,17 @@ impl TerminalState {
     }
 
     /// ADR-0008 round 4, consumer 5: the detector saw `agent` and no exit
-    /// stands against it; an exit superseded by the live witness does not.
-    fn agent_process_present(&self, agent: Option<Agent>) -> bool {
+    /// stands against it; an exit superseded by the live witness does not, for
+    /// the live authority's source only (round 5, rule 15).
+    fn agent_process_present(&self, source: &str, agent: Option<Agent>) -> bool {
         agent.is_some()
             && self.detected_agent == agent
-            && (self.recent_agent_process_exit.is_none() || self.recorded_exit_superseded())
+            && (self.recent_agent_process_exit.is_none()
+                || (self.recorded_exit_superseded()
+                    && self
+                        .hook_authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.source == source)))
     }
 
     /// ADR-0008 round 4: a full-lifecycle authority held by its witness alone,
@@ -1130,14 +1158,14 @@ impl TerminalState {
 
     fn defer_detection(
         &mut self,
+        previous: Option<DeferredDetection>,
         agent: Option<Agent>,
         fallback_state: AgentState,
         visible_blocker: bool,
         observed_at: Instant,
     ) {
-        let acquisition = self
-            .deferred_detection
-            .is_some_and(|deferred| deferred.acquisition && deferred.agent == agent);
+        let acquisition =
+            previous.is_some_and(|deferred| deferred.acquisition && deferred.agent == agent);
         self.deferred_detection = Some(DeferredDetection {
             agent,
             fallback_state,
@@ -1248,27 +1276,6 @@ impl TerminalState {
         }
     }
 
-    fn suppress_full_lifecycle_hook_report(
-        &mut self,
-        source: &str,
-        agent_label: &str,
-        reason: FullLifecycleHookSuppressionReason,
-    ) {
-        if crate::detect::full_lifecycle_hook_authority(source, agent_label) {
-            let session_ref = self
-                .hook_authority
-                .as_ref()
-                .and_then(|authority| authority.session_ref.clone());
-            self.suppress_full_lifecycle_hook_report_with_session_ref(
-                source.to_string(),
-                agent_label.to_string(),
-                session_ref,
-                reason,
-                Instant::now(),
-            );
-        }
-    }
-
     fn suppress_full_lifecycle_hook_report_with_session_ref(
         &mut self,
         source: String,
@@ -1317,7 +1324,7 @@ impl TerminalState {
         session_ref: &Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         reported_at: Instant,
-        named_agent_witnessed: bool,
+        witnessed_at: Option<Instant>,
     ) -> FullLifecycleHookReportRoute {
         if !crate::detect::full_lifecycle_hook_authority(source, agent_label) {
             return FullLifecycleHookReportRoute::Accept {
@@ -1329,7 +1336,7 @@ impl TerminalState {
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
-        let process_present = self.agent_process_present(known_agent);
+        let process_present = self.agent_process_present(source, known_agent);
         let anchored_session_ref = self
             .hook_authority
             .as_ref()
@@ -1426,7 +1433,7 @@ impl TerminalState {
         if replace_pending {
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
-                    named_agent_witnessed,
+                    witnessed_at,
                     source: source.to_string(),
                     agent_label: agent_label.to_string(),
                     state,
@@ -1958,7 +1965,7 @@ impl TerminalState {
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
-        let process_present = self.agent_process_present(known_agent);
+        let process_present = self.agent_process_present(&source, known_agent);
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
         let generation_gated = self
@@ -2061,7 +2068,7 @@ impl TerminalState {
 
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
-                let current_session = self.current_session_identity_for_persistence();
+                // ADR-0008 round 5, rule 17: measured after the replay.
                 return Some(TerminalStateMutation {
                     effective_state_change: self.recompute_effective_state(
                         previous_agent_label,
@@ -2070,7 +2077,8 @@ impl TerminalState {
                         previous_presentation,
                         now,
                     ),
-                    session_ref_changed: previous_session != current_session,
+                    session_ref_changed: previous_session
+                        != self.current_session_identity_for_persistence(),
                     persisted_agent_session_cwd_changed: false,
                     agent_released: false,
                 });
@@ -2242,7 +2250,9 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed,
             agent_released: false,
         })
@@ -2356,7 +2366,9 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session.is_some(),
+            // ADR-0008 round 5, rule 17: and what the replay installed.
+            session_ref_changed: previous_session.is_some()
+                || previous_session != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
             agent_released: false,
         })
@@ -2382,24 +2394,43 @@ impl TerminalState {
         if !self.accept_hook_report(source, seq) {
             return None;
         }
-        let preserve_foreign_persisted_session = self
-            .persisted_agent_session
-            .as_ref()
-            .is_some_and(|session| session.source != source || session.agent != agent_label);
-        let process_owns_agent = crate::detect::parse_agent_label(agent_label)
-            .is_some_and(|agent| self.agent_process_present(Some(agent)));
-
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        self.suppress_full_lifecycle_hook_report(
-            source,
-            agent_label,
-            FullLifecycleHookSuppressionReason::HookClear,
-        );
+        // ADR-0008 round 5, rule 17: the detection the released authority's
+        // witness held back is applied first, and an authority of the released
+        // source it installs is released too; ownership is then decided from
+        // the detector view, as upstream.
+        let released_session_ref = self
+            .hook_authority
+            .take()
+            .and_then(|authority| authority.session_ref);
+        self.replay_deferred_detection();
+        if self
+            .hook_authority
+            .as_ref()
+            .is_some_and(|authority| authority.source == source)
+        {
+            self.hook_authority = None;
+        }
+        let preserve_foreign_persisted_session = self
+            .persisted_agent_session
+            .as_ref()
+            .is_some_and(|session| session.source != source || session.agent != agent_label);
+        let process_owns_agent = crate::detect::parse_agent_label(agent_label)
+            .is_some_and(|agent| self.agent_process_present(source, Some(agent)));
+        if crate::detect::full_lifecycle_hook_authority(source, agent_label) {
+            self.suppress_full_lifecycle_hook_report_with_session_ref(
+                source.to_string(),
+                agent_label.to_string(),
+                released_session_ref,
+                FullLifecycleHookSuppressionReason::HookClear,
+                Instant::now(),
+            );
+        }
         if !process_owns_agent {
             self.detected_agent = None;
             self.fallback_state = AgentState::Unknown;
@@ -2407,12 +2438,10 @@ impl TerminalState {
             self.fallback_observed_at = None;
             self.clear_agent_name();
         }
-        self.hook_authority = None;
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
         }
-        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -2421,7 +2450,9 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
             agent_released: !process_owns_agent,
         })
@@ -2457,7 +2488,6 @@ impl TerminalState {
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
         self.clear_agent_name();
-        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -2466,7 +2496,9 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
             agent_released: true,
         })
@@ -5714,7 +5746,7 @@ mod tests {
 
     fn assert_witnessed_authority(terminal: &TerminalState, witness: Instant) {
         let authority = terminal.hook_authority.as_ref().expect("a hook authority");
-        assert!(authority.named_agent_witnessed, "{authority:?}");
+        assert_eq!(authority.witnessed_at, Some(witness), "{authority:?}");
         assert_eq!(authority.reported_at, witness, "{authority:?}");
     }
 
@@ -6472,9 +6504,7 @@ mod tests {
             authority.agent_label.clone(),
             authority.state,
             authority.reported_at,
-            authority
-                .named_agent_witnessed
-                .then_some(authority.reported_at),
+            authority.witnessed_at,
             session_value(&authority.session_ref),
         )
     }
