@@ -742,11 +742,25 @@ pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Op
         .then_some(stat.pgrp as u32)
 }
 
+/// One read of `/proc/<pid>/stat`: the fields come from the same read, so
+/// they describe one incarnation of `pid` (ADR-0008 round 2, rule 8).
+pub fn process_job_read(pid: u32) -> Option<super::ProcessJobRead> {
+    let stat = process_job_stat(pid)?;
+    (stat.pgrp > 0 && stat.session > 0).then_some(super::ProcessJobRead {
+        start_token: stat.start_time,
+        exited: matches!(stat.state, 'Z' | 'X'),
+        process_group: stat.pgrp as u32,
+        session: stat.session as u32,
+        foreground_group: (stat.tpgid > 0).then_some(stat.tpgid as u32),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcessJobStat {
     state: char,
     pgrp: i32,
     session: i32,
+    tpgid: i32,
     start_time: u64,
 }
 
@@ -758,11 +772,12 @@ fn process_job_stat(pid: u32) -> Option<ProcessJobStat> {
 fn process_job_stat_from_stat(stat: &str) -> Option<ProcessJobStat> {
     let rest = stat.get(stat.rfind(')')? + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // After (comm): state(0) ppid(1) pgrp(2) session(3) ... starttime(19)
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5) ... starttime(19)
     Some(ProcessJobStat {
         state: fields.first()?.chars().next()?,
         pgrp: fields.get(2)?.parse().ok()?,
         session: fields.get(3)?.parse().ok()?,
+        tpgid: fields.get(5)?.parse().ok()?,
         start_time: fields.get(19)?.parse().ok()?,
     })
 }
@@ -1821,6 +1836,7 @@ mod tests {
                 state: 'T',
                 pgrp: 456,
                 session: 789,
+                tpgid: 456,
                 start_time: 987654,
             })
         );

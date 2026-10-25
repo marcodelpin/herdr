@@ -1503,6 +1503,9 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    /// herdr-c1o5 (ADR-0008 round 2, rule 10): the shell's start token,
+    /// read before anything can reap it.
+    child_start_token: Option<u64>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     persistence_cwd: Mutex<Option<std::path::PathBuf>>,
     cwd_process_exited: Arc<AtomicBool>,
@@ -2556,6 +2559,8 @@ impl PaneRuntime {
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
+        let child_start_token =
+            (child_pid > 0).then(|| crate::platform::process_start_token(child_pid)).flatten();
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
         let cwd_process_exited = Arc::new(AtomicBool::new(false));
@@ -2664,6 +2669,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            child_start_token,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited,
@@ -2728,6 +2734,7 @@ impl PaneRuntime {
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
+        let mut child_start_token = None;
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
@@ -2742,6 +2749,8 @@ impl PaneRuntime {
             let mut child = spawned.child;
             if let Some(pid) = child.process_id() {
                 child_pid.store(pid, Ordering::Release);
+                // The wait task below has not started: the child is not reaped.
+                child_start_token = crate::platform::process_start_token(pid);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
@@ -3277,6 +3286,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_start_token,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited: child_wait_completed.clone(),
@@ -3844,6 +3854,12 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    /// herdr-c1o5 (ADR-0008 round 2, rule 10): the shell's pid with the
+    /// start token recorded when herdr spawned or adopted it.
+    pub fn child_incarnation(&self) -> Option<(u32, u64)> {
+        Some((self.child_pid()?, self.child_start_token?))
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -4070,6 +4086,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_start_token: None,
                 reported_cwd: Arc::new(Mutex::new(None)),
                 persistence_cwd: Mutex::new(None),
                 cwd_process_exited: Arc::new(AtomicBool::new(false)),
@@ -5425,6 +5442,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_start_token: None,
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -5465,6 +5483,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_start_token: None,
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),

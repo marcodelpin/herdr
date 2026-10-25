@@ -1635,7 +1635,13 @@ impl App {
             .cloned();
         let pane = self
             .lookup_runtime(ws_idx, pane_id)
-            .and_then(|(runtime, _)| runtime.child_pid());
+            .and_then(|(runtime, _)| runtime.child_incarnation())
+            .map(
+                |(pid, start_token)| crate::app::named_agent::ShellIncarnation {
+                    pid,
+                    start_token,
+                },
+            );
         let others: Vec<u32> = self
             .terminal_runtimes
             .iter()

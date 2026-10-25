@@ -690,6 +690,20 @@ fn child_exit_classification_only_checkpoints_interruptions() {
     assert!(!ChildExitReason::WaitFailed.requires_session_checkpoint());
 }
 
+/// herdr-c1o5 (ADR-0008 round 2, rule 8): one read of a process's job
+/// facts. Every field comes from the same read, so they describe one
+/// incarnation of the pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessJobRead {
+    pub start_token: u64,
+    /// The process exited and is not yet reaped.
+    pub exited: bool,
+    pub process_group: u32,
+    pub session: u32,
+    /// The foreground process group of its controlling terminal.
+    pub foreground_group: Option<u32>,
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -786,6 +800,72 @@ mod tests {
         );
         agent.wait().expect("reap agent");
         assert_eq!(live_pane_process_group(shell_pid, agent_pid, token), None);
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_job_read_reads_one_incarnation() {
+        use std::os::unix::process::CommandExt;
+
+        let mut detached = std::process::Command::new("sleep");
+        detached.arg("30");
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            detached.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut detached = detached.spawn().expect("spawn detached");
+        let read = process_job_read(detached.id()).expect("a live process reads");
+        assert_eq!(Some(read.start_token), process_start_token(detached.id()));
+        assert_eq!(read.session, detached.id(), "a session leader names its session");
+        assert_eq!(read.process_group, detached.id());
+        assert!(!read.exited);
+        let runner = process_job_read(std::process::id()).expect("the runner reads");
+        assert_ne!(runner.session, read.session, "another terminal session");
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let gone_pid = gone.id();
+        gone.wait().expect("reap");
+        assert_eq!(process_job_read(gone_pid), None, "a reaped process");
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_job_read_follows_the_process_not_its_job() {
+        use std::os::unix::process::CommandExt;
+
+        let mut wrapper = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+        let job = wrapper.id();
+        let mut agent = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(job as i32)
+            .spawn()
+            .expect("spawn agent");
+        let agent_pid = agent.id();
+        let group = |pid| process_job_read(pid).map(|read| (read.process_group, read.exited));
+        assert_eq!(group(agent_pid), Some((job, false)));
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGSTOP);
+        }
+        assert_eq!(group(agent_pid), Some((job, false)), "a stopped job counts");
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while group(agent_pid) == Some((job, false)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(group(agent_pid), Some((job, true)), "killed, not yet reaped");
+        let _ = agent.wait();
         let _ = wrapper.kill();
         let _ = wrapper.wait();
     }

@@ -5422,6 +5422,46 @@ mod tests {
         assert_ne!(terminal.state, AgentState::Blocked);
     }
 
+    // codex c1o5-r3 P2-3: a herdr:pi report witnessed at t0 is buffered, no pi
+    // being detected yet, and applied at t2; the detector saw pi working at
+    // t1, after the witness.
+    #[test]
+    fn buffered_witnessed_report_is_released_by_a_detection_after_its_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let session_ref = crate::agent_resume::session_ref_from_report(
+            "herdr:pi",
+            "pi",
+            Some("pi-session".into()),
+            None,
+        );
+        assert!(session_ref.is_some(), "the report carries a session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            session_ref,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
     #[test]
     fn process_exit_clears_matching_hook_authority_before_reporting_idle() {
         let mut terminal = test_terminal();

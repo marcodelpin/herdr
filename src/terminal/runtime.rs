@@ -594,6 +594,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_incarnation(&self) -> Option<(u32, u64)> {
+        self.0.child_incarnation()
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }

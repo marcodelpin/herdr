@@ -255,6 +255,12 @@ pub fn live_pane_process_group(_shell_pid: u32, _pid: u32, _start_token: u64) ->
     None
 }
 
+/// herdr-c1o5: no job-control read here, so a named report is refuted
+/// (ADR-0008 round 2, residuals).
+pub fn process_job_read(_pid: u32) -> Option<super::ProcessJobRead> {
+    None
+}
+
 /// Unsupported platform stub.
 pub fn process_exists(_pid: u32) -> bool {
     false

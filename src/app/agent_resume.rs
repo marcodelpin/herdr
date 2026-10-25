@@ -1394,6 +1394,25 @@ mod tests {
             }
         }
 
+        fn detect_claude(&mut self) {
+            self.app
+                .handle_internal_event(crate::events::AppEvent::StateChanged {
+                    pane_id: self.pane_id,
+                    agent: Some(crate::detect::Agent::Claude),
+                    state: crate::detect::AgentState::Idle,
+                    visible_blocker: false,
+                    visible_working: false,
+                    process_exited: false,
+                    observed_at: std::time::Instant::now(),
+                });
+        }
+
+        fn resume_argv(&self) -> Option<Vec<String>> {
+            self.terminal()
+                .reported_resume()
+                .map(|resume| resume.argv.clone())
+        }
+
         fn detector_clear(&mut self) {
             self.app
                 .handle_internal_event(crate::events::AppEvent::StateChanged {
@@ -1414,6 +1433,18 @@ mod tests {
             carrier: Option<(u32, u64)>,
             resume_session: Option<&str>,
         ) {
+            self.report_as("custom:a", None, seq, agent, carrier, resume_session);
+        }
+
+        fn report_as(
+            &mut self,
+            source: &str,
+            session: Option<&str>,
+            seq: u64,
+            agent: Option<(u32, u64)>,
+            carrier: Option<(u32, u64)>,
+            resume_session: Option<&str>,
+        ) {
             for child in &mut self.children {
                 assert!(
                     child.try_wait().unwrap().is_none(),
@@ -1426,12 +1457,12 @@ mod tests {
                 method: crate::api::schema::Method::PaneReportAgent(
                     crate::api::schema::PaneReportAgentParams {
                         pane_id: self.public_pane_id.clone(),
-                        source: "custom:a".into(),
+                        source: source.into(),
                         agent: "claude".into(),
                         state: crate::api::schema::PaneAgentState::Blocked,
                         message: None,
                         seq: Some(seq),
-                        agent_session_id: None,
+                        agent_session_id: session.map(str::to_string),
                         agent_session_path: None,
                         resume_argv: resume_session.map(|session| {
                             vec!["claude".into(), "--resume".into(), session.into()]
@@ -1499,6 +1530,57 @@ mod tests {
             pane.terminal()
                 .reported_resume()
                 .map(|resume| resume.argv.clone()),
+            Some(vec![
+                "claude".to_string(),
+                "--resume".to_string(),
+                "live-session".to_string()
+            ]),
+            "the corrected report at seq 11 is applied"
+        );
+    }
+
+    // codex c1o5-r3 P2-2: a reserved source goes through the same gate. P has
+    // a detected claude and session S at seq 10; seq 11 names the claude with
+    // a wrong agent_start and a stale resume command; seq 11 then comes
+    // corrected.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn report_agent_refuted_reserved_source_keeps_resume_and_sequence() {
+        let mut pane = C1o5Pane::new("r3-p2-2-reserved");
+        let claude = pane.spawn("claude");
+        pane.detect_claude();
+        let session = Some("session-s");
+        pane.report_as("herdr:claude", session, 10, None, None, None);
+        let before = pane.resume_argv();
+        let wrong_start = Some((claude.0, claude.1.wrapping_add(1)));
+        pane.report_as(
+            "herdr:claude",
+            session,
+            11,
+            wrong_start,
+            None,
+            Some("stale-session"),
+        );
+        assert_eq!(
+            pane.resume_argv(),
+            before,
+            "a refuted report must not record its resume_argv"
+        );
+        assert!(
+            pane.terminal().hook_report_is_newer("herdr:claude", Some(11)),
+            "a refuted report must not advance the sequence watermark"
+        );
+
+        pane.report_as(
+            "herdr:claude",
+            session,
+            11,
+            None,
+            None,
+            Some("live-session"),
+        );
+        assert_eq!(
+            pane.resume_argv(),
             Some(vec![
                 "claude".to_string(),
                 "--resume".to_string(),

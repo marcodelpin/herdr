@@ -1854,6 +1854,12 @@ pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Op
     .then_some(pid)
 }
 
+/// herdr-c1o5: no job-control read here, so a named report is refuted
+/// (ADR-0008 round 2, residuals).
+pub fn process_job_read(_pid: u32) -> Option<super::ProcessJobRead> {
+    None
+}
+
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
     crate::detect::identify_agent(&entry.name).is_some()
         || crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some()
