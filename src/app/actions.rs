@@ -178,9 +178,38 @@ pub struct PaneStateUpdate {
     pub seen: bool,
     pub presentation: crate::terminal::EffectivePresentation,
     pub agent_name_changed: bool,
-    pub agent_released: bool,
-    pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the release this update
+    /// publishes, as the state machine named it; `agent_label` and
+    /// `known_agent` stay the effective agent's.
+    pub release: Option<PaneAgentRelease>,
     pub suppress_completion: bool,
+}
+
+/// herdr-c1o5 (ADR-0008 round 7, rule 19): a published release - the released
+/// agent and the status it leaves with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneAgentRelease {
+    pub agent_label: Option<String>,
+    pub known_agent: Option<Agent>,
+    pub status: crate::api::schema::AgentStatus,
+}
+
+impl PaneStateUpdate {
+    pub fn agent_released(&self) -> bool {
+        self.release.is_some()
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19 c): the agent whose state this
+    /// update publishes - the effective agent; a release that leaves none
+    /// leaves the released agent's final state in the pane.
+    pub fn status_agent(&self) -> (Option<&str>, Option<Agent>) {
+        match &self.release {
+            Some(release) if self.agent_label.is_none() => {
+                (release.agent_label.as_deref(), release.known_agent)
+            }
+            _ => (self.agent_label.as_deref(), self.known_agent),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,8 +350,7 @@ impl AppState {
                     seen,
                     presentation: change.presentation.clone(),
                     agent_name_changed: false,
-                    agent_released: false,
-                    agent_release_status: None,
+                    release: None,
                     suppress_completion: false,
                 };
                 Some(update)
@@ -1743,7 +1771,7 @@ impl AppState {
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
-            let unchanged_change = (mutation.agent_released
+            let unchanged_change = (mutation.agent_released()
                 || agent_name_changed
                 || (completion_reset && had_completion))
                 .then(|| terminal.unchanged_effective_state_change_at(now));
@@ -1771,7 +1799,7 @@ impl AppState {
         {
             self.mark_session_dirty();
         }
-        let agent_released = mutation.agent_released;
+        let release = mutation.release;
         let change = mutation.effective_state_change.or(unchanged_change)?;
         let suppress_completion = force_suppress_completion
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
@@ -1793,22 +1821,17 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
-            agent_label: if agent_released {
-                change.previous_agent_label.clone()
-            } else {
-                change.agent_label.clone()
-            },
-            known_agent: if agent_released {
-                change.previous_known_agent
-            } else {
-                change.known_agent
-            },
+            agent_label: change.agent_label.clone(),
+            known_agent: change.known_agent,
             state: change.state,
             seen,
             presentation: change.presentation.clone(),
             agent_name_changed,
-            agent_released,
-            agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            release: release.map(|release| PaneAgentRelease {
+                agent_label: release.agent_label,
+                known_agent: release.known_agent,
+                status: pane_agent_status(release.final_state, seen),
+            }),
             suppress_completion,
         };
         Some(update)
@@ -1846,7 +1869,7 @@ impl AppState {
                 ))
             },
         )?;
-        update.agent_released.then_some(update)
+        update.agent_released().then_some(update)
     }
 
     fn apply_pane_state_change(
@@ -4656,12 +4679,22 @@ mod tests {
         assert!(!state.pane_is_in_active_tab(update.ws_idx, pane_id));
         assert_eq!(update.previous_state, AgentState::Working);
         assert_eq!(update.state, AgentState::Idle);
-        assert_eq!(update.agent_label.as_deref(), Some("pi"));
-        assert_eq!(update.known_agent, Some(Agent::Pi));
-        assert!(update.agent_released);
+        // ADR-0008 round 7, rule 19: the exit leaves no effective agent; the
+        // update publishes pi's final state under the released pi.
+        assert_eq!(update.agent_label, None);
+        assert_eq!(update.status_agent(), (Some("pi"), Some(Agent::Pi)));
+        assert!(update.agent_released());
         assert_eq!(
-            update.agent_release_status,
-            Some(crate::api::schema::AgentStatus::Done)
+            update.release.as_ref().map(|release| (
+                release.agent_label.as_deref(),
+                release.known_agent,
+                release.status
+            )),
+            Some((
+                Some("pi"),
+                Some(Agent::Pi),
+                crate::api::schema::AgentStatus::Done
+            ))
         );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),

@@ -2613,7 +2613,7 @@ mod tests {
         });
         assert!(matches!(
             pane_updates.as_slice(),
-            [update] if update.agent_released && update.suppress_completion
+            [update] if update.agent_released() && update.suppress_completion
         ));
         assert!(app.pending_worktree_remove_runtime_exits.is_empty());
         assert!(app.pending_worktree_remove_runtime_restores.is_empty());

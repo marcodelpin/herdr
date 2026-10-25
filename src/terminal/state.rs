@@ -182,10 +182,25 @@ pub struct TerminalStateMutation {
     /// persistence-dirty decision alongside `session_ref_changed`, or a
     /// cwd-only update never gets saved.
     pub persisted_agent_session_cwd_changed: bool,
-    pub agent_released: bool,
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the agent this mutation
+    /// released, named where the release happens.
+    pub release: Option<AgentRelease>,
+}
+
+/// herdr-c1o5 (ADR-0008 round 7, rule 19): the agent a release ends and the
+/// state it leaves for that agent; the publisher reads it as is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRelease {
+    pub agent_label: Option<String>,
+    pub known_agent: Option<Agent>,
+    pub final_state: AgentState,
 }
 
 impl TerminalStateMutation {
+    pub fn agent_released(&self) -> bool {
+        self.release.is_some()
+    }
+
     /// ADR-0008 round 4, consumer 4: two mutations made for one observation,
     /// reported as one.
     fn followed_by(self, next: Self) -> Self {
@@ -208,7 +223,7 @@ impl TerminalStateMutation {
             session_ref_changed: self.session_ref_changed || next.session_ref_changed,
             persisted_agent_session_cwd_changed: self.persisted_agent_session_cwd_changed
                 || next.persisted_agent_session_cwd_changed,
-            agent_released: self.agent_released || next.agent_released,
+            release: self.release.or(next.release),
         }
     }
 }
@@ -568,7 +583,7 @@ impl TerminalState {
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
                 persisted_agent_session_cwd_changed: false,
-                agent_released: false,
+                release: None,
             };
         }
         let replacement_process_detected = !process_exited
@@ -602,7 +617,7 @@ impl TerminalState {
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
                 persisted_agent_session_cwd_changed: false,
-                agent_released: false,
+                release: None,
             };
         }
         // A newer observation or an exit supersedes a deferred one.
@@ -837,6 +852,8 @@ impl TerminalState {
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
             self.clear_agent_name();
         }
+        let released_agent =
+            agent_released.then(|| (previous_agent_label.clone(), previous_known_agent));
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
@@ -852,7 +869,8 @@ impl TerminalState {
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
-            agent_released,
+            release: released_agent
+                .map(|(agent_label, known_agent)| self.release_of(agent_label, known_agent)),
         }
     }
 
@@ -1059,7 +1077,7 @@ impl TerminalState {
             effective_state_change,
             session_ref_changed: previous_session != current_session,
             persisted_agent_session_cwd_changed: false,
-            agent_released: false,
+            release: None,
         })
     }
 
@@ -2109,7 +2127,7 @@ impl TerminalState {
                     session_ref_changed: previous_session
                         != self.current_session_identity_for_persistence(),
                     persisted_agent_session_cwd_changed: false,
-                    agent_released: false,
+                    release: None,
                 });
             }
             return None;
@@ -2283,7 +2301,7 @@ impl TerminalState {
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed,
-            agent_released: false,
+            release: None,
         })
     }
 
@@ -2399,7 +2417,7 @@ impl TerminalState {
             session_ref_changed: previous_session.is_some()
                 || previous_session != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
-            agent_released: false,
+            release: None,
         })
     }
 
@@ -2492,8 +2510,29 @@ impl TerminalState {
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
-            agent_released: !process_owns_agent,
+            release: (!process_owns_agent)
+                .then(|| self.release_of(Some(agent_label.to_string()), released_agent)),
         })
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the release of the named agent
+    /// as this state leaves it. Its final state is the pane's while the
+    /// released agent is still the effective one or no agent is, and Unknown
+    /// when another agent is effective.
+    fn release_of(&self, agent_label: Option<String>, known_agent: Option<Agent>) -> AgentRelease {
+        let final_state = if self
+            .effective_agent_label()
+            .is_none_or(|effective| Some(effective) == agent_label.as_deref())
+        {
+            self.state
+        } else {
+            AgentState::Unknown
+        };
+        AgentRelease {
+            agent_label,
+            known_agent,
+            final_state,
+        }
     }
 
     /// A reporter that Herdr cannot also identify by process holds this pane,
@@ -2519,6 +2558,10 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let released_label = self
+            .hook_authority
+            .as_ref()
+            .map(|authority| authority.agent_label.clone());
         self.hook_authority = None;
         self.set_reported_resume(None);
         self.detected_agent = None;
@@ -2538,7 +2581,14 @@ impl TerminalState {
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
             persisted_agent_session_cwd_changed: false,
-            agent_released: true,
+            release: Some(
+                self.release_of(
+                    released_label.clone(),
+                    released_label
+                        .as_deref()
+                        .and_then(crate::detect::parse_agent_label),
+                ),
+            ),
         })
     }
 
@@ -6491,7 +6541,7 @@ mod tests {
         let mutation = terminal
             .release_agent_with_mutation("custom:pi", "pi", Some(2))
             .expect("the release is applied");
-        assert!(!mutation.agent_released, "{mutation:?}");
+        assert!(!mutation.agent_released(), "{mutation:?}");
         assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
         assert_eq!(terminal.state, AgentState::Working);
@@ -6527,7 +6577,7 @@ mod tests {
         let mutation = terminal
             .release_agent_with_mutation("custom:pi", "pi", Some(2))
             .expect("the release is applied");
-        assert!(mutation.agent_released, "{mutation:?}");
+        assert!(mutation.agent_released(), "{mutation:?}");
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.detected_agent, Some(Agent::Claude));
         assert_eq!(terminal.effective_agent_label(), Some("claude"));
@@ -6583,7 +6633,7 @@ mod tests {
         let mutation = terminal
             .release_agent_with_mutation(BRIDGE_SOURCE, "claude", Some(2))
             .expect("the release is applied");
-        assert!(mutation.agent_released, "{mutation:?}");
+        assert!(mutation.agent_released(), "{mutation:?}");
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
         assert_eq!(terminal.state, AgentState::Blocked, "S's report");
@@ -7056,7 +7106,7 @@ mod tests {
             false,
             t3,
         );
-        assert!(mutation.agent_released, "{mutation:?}");
+        assert!(mutation.agent_released(), "{mutation:?}");
         assert_eq!(
             pane_parts(&terminal),
             PaneParts {
@@ -7466,7 +7516,7 @@ mod tests {
             observed,
         );
 
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(
             terminal
@@ -8897,7 +8947,7 @@ mod tests {
             true,
             now,
         );
-        assert!(exit.agent_released);
+        assert!(exit.agent_released());
         assert_eq!(
             terminal.agent_name.as_deref(),
             Some("reviewer"),
@@ -8971,7 +9021,7 @@ mod tests {
         let mutation = terminal
             .release_agent_with_mutation("herdr:codex", "codex", None)
             .expect("detected agent release should be accepted");
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert_eq!(terminal.agent_name.as_deref(), Some("replacement"));
         assert_eq!(terminal.detected_agent, Some(Agent::Codex));
     }
@@ -8994,7 +9044,7 @@ mod tests {
             .release_agent_with_mutation("custom:pi", "pi", Some(11))
             .expect("custom release should be accepted");
 
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));

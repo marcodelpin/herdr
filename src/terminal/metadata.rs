@@ -290,7 +290,7 @@ impl TerminalState {
             effective_state_change,
             session_ref_changed: false,
             persisted_agent_session_cwd_changed: false,
-            agent_released: false,
+            release: None,
         })
     }
     pub fn effective_title(&self) -> Option<String> {
@@ -374,7 +374,7 @@ impl TerminalState {
             ),
             session_ref_changed: false,
             persisted_agent_session_cwd_changed: false,
-            agent_released: false,
+            release: None,
         })
     }
 

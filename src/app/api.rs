@@ -696,15 +696,36 @@ impl App {
             self.emit_pane_updated(update.ws_idx, update.pane_id);
         }
 
-        if update.previous_agent_label != update.agent_label || update.agent_released {
+        // herdr-c1o5 (ADR-0008 round 7, rule 19): the release event names the
+        // released agent; the effective agent is announced when it differs from
+        // the agent subscribers last read, which after a release is none.
+        if let Some(release) = &update.release {
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneAgentDetected,
+                data: crate::api::schema::EventData::PaneAgentDetected {
+                    pane_id: pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    agent: release.agent_label.clone(),
+                    released: true,
+                    final_status: Some(release.status),
+                },
+            });
+        }
+        let announce_effective_agent = match &update.release {
+            Some(release) => {
+                update.agent_label.is_some() && update.agent_label != release.agent_label
+            }
+            None => update.previous_agent_label != update.agent_label,
+        };
+        if announce_effective_agent {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentDetected,
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
                     agent: update.agent_label.clone(),
-                    released: update.agent_released,
-                    final_status: update.agent_release_status,
+                    released: false,
+                    final_status: None,
                 },
             });
         }
@@ -728,7 +749,7 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: update.status_agent().0.map(str::to_string),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     state_labels: presentation.state_labels,
