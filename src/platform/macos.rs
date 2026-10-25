@@ -971,6 +971,12 @@ pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Op
         .then_some(process.pbi_pgid)
 }
 
+/// herdr-c1o5 (ADR-0008 round 3, P1): `proc_bsdinfo` carries no session id,
+/// so the job facts are not one read here and a named report is refuted.
+pub fn process_job_read(_pid: u32) -> Option<super::ProcessJobRead> {
+    None
+}
+
 fn bsdinfo_start_token(info: &libc::proc_bsdinfo) -> u64 {
     info.pbi_start_tvsec
         .saturating_mul(1_000_000)

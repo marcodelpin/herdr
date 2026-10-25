@@ -43,6 +43,25 @@ pub enum NamedAgentVerdict {
     Witnessed { observed_at: Instant },
 }
 
+/// herdr-c1o5 (ADR-0008 round 3, rule 13), the ordering rule: an observation
+/// made at `observed_at`, before `witness`, says nothing about the process
+/// herdr saw alive at the witness. No witness orders nothing.
+fn observed_before(observed_at: Instant, witness: Option<Instant>) -> bool {
+    witness.is_some_and(|witness| observed_at < witness)
+}
+
+impl HookAuthority {
+    /// herdr-c1o5 (ADR-0008 round 3, rule 13): an observation made at
+    /// `observed_at` predates this authority's witness, so it never removes,
+    /// replaces, clears or hides this authority.
+    fn observed_before_witness(&self, observed_at: Instant) -> bool {
+        observed_before(
+            observed_at,
+            self.named_agent_witnessed.then_some(self.reported_at),
+        )
+    }
+}
+
 impl NamedAgentVerdict {
     pub fn witnessed_at(self) -> Option<Instant> {
         match self {
@@ -255,7 +274,7 @@ impl TerminalState {
     ) -> TerminalStateMutation {
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
-            && !self.detected_state_observed_before_release_suppression(Some(agent), now);
+            && !self.detection_predates_current_state(Some(agent), now);
         let mutation = self.set_detected_state_with_screen_signals_at(
             Some(agent),
             AgentState::Unknown,
@@ -415,17 +434,20 @@ impl TerminalState {
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
-        let newer_custom_authority = process_exited
+        // ADR-0008 round 3, rule 13, item 1: an authority this exit cannot
+        // clear, witnessed after it or (upstream) a custom-source report
+        // applied after it.
+        let authority_outlives_exit = process_exited
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 crate::detect::parse_agent_label(&authority.agent_label) == agent
-                    && !crate::agent_resume::is_official_agent_source(
-                        &authority.source,
-                        &authority.agent_label,
-                    )
-                    && authority.reported_at > now
+                    && (authority.observed_before_witness(now)
+                        || (!crate::agent_resume::is_official_agent_source(
+                            &authority.source,
+                            &authority.agent_label,
+                        ) && authority.reported_at > now))
             });
         let agent_released = process_exited
-            && !newer_custom_authority
+            && !authority_outlives_exit
             && (previous_agent_label.is_some() || self.agent_name.is_some());
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
             if self
@@ -455,7 +477,7 @@ impl TerminalState {
             && self
                 .recent_agent_process_exit
                 .is_some_and(|exit| Some(exit.agent) == agent && exit.observed_at < now);
-        if !process_exited && self.detected_state_observed_before_release_suppression(agent, now) {
+        if !process_exited && self.detection_predates_current_state(agent, now) {
             return TerminalStateMutation {
                 effective_state_change: self.recompute_effective_state(
                     previous_agent_label,
@@ -510,6 +532,16 @@ impl TerminalState {
                 {
                     continue;
                 }
+                // ADR-0008 round 3, rule 13, item 3: an entry whose buffered
+                // authority was witnessed after this exit keeps it, with the
+                // replacement session and the watermark it is released by.
+                if suppressed
+                    .pending_replacement_report
+                    .as_ref()
+                    .is_some_and(|pending| pending.authority.observed_before_witness(now))
+                {
+                    continue;
+                }
                 let exited_session_ref = suppressed
                     .replacement_session_ref
                     .take()
@@ -543,37 +575,33 @@ impl TerminalState {
                 self.hook_report_sequences.remove(&source);
             }
 
-            let official_session = self
-                .hook_authority
-                .as_ref()
-                .filter(|authority| {
-                    crate::agent_resume::is_official_agent_source(
-                        &authority.source,
-                        &authority.agent_label,
-                    ) && crate::detect::parse_agent_label(&authority.agent_label) == agent
-                })
-                .map(|authority| {
-                    (
-                        authority.source.clone(),
-                        authority.agent_label.clone(),
-                        authority.session_ref.clone(),
-                    )
-                })
-                .or_else(|| {
-                    self.persisted_agent_session.as_ref().and_then(|session| {
-                        (crate::agent_resume::is_official_agent_source(
-                            &session.source,
-                            &session.agent,
-                        ) && crate::detect::parse_agent_label(&session.agent) == agent)
-                            .then(|| {
-                                (
-                                    session.source.clone(),
-                                    session.agent.clone(),
-                                    Some(session.session_ref.clone()),
-                                )
-                            })
-                    })
-                });
+            let official_authority = self.hook_authority.as_ref().filter(|authority| {
+                crate::agent_resume::is_official_agent_source(
+                    &authority.source,
+                    &authority.agent_label,
+                ) && crate::detect::parse_agent_label(&authority.agent_label) == agent
+            });
+            // ADR-0008 round 3, rule 13, item 2: the source of a surviving
+            // official authority is not suppressed.
+            let official_session = match official_authority {
+                Some(_) if authority_outlives_exit => None,
+                Some(authority) => Some((
+                    authority.source.clone(),
+                    authority.agent_label.clone(),
+                    authority.session_ref.clone(),
+                )),
+                None => self.persisted_agent_session.as_ref().and_then(|session| {
+                    (crate::agent_resume::is_official_agent_source(&session.source, &session.agent)
+                        && crate::detect::parse_agent_label(&session.agent) == agent)
+                        .then(|| {
+                            (
+                                session.source.clone(),
+                                session.agent.clone(),
+                                Some(session.session_ref.clone()),
+                            )
+                        })
+                }),
+            };
             if let Some((source, agent_label, session_ref)) = official_session {
                 self.hook_report_sequences.remove(&source);
                 self.suppress_full_lifecycle_hook_report_with_session_ref(
@@ -586,14 +614,14 @@ impl TerminalState {
             }
             let cleared_hook_source = self.hook_authority.as_ref().and_then(|authority| {
                 (crate::detect::parse_agent_label(&authority.agent_label) == agent
-                    && !newer_custom_authority)
+                    && !authority_outlives_exit)
                     .then(|| authority.source.clone())
             });
             if let Some(source) = cleared_hook_source {
                 self.hook_report_sequences.remove(&source);
                 self.hook_authority = None;
             }
-            if !newer_custom_authority
+            if !authority_outlives_exit
                 && self
                     .persisted_agent_session
                     .as_ref()
@@ -603,7 +631,7 @@ impl TerminalState {
             {
                 self.persisted_agent_session = None;
             }
-            if !newer_custom_authority
+            if !authority_outlives_exit
                 && agent.is_some()
                 && self
                     .reported_resume
@@ -932,9 +960,7 @@ impl TerminalState {
         !crate::detect::full_lifecycle_hook_authority(source, agent_label)
             && self.recent_agent_process_exit.is_some_and(|exit| {
                 crate::detect::parse_agent_label(agent_label) == Some(exit.agent)
-                    && named_agent
-                        .witnessed_at()
-                        .is_none_or(|observed_at| observed_at <= exit.observed_at)
+                    && !observed_before(exit.observed_at, named_agent.witnessed_at())
             })
     }
 
@@ -959,11 +985,10 @@ impl TerminalState {
     /// amendment 2026-10-25, round-cap exit a]): the exited agent leaving the
     /// foreground does not clear it.
     fn authority_outlived_exited_agent(&self, authority: &HookAuthority) -> bool {
-        authority.named_agent_witnessed
-            && self.recent_agent_process_exit.is_some_and(|exit| {
-                crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
-                    && exit.observed_at < authority.reported_at
-            })
+        self.recent_agent_process_exit.is_some_and(|exit| {
+            crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
+                && authority.observed_before_witness(exit.observed_at)
+        })
     }
 
     fn fallback_not_older_than_hook(&self) -> bool {
@@ -1057,6 +1082,23 @@ impl TerminalState {
         reason: FullLifecycleHookSuppressionReason,
         observed_at: Instant,
     ) {
+        // ADR-0008 round 3, rule 13, item 4: the buffered authority of the entry
+        // this replaces survives a suppression older than its witness, with the
+        // replacement session it is released by.
+        let (replacement_session_ref, pending_replacement_report) = self
+            .suppressed_full_lifecycle_hook_reports
+            .remove(&source)
+            .and_then(|replaced| {
+                let pending = replaced
+                    .pending_replacement_report
+                    .filter(|pending| pending.authority.observed_before_witness(observed_at))?;
+                let replacement_session_ref =
+                    replaced.replacement_session_ref.filter(|session_ref| {
+                        pending.authority.session_ref.as_ref() == Some(session_ref)
+                    });
+                Some((replacement_session_ref, Some(pending)))
+            })
+            .unwrap_or((None, None));
         self.suppressed_full_lifecycle_hook_reports.insert(
             source,
             SuppressedFullLifecycleHookReport {
@@ -1064,8 +1106,8 @@ impl TerminalState {
                 session_ref,
                 observed_at,
                 reason,
-                replacement_session_ref: None,
-                pending_replacement_report: None,
+                replacement_session_ref,
+                pending_replacement_report,
             },
         );
     }
@@ -1438,6 +1480,21 @@ impl TerminalState {
         if remove_source {
             self.stale_full_lifecycle_hook_sessions.remove(source);
         }
+    }
+
+    /// A detection, not an exit, older than the state it would change is not
+    /// applied: older than a release suppression (upstream), or older than the
+    /// live authority's witness (ADR-0008 round 3, rule 13, item 5).
+    fn detection_predates_current_state(
+        &self,
+        detected_agent: Option<Agent>,
+        observed_at: Instant,
+    ) -> bool {
+        self.detected_state_observed_before_release_suppression(detected_agent, observed_at)
+            || self
+                .hook_authority
+                .as_ref()
+                .is_some_and(|authority| authority.observed_before_witness(observed_at))
     }
 
     fn detected_state_observed_before_release_suppression(
@@ -2334,7 +2391,12 @@ impl TerminalState {
     fn hook_authority_is_effective(&self, authority: &HookAuthority) -> bool {
         !crate::detect::full_lifecycle_hook_authority(&authority.source, &authority.agent_label)
             || crate::detect::parse_agent_label(&authority.agent_label).is_none_or(|agent| {
-                self.detected_agent == Some(agent) && self.recent_agent_process_exit.is_none()
+                // ADR-0008 round 3, rule 13, item 7: an exit observed before
+                // the witness does not hide the authority.
+                self.detected_agent == Some(agent)
+                    && self
+                        .recent_agent_process_exit
+                        .is_none_or(|exit| authority.observed_before_witness(exit.observed_at))
             })
     }
 
@@ -5778,7 +5840,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_process_exit_preserves_newer_custom_authority() {
+    fn stale_process_exit_preserves_authority_outlives_exit() {
         let mut terminal = test_terminal();
         let observed = Instant::now();
         terminal.set_detected_state_with_screen_signals_at(
