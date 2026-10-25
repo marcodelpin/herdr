@@ -2189,6 +2189,175 @@ mod tests {
         )));
     }
 
+    fn release_publication_agent_events(
+        event_hub: &crate::api::EventHub,
+        before: usize,
+    ) -> Vec<String> {
+        event_hub
+            .events_after(0)
+            .into_iter()
+            .skip(before)
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentDetected {
+                    agent,
+                    released,
+                    final_status,
+                    ..
+                } => Some(format!(
+                    "detected {agent:?} released={released} final={final_status:?}"
+                )),
+                crate::api::schema::EventData::PaneAgentStatusChanged {
+                    agent,
+                    agent_status,
+                    ..
+                } => Some(format!("status {agent:?} {agent_status:?}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // codex c1o5-r8 P2 (ADR-0008 round 7, rule 19): custom:pi witnessed at t2;
+    // a native Claude acquisition and Working observation from t0/t1 < t2 are
+    // deferred; the release of custom:pi seq 2 replays them. The published
+    // update releases pi with its own final status and announces Claude with
+    // its status; nothing gives pi Claude's status.
+    #[test]
+    fn a_release_publishes_the_released_agent_and_the_agent_it_leaves() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("release-publication");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let t2 = t0 + std::time::Duration::from_millis(10);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            crate::terminal::NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Claude, t0);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        let before = event_hub.events_after(0).len();
+
+        let updates = app.handle_internal_event_with_pane_updates(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "custom:pi".into(),
+            agent_label: "pi".into(),
+            known_agent: Some(Agent::Pi),
+            seq: Some(2),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Working);
+        let [update] = updates.as_slice() else {
+            panic!("one published update: {updates:?}");
+        };
+        let expected_events = [
+            "detected Some(\"pi\") released=true final=Some(Unknown)",
+            "detected Some(\"claude\") released=false final=None",
+            "status Some(\"claude\") Working",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            (
+                (
+                    update.agent_label.as_deref(),
+                    update.known_agent,
+                    update.state
+                ),
+                release_publication_agent_events(&event_hub, before),
+            ),
+            (
+                (Some("claude"), Some(Agent::Claude), AgentState::Working),
+                expected_events,
+            ),
+            "{update:?}"
+        );
+    }
+
+    // ADR-0008 round 7, rule 19: a release that leaves no agent publishes what
+    // upstream publishes - the released agent with its final status, and the
+    // pane's status under the released agent.
+    #[test]
+    fn a_release_that_leaves_no_agent_publishes_as_upstream() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("plain-release");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let t0 = std::time::Instant::now();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(1),
+            crate::terminal::NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t0,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        let before = event_hub.events_after(0).len();
+
+        let updates = app.handle_internal_event_with_pane_updates(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "custom:pi".into(),
+            agent_label: "pi".into(),
+            known_agent: Some(Agent::Pi),
+            seq: Some(2),
+        });
+
+        assert_eq!(
+            app.state.terminals[&terminal_id].effective_agent_label(),
+            None
+        );
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(
+            release_publication_agent_events(&event_hub, before),
+            [
+                "detected Some(\"pi\") released=true final=Some(Unknown)",
+                "status Some(\"pi\") Unknown",
+            ]
+        );
+    }
+
     #[test]
     fn overlay_exit_layout_updated_uses_restored_zoom_state() {
         let event_hub = crate::api::EventHub::default();

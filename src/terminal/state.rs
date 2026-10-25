@@ -6664,6 +6664,67 @@ mod tests {
         );
     }
 
+    // codex c1o5-r8 P3 (ADR-0008 round 7): the witness a buffered successor
+    // inherits is bound to the whole session reference, kind included:
+    // herdr:pi seq 2 Id("/tmp/pi.jsonl") witnessed at t2 is buffered; an
+    // unnamed seq 3 Path("/tmp/pi.jsonl") replaces it and keeps no witness.
+    #[test]
+    fn an_unnamed_buffered_successor_of_another_session_kind_keeps_no_witness() {
+        use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind};
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(15);
+        let id = AgentSessionRef {
+            kind: AgentSessionRefKind::Id,
+            value: "/tmp/pi.jsonl".into(),
+        };
+        let path = AgentSessionRef {
+            kind: AgentSessionRefKind::Path,
+            ..id.clone()
+        };
+        let pending = |terminal: &TerminalState| {
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .and_then(|suppressed| suppressed.pending_replacement_report.as_ref())
+                .map(|pending| {
+                    (
+                        pending.authority.session_ref.clone(),
+                        pending.authority.witnessed_at,
+                    )
+                })
+        };
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            Some(id.clone()),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        assert_eq!(
+            pending(&terminal),
+            Some((Some(id), Some(t2))),
+            "the witnessed report is buffered"
+        );
+
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(path.clone()),
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+
+        assert_eq!(pending(&terminal), Some((Some(path), None)));
+    }
+
     // codex c1o5-r7 P3: the snapshot tells session kinds apart, and reads the
     // persisted session's agent and cwd.
     #[test]
