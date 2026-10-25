@@ -52,6 +52,26 @@ fn observed_before(observed_at: Instant, witness: Option<Instant>) -> bool {
     witness.is_some_and(|witness| observed_at < witness)
 }
 
+/// herdr-c1o5 (ADR-0008 round 5, rule 15, amended in round 6): the witness a
+/// report naming no process keeps from the authority it replaces, live or
+/// buffered, when that authority has the same source and agent, and the same
+/// session where the report names one.
+fn inherited_witness(
+    previous: Option<&HookAuthority>,
+    source: &str,
+    agent_label: &str,
+    session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+) -> Option<Instant> {
+    previous
+        .filter(|previous| {
+            previous.source == source
+                && previous.agent_label == agent_label
+                && session_ref
+                    .is_none_or(|session_ref| previous.session_ref.as_ref() == Some(session_ref))
+        })
+        .and_then(|previous| previous.witnessed_at)
+}
+
 impl HookAuthority {
     /// herdr-c1o5 (ADR-0008 round 3, rule 13): an observation made at
     /// `observed_at` predates this authority's witness, so it never removes,
@@ -1006,16 +1026,12 @@ impl TerminalState {
         // ADR-0008 round 5, rule 15: a report of the same source and session
         // naming no process keeps the witness of the authority it replaces.
         let witnessed_at = named_agent.witnessed_at().or_else(|| {
-            self.hook_authority
-                .as_ref()
-                .filter(|previous| {
-                    previous.source == source
-                        && previous.agent_label == agent_label
-                        && session_ref.as_ref().is_none_or(|session_ref| {
-                            previous.session_ref.as_ref() == Some(session_ref)
-                        })
-                })
-                .and_then(|previous| previous.witnessed_at)
+            inherited_witness(
+                self.hook_authority.as_ref(),
+                &source,
+                &agent_label,
+                session_ref.as_ref(),
+            )
         });
         self.persisted_agent_session = None;
         self.hook_authority = Some(HookAuthority {
@@ -1431,6 +1447,19 @@ impl TerminalState {
             .as_ref()
             .is_none_or(|pending| seq > pending.seq);
         if replace_pending {
+            // ADR-0008 round 6, rule 15 amended: an unnamed successor of the
+            // buffered authority keeps its witness, as one of the live one does.
+            let witnessed_at = witnessed_at.or_else(|| {
+                inherited_witness(
+                    suppressed
+                        .pending_replacement_report
+                        .as_ref()
+                        .map(|pending| &pending.authority),
+                    source,
+                    agent_label,
+                    Some(&session_ref),
+                )
+            });
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
                     witnessed_at,
@@ -2420,8 +2449,15 @@ impl TerminalState {
             .persisted_agent_session
             .as_ref()
             .is_some_and(|session| session.source != source || session.agent != agent_label);
-        let process_owns_agent = crate::detect::parse_agent_label(agent_label)
-            .is_some_and(|agent| self.agent_process_present(source, Some(agent)));
+        let released_agent = crate::detect::parse_agent_label(agent_label);
+        let process_owns_agent =
+            released_agent.is_some_and(|agent| self.agent_process_present(source, Some(agent)));
+        // ADR-0008 round 6, rule 18: a release speaks for the released agent
+        // only; the detector's view of another agent, standing or replayed,
+        // stays.
+        let detector_shows_other_agent = self
+            .detected_agent
+            .is_some_and(|detected| Some(detected) != released_agent);
         if crate::detect::full_lifecycle_hook_authority(source, agent_label) {
             self.suppress_full_lifecycle_hook_report_with_session_ref(
                 source.to_string(),
@@ -2432,10 +2468,12 @@ impl TerminalState {
             );
         }
         if !process_owns_agent {
-            self.detected_agent = None;
-            self.fallback_state = AgentState::Unknown;
-            self.fallback_visible_blocker = false;
-            self.fallback_observed_at = None;
+            if !detector_shows_other_agent {
+                self.detected_agent = None;
+                self.fallback_state = AgentState::Unknown;
+                self.fallback_visible_blocker = false;
+                self.fallback_observed_at = None;
+            }
             self.clear_agent_name();
         }
         self.forget_reported_resume_of(source, agent_label);
@@ -6309,7 +6347,7 @@ mod tests {
                 .suppressed_full_lifecycle_hook_reports
                 .get("herdr:pi")
                 .and_then(|entry| session_value(&entry.replacement_session_ref)),
-            Some("s-session".into())
+            id_session("s-session")
         );
 
         observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t3);
@@ -6675,21 +6713,29 @@ mod tests {
 
     // ADR-0008 round 4, rule 14, and round 5: every part of the pane state,
     // compared as one value by the complete-state tests below.
+    // ADR-0008 round 6, P3: a session is its whole reference, kind and value.
+    type SessionPart = Option<crate::agent_resume::AgentSessionRef>;
+    type PersistedPart = (
+        String,
+        String,
+        crate::agent_resume::AgentSessionRef,
+        Option<String>,
+    );
     type AuthorityPart = (
         String,
         String,
         AgentState,
         Instant,
         Option<Instant>,
-        Option<String>,
+        SessionPart,
     );
     type EntryPart = (
         String,
         String,
-        Option<String>,
+        SessionPart,
         Instant,
         FullLifecycleHookSuppressionReason,
-        Option<String>,
+        SessionPart,
         Option<(u64, AuthorityPart)>,
     );
     type ResumePart = (String, String, Vec<String>);
@@ -6702,14 +6748,23 @@ mod tests {
         watermarks: Vec<(String, u64)>,
         detector: (Option<Agent>, AgentState, bool, Option<Instant>),
         deferred: Option<DeferredDetection>,
-        session: Option<(String, String)>,
+        session: Option<PersistedPart>,
         resume: Option<ResumePart>,
     }
 
-    fn session_value(session_ref: &Option<crate::agent_resume::AgentSessionRef>) -> Option<String> {
-        session_ref
-            .as_ref()
-            .map(|session_ref| session_ref.value.clone())
+    fn session_value(session_ref: &Option<crate::agent_resume::AgentSessionRef>) -> SessionPart {
+        session_ref.clone()
+    }
+
+    fn id_session(value: &str) -> SessionPart {
+        Some(crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: value.into(),
+        })
+    }
+
+    fn persisted_part(source: &str, agent: &str, session: &str) -> Option<PersistedPart> {
+        id_session(session).map(|session_ref| (source.into(), agent.into(), session_ref, None))
     }
 
     fn authority_part(authority: &HookAuthority) -> AuthorityPart {
@@ -6737,7 +6792,7 @@ mod tests {
             state,
             reported_at,
             witness,
-            session.map(str::to_string),
+            session.and_then(id_session),
         )
     }
 
@@ -6789,10 +6844,14 @@ mod tests {
                 terminal.fallback_observed_at,
             ),
             deferred: terminal.deferred_detection,
-            session: terminal
-                .persisted_agent_session
-                .as_ref()
-                .map(|session| (session.source.clone(), session.session_ref.value.clone())),
+            session: terminal.persisted_agent_session.as_ref().map(|session| {
+                (
+                    session.source.clone(),
+                    session.agent.clone(),
+                    session.session_ref.clone(),
+                    session.cwd.clone(),
+                )
+            }),
             resume: terminal.reported_resume.as_ref().map(|resume| {
                 (
                     resume.source.clone(),
@@ -6945,7 +7004,7 @@ mod tests {
                 entries: vec![(
                     "herdr:pi".into(),
                     "pi".into(),
-                    Some("pi-session".into()),
+                    id_session("pi-session"),
                     t3,
                     FullLifecycleHookSuppressionReason::ProcessExit,
                     None,
@@ -7008,10 +7067,10 @@ mod tests {
             entries: vec![(
                 "herdr:pi".into(),
                 "pi".into(),
-                Some("old-session".into()),
+                id_session("old-session"),
                 t1,
                 FullLifecycleHookSuppressionReason::ProcessExit,
-                Some("s-session".into()),
+                id_session("s-session"),
                 Some((
                     20,
                     authority_of(
@@ -7058,7 +7117,7 @@ mod tests {
                 watermarks: vec![("herdr:pi".into(), 20)],
                 detector: (Some(Agent::Pi), AgentState::Working, false, Some(t3)),
                 deferred: None,
-                session: Some(("herdr:pi".into(), "s-session".into())),
+                session: persisted_part("herdr:pi", "pi", "s-session"),
                 resume: None,
             }
         );
@@ -7189,7 +7248,7 @@ mod tests {
                 watermarks: vec![("custom:pi".into(), 1)],
                 detector: (Some(Agent::Claude), AgentState::Working, false, Some(t3)),
                 deferred: None,
-                session: Some(("custom:pi".into(), "custom-session".into())),
+                session: persisted_part("custom:pi", "pi", "custom-session"),
                 resume: None,
             }
         );
