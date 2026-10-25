@@ -5777,6 +5777,231 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Blocked);
     }
 
+    // codex c1o5-r5 P2-1: live herdr:pi, session S, seq 2, Blocked, witnessed
+    // at t2; a queued pi exit observed at t1 < t2 is consumed after it.
+    // Returns [t0, t1, t2, t3, t4].
+    fn official_authority_kept_across_an_older_exit(terminal: &mut TerminalState) -> [Instant; 5] {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let t4 = t0 + Duration::from_millis(30);
+        let session_ref = pi_session("pi-session");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref,
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        [t0, t1, t2, t3, t4]
+    }
+
+    // codex c1o5-r5 P2-1: S's seq 3 Working, witnessed at t3, then a pi
+    // detection at t4.
+    #[test]
+    fn a_kept_official_authority_accepts_its_next_report() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, t4] = official_authority_kept_across_an_older_exit(&mut terminal);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            pi_session("pi-session"),
+            Some(3),
+            NamedAgentVerdict::Witnessed { observed_at: t3 },
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "seq 3 is applied");
+        assert_witnessed_authority(&terminal, t3);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t4,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(
+            terminal.recent_agent_process_exit.is_none(),
+            "the detector saw pi after the exit"
+        );
+        assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&3));
+    }
+
+    // codex c1o5-r5 P2-1, disappearance: the authority is held by its witness
+    // alone, so the producer keeps publishing, and an observation at t3 > t2
+    // without pi ends it as an exit observed then.
+    #[test]
+    fn a_witness_held_authority_ends_on_a_newer_observation_without_its_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(
+            !terminal.full_lifecycle_hook_authority_active(),
+            "a witness-held authority does not silence the detector"
+        );
+
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), None, "no dead label");
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal
+                .recent_agent_process_exit
+                .map(|exit| (exit.agent, exit.observed_at)),
+            Some((Agent::Pi, t3))
+        );
+    }
+
+    // codex c1o5-r5 P2-2: persisted herdr:pi session OLD; S seq 20 Blocked
+    // witnessed at t2 is buffered; S's startup at seq 10; a pi exit observed at
+    // t1 < t2; a delayed session R startup at seq 9; a pi detection at t3.
+    #[test]
+    fn a_late_session_start_cannot_pass_a_kept_buffer_watermark() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("old-session").expect("a pi session"),
+            cwd: None,
+        });
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(20),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(10),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("r-session"),
+            Some(9),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report replayed");
+        assert_witnessed_authority(&terminal, t2);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+    }
+
+    // codex c1o5-r5 P2-3: a native pi's acquisition and first Working
+    // observation, both older than a witnessed custom:pi report, are consumed
+    // after it; then that authority is cleared while pi runs.
+    #[test]
+    fn a_deferred_detection_is_applied_when_the_authority_is_cleared() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "the witnessed report");
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "the detector's view");
+    }
+
     #[test]
     fn process_exit_clears_matching_hook_authority_before_reporting_idle() {
         let mut terminal = test_terminal();
