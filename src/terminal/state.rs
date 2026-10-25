@@ -166,6 +166,34 @@ pub struct TerminalStateMutation {
     pub agent_released: bool,
 }
 
+impl TerminalStateMutation {
+    /// ADR-0008 round 4, consumer 4: two mutations made for one observation,
+    /// reported as one.
+    fn followed_by(self, next: Self) -> Self {
+        let effective_state_change =
+            match (self.effective_state_change, next.effective_state_change) {
+                (Some(first), Some(second)) => (first.previous_agent_label != second.agent_label
+                    || first.previous_state != second.state
+                    || first.previous_presentation != second.presentation)
+                    .then_some(EffectiveStateChange {
+                        previous_agent_label: first.previous_agent_label,
+                        previous_known_agent: first.previous_known_agent,
+                        previous_state: first.previous_state,
+                        previous_presentation: first.previous_presentation,
+                        ..second
+                    }),
+                (first, second) => second.or(first),
+            };
+        Self {
+            effective_state_change,
+            session_ref_changed: self.session_ref_changed || next.session_ref_changed,
+            persisted_agent_session_cwd_changed: self.persisted_agent_session_cwd_changed
+                || next.persisted_agent_session_cwd_changed,
+            agent_released: self.agent_released || next.agent_released,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentNameOwner {
     agent_label: String,
@@ -176,6 +204,19 @@ struct AgentNameOwner {
 struct RecentAgentProcessExit {
     agent: Agent,
     observed_at: Instant,
+}
+
+/// ADR-0008 round 4, consumer 3: the latest detector observation rule 13 did
+/// not apply, older than the live witness. The producer believes it published
+/// it and publishes on change only, so herdr applies it once no witness
+/// predates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredDetection {
+    agent: Option<Agent>,
+    fallback_state: AgentState,
+    visible_blocker: bool,
+    observed_at: Instant,
+    acquisition: bool,
 }
 
 /// Pure state for a server-owned terminal.
@@ -221,6 +262,7 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
+    deferred_detection: Option<DeferredDetection>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
@@ -261,6 +303,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
+            deferred_detection: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
@@ -284,6 +327,14 @@ impl TerminalState {
             false,
             now,
         );
+        // ADR-0008 round 4, consumer 3: a deferred acquisition stays one.
+        if let Some(deferred) = self
+            .deferred_detection
+            .as_mut()
+            .filter(|deferred| deferred.observed_at == now && deferred.agent == Some(agent))
+        {
+            deferred.acquisition = true;
+        }
         if starts_acquisition {
             self.codex_prompt_ready = false;
             self.agent_process_acquisition_pending = true;
@@ -306,6 +357,7 @@ impl TerminalState {
 
     #[cfg(unix)]
     pub(crate) fn restore_handoff_agent_state(&mut self, snapshot: HandoffAgentState) {
+        self.deferred_detection = None;
         if let Some(sequence) = snapshot.sequence {
             self.hook_report_sequences
                 .insert(snapshot.authority.source.clone(), sequence);
@@ -428,6 +480,32 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
+        // ADR-0008 round 4, consumer 4: an observation without the agent of a
+        // witness-held authority, made at or after its witness, is the exit of
+        // the witnessed process that the producer could not report.
+        if !process_exited && agent.is_none() {
+            if let Some(held_agent) = self.witness_held_agent_unseen_at(now) {
+                let exit = self.set_detected_state_with_screen_signals_at(
+                    Some(held_agent),
+                    AgentState::Unknown,
+                    false,
+                    false,
+                    false,
+                    true,
+                    now,
+                );
+                let observation = self.set_detected_state_with_screen_signals_at(
+                    agent,
+                    fallback_state,
+                    visible_blocker,
+                    false,
+                    false,
+                    false,
+                    now,
+                );
+                return exit.followed_by(observation);
+            }
+        }
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
@@ -450,6 +528,8 @@ impl TerminalState {
             && !authority_outlives_exit
             && (previous_agent_label.is_some() || self.agent_name.is_some());
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
+            // A newer observation supersedes a deferred one.
+            self.deferred_detection = None;
             if self
                 .hook_authority
                 .as_ref()
@@ -478,6 +558,12 @@ impl TerminalState {
                 .recent_agent_process_exit
                 .is_some_and(|exit| Some(exit.agent) == agent && exit.observed_at < now);
         if !process_exited && self.detection_predates_current_state(agent, now) {
+            // ADR-0008 round 4, consumer 3: a detection older than the live
+            // witness is deferred, not dropped; one older than a release
+            // suppression is dropped (upstream).
+            if !self.detected_state_observed_before_release_suppression(agent, now) {
+                self.defer_detection(agent, fallback_state, visible_blocker, now);
+            }
             return TerminalStateMutation {
                 effective_state_change: self.recompute_effective_state(
                     previous_agent_label,
@@ -492,6 +578,8 @@ impl TerminalState {
                 agent_released: false,
             };
         }
+        // A newer observation or an exit supersedes a deferred one.
+        self.deferred_detection = None;
         self.detected_agent = agent;
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
@@ -526,6 +614,7 @@ impl TerminalState {
         if process_exited {
             let mut reset_sources = Vec::new();
             let mut stale_sessions = Vec::new();
+            let mut kept_sources = Vec::new();
             for (source, suppressed) in &mut self.suppressed_full_lifecycle_hook_reports {
                 if crate::detect::parse_agent_label(&suppressed.agent_label) != agent
                     || suppressed.reason == FullLifecycleHookSuppressionReason::HookClear
@@ -540,6 +629,7 @@ impl TerminalState {
                     .as_ref()
                     .is_some_and(|pending| pending.authority.observed_before_witness(now))
                 {
+                    kept_sources.push(source.clone());
                     continue;
                 }
                 let exited_session_ref = suppressed
@@ -603,7 +693,11 @@ impl TerminalState {
                 }),
             };
             if let Some((source, agent_label, session_ref)) = official_session {
-                self.hook_report_sequences.remove(&source);
+                // ADR-0008 round 4, consumer 2: a kept entry keeps the
+                // watermark it is released by.
+                if !kept_sources.contains(&source) {
+                    self.hook_report_sequences.remove(&source);
+                }
                 self.suppress_full_lifecycle_hook_report_with_session_ref(
                     source,
                     agent_label,
@@ -618,7 +712,9 @@ impl TerminalState {
                     .then(|| authority.source.clone())
             });
             if let Some(source) = cleared_hook_source {
-                self.hook_report_sequences.remove(&source);
+                if !kept_sources.contains(&source) {
+                    self.hook_report_sequences.remove(&source);
+                }
                 self.hook_authority = None;
             }
             if !authority_outlives_exit
@@ -991,6 +1087,104 @@ impl TerminalState {
         })
     }
 
+    /// ADR-0008 round 4, rule 14: the recorded exit is superseded, the live
+    /// authority naming its agent having been witnessed after it.
+    fn recorded_exit_superseded(&self) -> bool {
+        self.hook_authority
+            .as_ref()
+            .is_some_and(|authority| self.authority_outlived_exited_agent(authority))
+    }
+
+    /// ADR-0008 round 4, consumer 5: the detector saw `agent` and no exit
+    /// stands against it; an exit superseded by the live witness does not.
+    fn agent_process_present(&self, agent: Option<Agent>) -> bool {
+        agent.is_some()
+            && self.detected_agent == agent
+            && (self.recent_agent_process_exit.is_none() || self.recorded_exit_superseded())
+    }
+
+    /// ADR-0008 round 4: a full-lifecycle authority held by its witness alone,
+    /// the detector not having seen its process since the recorded exit. It
+    /// does not silence the detector.
+    fn full_lifecycle_authority_held_by_witness(&self) -> bool {
+        self.recorded_exit_superseded()
+            && self.hook_authority.as_ref().is_some_and(|authority| {
+                crate::detect::full_lifecycle_hook_authority(
+                    &authority.source,
+                    &authority.agent_label,
+                )
+            })
+    }
+
+    /// The agent of a witness-held authority, when `observed_at` is not before
+    /// its witness.
+    fn witness_held_agent_unseen_at(&self, observed_at: Instant) -> Option<Agent> {
+        if !self.full_lifecycle_authority_held_by_witness() {
+            return None;
+        }
+        self.hook_authority
+            .as_ref()
+            .filter(|authority| !authority.observed_before_witness(observed_at))
+            .and_then(|authority| crate::detect::parse_agent_label(&authority.agent_label))
+    }
+
+    fn defer_detection(
+        &mut self,
+        agent: Option<Agent>,
+        fallback_state: AgentState,
+        visible_blocker: bool,
+        observed_at: Instant,
+    ) {
+        let acquisition = self
+            .deferred_detection
+            .is_some_and(|deferred| deferred.acquisition && deferred.agent == agent);
+        self.deferred_detection = Some(DeferredDetection {
+            agent,
+            fallback_state,
+            visible_blocker,
+            observed_at,
+            acquisition,
+        });
+    }
+
+    /// ADR-0008 round 4, the way back of consumer 3: the deferred detection is
+    /// applied with its own observation time once no live witness predates
+    /// it, and dropped when a release suppression is newer than it.
+    fn replay_deferred_detection(&mut self) {
+        let Some(deferred) = self.deferred_detection else {
+            return;
+        };
+        if self
+            .hook_authority
+            .as_ref()
+            .is_some_and(|authority| authority.observed_before_witness(deferred.observed_at))
+        {
+            return;
+        }
+        self.deferred_detection = None;
+        if self.detected_state_observed_before_release_suppression(
+            deferred.agent,
+            deferred.observed_at,
+        ) {
+            return;
+        }
+        if deferred.acquisition
+            && !self.should_ignore_detected_state_under_full_lifecycle_hook(deferred.agent, false)
+        {
+            self.codex_prompt_ready = false;
+            self.agent_process_acquisition_pending = true;
+        }
+        self.set_detected_state_with_screen_signals_at(
+            deferred.agent,
+            deferred.fallback_state,
+            deferred.visible_blocker,
+            false,
+            false,
+            false,
+            deferred.observed_at,
+        );
+    }
+
     fn fallback_not_older_than_hook(&self) -> bool {
         self.hook_authority.as_ref().is_none_or(|authority| {
             self.fallback_observed_at
@@ -1014,6 +1208,7 @@ impl TerminalState {
         process_exited: bool,
     ) -> bool {
         self.live_full_lifecycle_hook_authority()
+            && !self.full_lifecycle_authority_held_by_witness()
             && !process_exited
             && !self.hook_authority_conflicts_with_detected_agent(detected_agent)
     }
@@ -1134,9 +1329,7 @@ impl TerminalState {
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
-        let process_present = known_agent.is_some()
-            && self.detected_agent == known_agent
-            && self.recent_agent_process_exit.is_none();
+        let process_present = self.agent_process_present(known_agent);
         let anchored_session_ref = self
             .hook_authority
             .as_ref()
@@ -1407,10 +1600,16 @@ impl TerminalState {
                 stale_session.session_ref,
             );
         }
+        // ADR-0008 round 4, consumer 4: the live authority keeps its watermark.
+        let live_source = self
+            .hook_authority
+            .as_ref()
+            .map(|authority| authority.source.clone());
         self.hook_report_sequences.retain(|source, _| {
             validated_replacement_sessions
                 .iter()
                 .any(|(validated_source, _, _, _)| validated_source == source)
+                || live_source.as_deref() == Some(source.as_str())
                 || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
@@ -1759,9 +1958,7 @@ impl TerminalState {
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
-        let process_present = known_agent.is_some()
-            && self.detected_agent == known_agent
-            && self.recent_agent_process_exit.is_none();
+        let process_present = self.agent_process_present(known_agent);
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
         let generation_gated = self
@@ -2189,10 +2386,8 @@ impl TerminalState {
             .persisted_agent_session
             .as_ref()
             .is_some_and(|session| session.source != source || session.agent != agent_label);
-        let process_owns_agent =
-            crate::detect::parse_agent_label(agent_label).is_some_and(|agent| {
-                self.detected_agent == Some(agent) && self.recent_agent_process_exit.is_none()
-            });
+        let process_owns_agent = crate::detect::parse_agent_label(agent_label)
+            .is_some_and(|agent| self.agent_process_present(Some(agent)));
 
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -2435,8 +2630,11 @@ impl TerminalState {
         }
     }
 
+    /// Whether the detector is silenced: a witness-held authority does not
+    /// silence it (ADR-0008 round 4), so the producer keeps publishing.
     pub fn full_lifecycle_hook_authority_active(&self) -> bool {
         self.live_full_lifecycle_hook_authority()
+            && !self.full_lifecycle_authority_held_by_witness()
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {
@@ -2693,6 +2891,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.deferred_detection = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -2777,6 +2976,9 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
+        // ADR-0008 round 4: every mutation ends here, so a deferred detection
+        // no witness predates any more is applied first.
+        self.replay_deferred_detection();
         let state = if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else {
@@ -6000,6 +6202,495 @@ mod tests {
         terminal.clear_hook_authority(Some("custom:pi"), Some(2));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
         assert_eq!(terminal.state, AgentState::Working, "the detector's view");
+    }
+
+    // ADR-0008 round 4, rule 14: the six parts of the pane state, compared as
+    // one value by the complete-state tests below.
+    type PendingPart = (u64, AgentState, Instant, bool);
+    type EntryPart = (
+        String,
+        Option<String>,
+        Instant,
+        FullLifecycleHookSuppressionReason,
+        Option<String>,
+        Option<PendingPart>,
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct PaneParts {
+        authority: Option<(String, AgentState, Instant, bool, Option<String>)>,
+        exit: Option<(Agent, Instant)>,
+        entries: Vec<EntryPart>,
+        watermarks: Vec<(String, u64)>,
+        detector: (Option<Agent>, AgentState, Option<Instant>),
+        deferred: Option<DeferredDetection>,
+        session: Option<(String, String)>,
+    }
+
+    fn pane_parts(terminal: &TerminalState) -> PaneParts {
+        let value = |session_ref: &Option<crate::agent_resume::AgentSessionRef>| {
+            session_ref
+                .as_ref()
+                .map(|session_ref| session_ref.value.clone())
+        };
+        let mut entries: Vec<EntryPart> = terminal
+            .suppressed_full_lifecycle_hook_reports
+            .iter()
+            .map(|(source, entry)| {
+                (
+                    source.clone(),
+                    value(&entry.session_ref),
+                    entry.observed_at,
+                    entry.reason,
+                    value(&entry.replacement_session_ref),
+                    entry.pending_replacement_report.as_ref().map(|pending| {
+                        (
+                            pending.seq,
+                            pending.authority.state,
+                            pending.authority.reported_at,
+                            pending.authority.named_agent_witnessed,
+                        )
+                    }),
+                )
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut watermarks: Vec<(String, u64)> = terminal
+            .hook_report_sequences
+            .iter()
+            .map(|(source, seq)| (source.clone(), *seq))
+            .collect();
+        watermarks.sort();
+        PaneParts {
+            authority: terminal.hook_authority.as_ref().map(|authority| {
+                (
+                    authority.source.clone(),
+                    authority.state,
+                    authority.reported_at,
+                    authority.named_agent_witnessed,
+                    value(&authority.session_ref),
+                )
+            }),
+            exit: terminal
+                .recent_agent_process_exit
+                .map(|exit| (exit.agent, exit.observed_at)),
+            entries,
+            watermarks,
+            detector: (
+                terminal.detected_agent,
+                terminal.fallback_state,
+                terminal.fallback_observed_at,
+            ),
+            deferred: terminal.deferred_detection,
+            session: terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.source.clone(), session.session_ref.value.clone())),
+        }
+    }
+
+    fn pi_report(terminal: &mut TerminalState, state: AgentState, seq: u64, witness: Instant) {
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            state,
+            None,
+            pi_session("pi-session"),
+            Some(seq),
+            NamedAgentVerdict::Witnessed {
+                observed_at: witness,
+            },
+            witness,
+        );
+    }
+
+    fn observe(terminal: &mut TerminalState, agent: Option<Agent>, state: AgentState, at: Instant) {
+        terminal.set_detected_state_with_screen_signals_at(
+            agent,
+            state,
+            false,
+            false,
+            state == AgentState::Working,
+            false,
+            at,
+        );
+    }
+
+    // Consumer 1: an exit older than the live witness.
+    #[test]
+    fn complete_state_consumer_1_exit_older_than_the_live_witness() {
+        let mut terminal = test_terminal();
+        let [_, t1, t2, _, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some((
+                    "herdr:pi".into(),
+                    AgentState::Blocked,
+                    t2,
+                    true,
+                    Some("pi-session".into())
+                )),
+                exit: Some((Agent::Pi, t1)),
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 2)],
+                detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+                deferred: None,
+                session: None,
+            }
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(!terminal.full_lifecycle_hook_authority_active());
+    }
+
+    // Consumer 5: a report of the witness-held authority's source.
+    #[test]
+    fn complete_state_consumer_5_report_while_held_by_its_witness() {
+        let mut terminal = test_terminal();
+        let [_, t1, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        pi_report(&mut terminal, AgentState::Working, 3, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some((
+                    "herdr:pi".into(),
+                    AgentState::Working,
+                    t3,
+                    true,
+                    Some("pi-session".into())
+                )),
+                exit: Some((Agent::Pi, t1)),
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 3)],
+                detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+                deferred: None,
+                session: None,
+            }
+        );
+    }
+
+    // Consumer 4, the held agent: a pi detection newer than the witness.
+    #[test]
+    fn complete_state_consumer_4_newer_detection_of_the_held_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, t4] = official_authority_kept_across_an_older_exit(&mut terminal);
+        pi_report(&mut terminal, AgentState::Working, 3, t3);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t4);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some((
+                    "herdr:pi".into(),
+                    AgentState::Working,
+                    t3,
+                    true,
+                    Some("pi-session".into())
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 3)],
+                detector: (Some(Agent::Pi), AgentState::Working, Some(t4)),
+                deferred: None,
+                session: None,
+            }
+        );
+        assert!(
+            terminal.full_lifecycle_hook_authority_active(),
+            "detector-held again"
+        );
+    }
+
+    // Consumer 4, no agent: an observation without pi newer than the witness
+    // is the exit of the witnessed process, then the observation itself.
+    #[test]
+    fn complete_state_consumer_4_newer_observation_without_the_held_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        let mutation = terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+        assert!(mutation.agent_released, "{mutation:?}");
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: Some((Agent::Pi, t3)),
+                entries: vec![(
+                    "herdr:pi".into(),
+                    Some("pi-session".into()),
+                    t3,
+                    FullLifecycleHookSuppressionReason::ProcessExit,
+                    None,
+                    None
+                )],
+                watermarks: vec![],
+                detector: (None, AgentState::Unknown, Some(t3)),
+                deferred: None,
+                session: None,
+            }
+        );
+    }
+
+    // Consumers 2 and 7: an exit older than a buffered witness, with the
+    // persisted-session suppression rewriting the entry; then a late session
+    // start and a pi detection.
+    #[test]
+    fn complete_state_consumer_2_exit_older_than_a_buffered_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("old-session").expect("a pi session"),
+            cwd: None,
+        });
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(20),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(10),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        let after_exit = PaneParts {
+            authority: None,
+            exit: Some((Agent::Pi, t1)),
+            entries: vec![(
+                "herdr:pi".into(),
+                Some("old-session".into()),
+                t1,
+                FullLifecycleHookSuppressionReason::ProcessExit,
+                Some("s-session".into()),
+                Some((20, AgentState::Blocked, t2, true)),
+            )],
+            watermarks: vec![("herdr:pi".into(), 10)],
+            detector: (Some(Agent::Pi), AgentState::Idle, Some(t1)),
+            deferred: None,
+            session: None,
+        };
+        assert_eq!(pane_parts(&terminal), after_exit);
+
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("r-session"),
+            Some(9),
+            Some("startup".into()),
+        );
+        assert_eq!(pane_parts(&terminal), after_exit, "seq 9 is not newer");
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some((
+                    "herdr:pi".into(),
+                    AgentState::Blocked,
+                    t2,
+                    true,
+                    Some("s-session".into())
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 20)],
+                detector: (Some(Agent::Pi), AgentState::Working, Some(t3)),
+                deferred: None,
+                session: Some(("herdr:pi".into(), "s-session".into())),
+            }
+        );
+    }
+
+    // Consumer 3: detections older than the live witness are deferred, then
+    // applied when the authority is cleared.
+    #[test]
+    fn complete_state_consumer_3_detection_older_than_the_live_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(("custom:pi".into(), AgentState::Blocked, t2, true, None)),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (None, AgentState::Unknown, None),
+                deferred: Some(DeferredDetection {
+                    agent: Some(Agent::Pi),
+                    fallback_state: AgentState::Working,
+                    visible_blocker: false,
+                    observed_at: t1,
+                    acquisition: true,
+                }),
+                session: None,
+            }
+        );
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 2)],
+                detector: (Some(Agent::Pi), AgentState::Working, Some(t1)),
+                deferred: None,
+                session: None,
+            }
+        );
+        assert!(!terminal.agent_process_acquisition_pending, "Working");
+    }
+
+    // Consumer 6: the detector clear, by an observation older than the witness
+    // (deferred, nothing cleared), then by a newer one of another agent.
+    #[test]
+    fn complete_state_consumer_6_detector_clear() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "custom-session".into(),
+        };
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            Some(session_ref),
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some((
+                    "custom:pi".into(),
+                    AgentState::Blocked,
+                    t2,
+                    true,
+                    Some("custom-session".into())
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (None, AgentState::Unknown, None),
+                deferred: Some(DeferredDetection {
+                    agent: Some(Agent::Claude),
+                    fallback_state: AgentState::Working,
+                    visible_blocker: false,
+                    observed_at: t1,
+                    acquisition: false,
+                }),
+                session: None,
+            }
+        );
+
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (Some(Agent::Claude), AgentState::Working, Some(t3)),
+                deferred: None,
+                session: Some(("custom:pi".into(), "custom-session".into())),
+            }
+        );
+    }
+
+    // Consumer 8: an idle shell older than the witness of a self-reported
+    // agent changes nothing; a newer one clears it.
+    #[test]
+    fn complete_state_consumer_8_idle_shell() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:foo".into(),
+            "foo".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        let held = PaneParts {
+            authority: Some(("custom:foo".into(), AgentState::Working, t2, true, None)),
+            exit: None,
+            entries: vec![],
+            watermarks: vec![("custom:foo".into(), 1)],
+            detector: (None, AgentState::Unknown, None),
+            deferred: None,
+            session: None,
+        };
+        assert_eq!(pane_parts(&terminal), held);
+        assert!(terminal.clear_self_reported_agent(t1).is_none());
+        assert_eq!(pane_parts(&terminal), held);
+
+        assert!(terminal.clear_self_reported_agent(t3).is_some());
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:foo".into(), 1)],
+                detector: (None, AgentState::Unknown, None),
+                deferred: None,
+                session: None,
+            }
+        );
     }
 
     #[test]
