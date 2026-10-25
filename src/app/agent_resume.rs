@@ -1315,14 +1315,17 @@ mod tests {
                 .get(&terminal_id)
                 .and_then(|runtime| runtime.child_pid())
                 .expect("the pane needs a real shell");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            // The carrier is the resumed job, never the shell at its prompt:
+            // the job takes the foreground later and would refute it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline
                 && crate::detect::foreground_process_group_id(shell_pid) == Some(shell_pid)
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             let carrier_pid = crate::detect::foreground_process_group_id(shell_pid)
-                .expect("the pane has a foreground job");
+                .filter(|&group| group != shell_pid)
+                .expect("the resumed job holds the pane's foreground");
             let carrier_start = crate::platform::process_start_token(carrier_pid)
                 .expect("the foreground job is alive");
             let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
@@ -1340,20 +1343,36 @@ mod tests {
             }
         }
 
-        /// A live process whose comm is `name` (a link to `sleep`).
+        /// A live process whose comm is `name`: a script blocked in the shell's
+        /// `read` builtin, so it has no child to leave behind. Not a link to a
+        /// binary: a multicall coreutils (uutils `sleep` 0.10.0 on dcc) exits
+        /// at once under a name it does not know, so a link named `claude`
+        /// died before the reports that named it.
         fn spawn(&mut self, name: &str) -> (u32, u64) {
+            use std::os::unix::fs::PermissionsExt;
             let path = self.dir.join(name);
             if !path.exists() {
-                let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-                    .into_iter()
-                    .find(|candidate| std::path::Path::new(candidate).exists())
-                    .expect("a sleep binary");
-                std::os::unix::fs::symlink(sleep, &path).unwrap();
+                std::fs::write(&path, "#!/bin/sh\nread -r line\n").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
-            let child = std::process::Command::new(&path)
-                .arg("600")
-                .spawn()
-                .unwrap();
+            let mut child = loop {
+                match std::process::Command::new(&path)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => break child,
+                    // Another thread forked while the script was open for writing.
+                    Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("spawn {name}: {error}"),
+                }
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "the process named {name} exited at once"
+            );
             let pid = child.id();
             self.children.push(child);
             (pid, crate::platform::process_start_token(pid).unwrap())
@@ -1395,6 +1414,13 @@ mod tests {
             carrier: Option<(u32, u64)>,
             resume_session: Option<&str>,
         ) {
+            for child in &mut self.children {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "seq {seq}: process {} exited before the report",
+                    child.id()
+                );
+            }
             let response = self.app.handle_api_request(crate::api::schema::Request {
                 id: format!("report-{seq}"),
                 method: crate::api::schema::Method::PaneReportAgent(
