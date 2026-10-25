@@ -670,17 +670,51 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
     process_job_stat(pid).map(|stat| stat.start_time)
 }
 
-/// Process group of `pid` while that same process, matched by its start
-/// token, is alive in the terminal session of the pane shell `shell_pid`.
-/// A stopped or backgrounded job still counts.
-pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
-    let stat = process_job_stat(pid)?;
-    let shell_session = process_job_stat(shell_pid)?.session;
-    (!matches!(stat.state, 'Z' | 'X')
+/// Liveness of `pid`, matched by its start token, in the terminal session of
+/// the pane shell `shell_pid`.
+pub fn pane_process_liveness(
+    shell_pid: u32,
+    pid: u32,
+    start_token: u64,
+) -> super::PaneProcessLiveness {
+    pane_process_liveness_from_stats(
+        read_process_stat(shell_pid),
+        read_process_stat(pid),
+        start_token,
+    )
+}
+
+fn read_process_stat(pid: u32) -> std::io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+}
+
+fn pane_process_liveness_from_stats(
+    shell_stat: std::io::Result<String>,
+    stat: std::io::Result<String>,
+    start_token: u64,
+) -> super::PaneProcessLiveness {
+    use super::PaneProcessLiveness;
+
+    let Some(stat) = stat.ok().as_deref().and_then(process_job_stat_from_stat) else {
+        return PaneProcessLiveness::Gone;
+    };
+    let Some(shell_session) = shell_stat
+        .ok()
+        .as_deref()
+        .and_then(process_job_stat_from_stat)
+        .map(|shell| shell.session)
+    else {
+        return PaneProcessLiveness::Gone;
+    };
+    if !matches!(stat.state, 'Z' | 'X')
         && stat.start_time == start_token
         && stat.session == shell_session
-        && stat.pgrp > 0)
-        .then_some(stat.pgrp as u32)
+        && stat.pgrp > 0
+    {
+        PaneProcessLiveness::Alive(stat.pgrp as u32)
+    } else {
+        PaneProcessLiveness::Gone
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1673,6 +1707,138 @@ mod tests {
             })
         );
         assert_eq!(process_job_stat_from_stat("123 (short) S 1 456 789"), None);
+    }
+
+    const SHELL_SESSION: i32 = 100;
+    const AGENT_GROUP: i32 = 456;
+    const AGENT_START: u64 = 987654;
+
+    fn job_stat(state: char, pgrp: i32, session: i32, start_time: u64) -> std::io::Result<String> {
+        Ok(format!(
+            "21 (agent) {state} 1 {pgrp} {session} 34816 {pgrp} 4194560 1 2 3 4 5 6 7 8 20 0 11 0 {start_time} 0 0"
+        ))
+    }
+
+    fn shell_stat() -> std::io::Result<String> {
+        job_stat('S', SHELL_SESSION, SHELL_SESSION, 1)
+    }
+
+    fn liveness(
+        shell: std::io::Result<String>,
+        agent: std::io::Result<String>,
+    ) -> super::super::PaneProcessLiveness {
+        pane_process_liveness_from_stats(shell, agent, AGENT_START)
+    }
+
+    fn read_error(kind: std::io::ErrorKind) -> std::io::Result<String> {
+        Err(std::io::Error::from(kind))
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_a_stopped_agent_in_the_pane_session_as_alive() {
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                job_stat('T', AGENT_GROUP, SHELL_SESSION, AGENT_START)
+            ),
+            super::super::PaneProcessLiveness::Alive(AGENT_GROUP as u32)
+        );
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_a_missing_agent_as_gone() {
+        use super::super::PaneProcessLiveness::Gone;
+        assert_eq!(
+            liveness(shell_stat(), read_error(std::io::ErrorKind::NotFound)),
+            Gone
+        );
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+            ),
+            Gone,
+            "the process exited during the read"
+        );
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_a_zombie_agent_as_gone() {
+        for state in ['Z', 'X'] {
+            assert_eq!(
+                liveness(
+                    shell_stat(),
+                    job_stat(state, AGENT_GROUP, SHELL_SESSION, AGENT_START)
+                ),
+                super::super::PaneProcessLiveness::Gone
+            );
+        }
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_a_reused_pid_as_gone() {
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                job_stat('S', AGENT_GROUP, SHELL_SESSION, AGENT_START + 1)
+            ),
+            super::super::PaneProcessLiveness::Gone
+        );
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_an_agent_in_another_session_as_gone() {
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                job_stat('S', AGENT_GROUP, SHELL_SESSION + 1, AGENT_START)
+            ),
+            super::super::PaneProcessLiveness::Gone
+        );
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_an_unreadable_agent_stat_as_unknown() {
+        use super::super::PaneProcessLiveness::Unknown;
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                read_error(std::io::ErrorKind::PermissionDenied)
+            ),
+            Unknown
+        );
+        assert_eq!(
+            liveness(
+                shell_stat(),
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            ),
+            Unknown
+        );
+        assert_eq!(
+            liveness(shell_stat(), Ok("21 (agent) S 1 456".to_string())),
+            Unknown,
+            "a truncated stat"
+        );
+        assert_eq!(
+            liveness(shell_stat(), job_stat('S', 0, SHELL_SESSION, AGENT_START)),
+            Unknown,
+            "no process group"
+        );
+    }
+
+    #[test]
+    fn pane_process_liveness_reads_an_unreadable_shell_stat_as_unknown() {
+        use super::super::PaneProcessLiveness::Unknown;
+        let agent = || job_stat('S', AGENT_GROUP, SHELL_SESSION, AGENT_START);
+        assert_eq!(
+            liveness(read_error(std::io::ErrorKind::PermissionDenied), agent()),
+            Unknown
+        );
+        assert_eq!(
+            liveness(read_error(std::io::ErrorKind::NotFound), agent()),
+            Unknown
+        );
+        assert_eq!(liveness(Ok("10 (sh) S 1".to_string()), agent()), Unknown);
     }
 
     #[test]

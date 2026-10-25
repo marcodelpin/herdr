@@ -236,8 +236,12 @@ pub fn process_start_token(_pid: u32) -> Option<u64> {
 }
 
 /// Unsupported platform stub.
-pub fn live_pane_process_group(_shell_pid: u32, _pid: u32, _start_token: u64) -> Option<u32> {
-    None
+pub fn pane_process_liveness(
+    _shell_pid: u32,
+    _pid: u32,
+    _start_token: u64,
+) -> super::PaneProcessLiveness {
+    super::PaneProcessLiveness::Gone
 }
 
 /// Unsupported platform stub.

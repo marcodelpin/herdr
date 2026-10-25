@@ -555,7 +555,12 @@ fn apply_foreground_shell_agent_action(
 /// Process facts used to tell a backgrounded agent from an exited one.
 trait AgentProcessLiveness {
     fn start_token(&self, pid: u32) -> Option<u64>;
-    fn live_process_group(&self, shell_pid: u32, pid: u32, start_token: u64) -> Option<u32>;
+    fn liveness(
+        &self,
+        shell_pid: u32,
+        pid: u32,
+        start_token: u64,
+    ) -> crate::platform::PaneProcessLiveness;
 }
 
 struct PlatformAgentProcesses;
@@ -565,8 +570,13 @@ impl AgentProcessLiveness for PlatformAgentProcesses {
         crate::platform::process_start_token(pid)
     }
 
-    fn live_process_group(&self, shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
-        crate::platform::live_pane_process_group(shell_pid, pid, start_token)
+    fn liveness(
+        &self,
+        shell_pid: u32,
+        pid: u32,
+        start_token: u64,
+    ) -> crate::platform::PaneProcessLiveness {
+        crate::platform::pane_process_liveness(shell_pid, pid, start_token)
     }
 }
 
@@ -606,7 +616,7 @@ fn observe_foreground_agent(
                 && !*foreground_shell_exit_reported,
             observation.shell_pid,
             observation.process_group_id,
-            |shell_pid, pid, start_token| processes.live_process_group(shell_pid, pid, start_token),
+            |shell_pid, pid, start_token| processes.liveness(shell_pid, pid, start_token),
         )
     };
     let action = foreground_shell_agent_action(
@@ -5572,10 +5582,22 @@ mod tests {
         pub(super) const AGENT_PID: u32 = 21;
         const AGENT_START: u64 = 7_000;
 
+        /// `pid -> (start token, process group)`, plus the pids whose read fails.
         #[derive(Default)]
-        pub(super) struct FakeProcesses(RefCell<HashMap<u32, (u64, u32)>>);
+        pub(super) struct FakeProcesses(
+            RefCell<HashMap<u32, (u64, u32)>>,
+            RefCell<std::collections::HashSet<u32>>,
+        );
 
         impl FakeProcesses {
+            pub(super) fn set_unreadable(&self, pid: u32, unreadable: bool) {
+                if unreadable {
+                    self.1.borrow_mut().insert(pid);
+                } else {
+                    self.1.borrow_mut().remove(&pid);
+                }
+            }
+
             pub(super) fn spawn(&self, pid: u32, start_token: u64, group: u32) {
                 self.0.borrow_mut().insert(pid, (start_token, group));
             }
@@ -5593,18 +5615,24 @@ mod tests {
                     .map(|(start_token, _)| *start_token)
             }
 
-            fn live_process_group(
+            fn liveness(
                 &self,
                 shell_pid: u32,
                 pid: u32,
                 start_token: u64,
-            ) -> Option<u32> {
+            ) -> crate::platform::PaneProcessLiveness {
+                use crate::platform::PaneProcessLiveness;
                 assert_eq!(shell_pid, SHELL);
+                if self.1.borrow().contains(&pid) {
+                    return PaneProcessLiveness::Unknown;
+                }
                 self.0
                     .borrow()
                     .get(&pid)
                     .filter(|(token, _)| *token == start_token)
-                    .map(|(_, group)| *group)
+                    .map_or(PaneProcessLiveness::Gone, |(_, group)| {
+                        PaneProcessLiveness::Alive(*group)
+                    })
             }
         }
 
@@ -5717,6 +5745,24 @@ mod tests {
         assert!(!pane.job.in_background());
 
         // A real exit afterwards still reports and clears.
+        pane.processes.exit(held_agent::AGENT_PID);
+        pane.processes.exit(held_agent::WRAPPER_JOB);
+        pane.assert_exit_reported_then_cleared();
+    }
+
+    #[test]
+    fn held_agent_survives_an_unreadable_liveness_read() {
+        let mut pane = held_agent::Pane::with_agent(Agent::Claude);
+        pane.assert_held_while_shell_in_front();
+
+        // The suspended agent lives, but its liveness read fails for a while.
+        pane.processes.set_unreadable(held_agent::AGENT_PID, true);
+        pane.assert_held_while_shell_in_front();
+        assert_eq!(pane.presence.current_agent(), Some(Agent::Claude));
+
+        // Once the read works again, a real exit still reports and clears.
+        pane.processes.set_unreadable(held_agent::AGENT_PID, false);
+        pane.assert_held_while_shell_in_front();
         pane.processes.exit(held_agent::AGENT_PID);
         pane.processes.exit(held_agent::WRAPPER_JOB);
         pane.assert_exit_reported_then_cleared();

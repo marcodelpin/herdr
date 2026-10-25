@@ -921,7 +921,18 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
 /// Process group of `pid` while that same process, matched by its start
 /// token, is alive on the terminal of the pane shell `shell_pid`. A stopped or
 /// backgrounded job still counts.
-pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+pub fn pane_process_liveness(
+    shell_pid: u32,
+    pid: u32,
+    start_token: u64,
+) -> super::PaneProcessLiveness {
+    live_pane_process_group(shell_pid, pid, start_token).map_or(
+        super::PaneProcessLiveness::Gone,
+        super::PaneProcessLiveness::Alive,
+    )
+}
+
+fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
     let process = process_bsdinfo(pid)?;
     let shell = process_bsdinfo(shell_pid)?;
     (process.pbi_status != libc::SZOMB

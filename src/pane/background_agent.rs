@@ -6,6 +6,7 @@
 //! nothing would restore them when it returns.
 
 use crate::detect::Agent;
+use crate::platform::PaneProcessLiveness;
 
 /// Where the process that identified as the current agent is now, when the
 /// foreground probe no longer finds that agent.
@@ -45,14 +46,14 @@ impl AgentJobTracker {
     /// `agent_missing` means the probe lost a current agent whose exit has not
     /// been reported yet. Liveness is checked only then, never per render.
     ///
-    /// `live_group(shell_pid, pid, start_token)` returns the process group of
-    /// that exact process while it is alive in the pane's terminal session.
+    /// `liveness(shell_pid, pid, start_token)` reads that exact process in the
+    /// pane's terminal session.
     pub(super) fn status(
         &self,
         agent_missing: bool,
         shell_pid: u32,
         foreground_group: Option<u32>,
-        live_group: impl FnOnce(u32, u32, u64) -> Option<u32>,
+        liveness: impl FnOnce(u32, u32, u64) -> PaneProcessLiveness,
     ) -> AgentJobStatus {
         if !agent_missing {
             return AgentJobStatus::Unknown;
@@ -60,15 +61,19 @@ impl AgentJobTracker {
         let Some(process) = self.process else {
             return AgentJobStatus::Unknown;
         };
-        match live_group(shell_pid, process.pid, process.start_token) {
+        match liveness(shell_pid, process.pid, process.start_token) {
             // An agent in the shell's own group was never a separate job, and
             // one still in the foreground group is a plain miss.
-            Some(group) if group != shell_pid && Some(group) != foreground_group => {
+            PaneProcessLiveness::Alive(group)
+                if group != shell_pid && Some(group) != foreground_group =>
+            {
                 AgentJobStatus::Background
             }
-            Some(_) => AgentJobStatus::Unknown,
-            None if self.in_background => AgentJobStatus::ExitedInBackground,
-            None => AgentJobStatus::Unknown,
+            PaneProcessLiveness::Alive(_) => AgentJobStatus::Unknown,
+            PaneProcessLiveness::Gone | PaneProcessLiveness::Unknown if self.in_background => {
+                AgentJobStatus::ExitedInBackground
+            }
+            PaneProcessLiveness::Gone | PaneProcessLiveness::Unknown => AgentJobStatus::Unknown,
         }
     }
 
@@ -131,9 +136,57 @@ mod tests {
         tracker
     }
 
-    fn live_agent(shell: u32, pid: u32, start_token: u64) -> Option<u32> {
+    fn live_agent(shell: u32, pid: u32, start_token: u64) -> PaneProcessLiveness {
         assert_eq!(shell, SHELL);
-        (pid == AGENT_PID && start_token == AGENT_START).then_some(WRAPPER_JOB)
+        if pid == AGENT_PID && start_token == AGENT_START {
+            PaneProcessLiveness::Alive(WRAPPER_JOB)
+        } else {
+            PaneProcessLiveness::Gone
+        }
+    }
+
+    fn held(agent: Agent) -> AgentJobTracker {
+        let mut tracker = acquired(agent);
+        let status = tracker.status(true, SHELL, Some(SHELL), live_agent);
+        tracker.observe(status, Some(agent), None, None, |_| None);
+        assert!(tracker.in_background());
+        tracker
+    }
+
+    #[test]
+    fn held_agent_that_is_gone_exited_in_background() {
+        let tracker = held(Agent::Claude);
+
+        assert_eq!(
+            tracker.status(true, SHELL, Some(SHELL), |_, _, _| {
+                PaneProcessLiveness::Gone
+            }),
+            AgentJobStatus::ExitedInBackground
+        );
+    }
+
+    #[test]
+    fn held_agent_with_an_unreadable_liveness_stays_held() {
+        let tracker = held(Agent::Claude);
+
+        assert_eq!(
+            tracker.status(true, SHELL, Some(SHELL), |_, _, _| {
+                PaneProcessLiveness::Unknown
+            }),
+            AgentJobStatus::Background
+        );
+    }
+
+    #[test]
+    fn unheld_agent_with_an_unreadable_liveness_is_unknown() {
+        let tracker = acquired(Agent::Claude);
+
+        assert_eq!(
+            tracker.status(true, SHELL, Some(SHELL), |_, _, _| {
+                PaneProcessLiveness::Unknown
+            }),
+            AgentJobStatus::Unknown
+        );
     }
 
     #[test]
@@ -151,7 +204,9 @@ mod tests {
         let tracker = acquired(Agent::Claude);
 
         assert_eq!(
-            tracker.status(true, SHELL, Some(SHELL), |_, _, _| None),
+            tracker.status(true, SHELL, Some(SHELL), |_, _, _| {
+                PaneProcessLiveness::Gone
+            }),
             AgentJobStatus::Unknown
         );
     }
@@ -159,7 +214,8 @@ mod tests {
     #[test]
     fn liveness_is_only_checked_when_the_agent_went_missing() {
         let tracker = acquired(Agent::Claude);
-        let no_check = |_: u32, _: u32, _: u64| -> Option<u32> { panic!("liveness checked") };
+        let no_check =
+            |_: u32, _: u32, _: u64| -> PaneProcessLiveness { panic!("liveness checked") };
 
         assert_eq!(
             tracker.status(false, SHELL, Some(SHELL), no_check),
@@ -186,7 +242,9 @@ mod tests {
         let tracker = acquired(Agent::Pi);
 
         assert_eq!(
-            tracker.status(true, SHELL, Some(30), |_, _, _| Some(SHELL)),
+            tracker.status(true, SHELL, Some(30), |_, _, _| PaneProcessLiveness::Alive(
+                SHELL
+            )),
             AgentJobStatus::Unknown
         );
     }
@@ -203,7 +261,9 @@ mod tests {
         );
 
         assert_eq!(
-            tracker.status(true, SHELL, Some(SHELL), |_, _, _| Some(WRAPPER_JOB)),
+            tracker.status(true, SHELL, Some(SHELL), |_, _, _| {
+                PaneProcessLiveness::Alive(WRAPPER_JOB)
+            }),
             AgentJobStatus::Unknown
         );
     }
@@ -223,7 +283,11 @@ mod tests {
 
         assert_eq!(
             tracker.status(true, SHELL, Some(SHELL), |_, pid, token| {
-                (pid == AGENT_PID && token == REUSED_START).then_some(WRAPPER_JOB)
+                if pid == AGENT_PID && token == REUSED_START {
+                    PaneProcessLiveness::Alive(WRAPPER_JOB)
+                } else {
+                    PaneProcessLiveness::Gone
+                }
             }),
             AgentJobStatus::Background
         );

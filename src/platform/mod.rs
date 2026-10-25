@@ -422,6 +422,20 @@ mod fallback;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub use fallback::*;
 
+/// What one liveness read proved about a process the pane identified as its
+/// agent. Only `Gone` may end a held agent: a failed read proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneProcessLiveness {
+    /// Alive in the pane's terminal session, in this process group. A stopped
+    /// or backgrounded job still counts.
+    Alive(u32),
+    /// Exited, a zombie, a later process reusing the pid, or a process that
+    /// left the pane's terminal session and so can never return to its front.
+    Gone,
+    /// A read failed or returned a value that proves neither.
+    Unknown,
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {
     if job.process_group_id != child_pid
@@ -626,7 +640,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn live_pane_process_group_rejects_processes_outside_the_pane_session() {
+    fn pane_process_liveness_rejects_processes_outside_the_pane_session() {
         use std::os::unix::process::CommandExt;
 
         let mut detached = std::process::Command::new("sleep");
@@ -645,13 +659,13 @@ mod tests {
         gone.wait().expect("reap");
 
         assert_eq!(
-            live_pane_process_group(std::process::id(), detached.id(), token),
-            None,
+            pane_process_liveness(std::process::id(), detached.id(), token),
+            PaneProcessLiveness::Gone,
             "a live process in another terminal session"
         );
         assert_eq!(
-            live_pane_process_group(gone_pid, detached.id(), token),
-            None,
+            pane_process_liveness(gone_pid, detached.id(), token),
+            PaneProcessLiveness::Gone,
             "a pane shell that is gone"
         );
         let _ = detached.kill();
@@ -660,7 +674,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn live_pane_process_group_follows_the_agent_process_not_its_job() {
+    fn pane_process_liveness_follows_the_agent_process_not_its_job() {
         use std::os::unix::process::CommandExt;
 
         let shell_pid = std::process::id();
@@ -680,42 +694,45 @@ mod tests {
         let wrapper_token = process_start_token(job).expect("wrapper start token");
 
         assert_eq!(
-            live_pane_process_group(shell_pid, agent_pid, token),
-            Some(job)
+            pane_process_liveness(shell_pid, agent_pid, token),
+            PaneProcessLiveness::Alive(job)
         );
         assert_eq!(
-            live_pane_process_group(shell_pid, agent_pid, token + 1),
-            None,
+            pane_process_liveness(shell_pid, agent_pid, token + 1),
+            PaneProcessLiveness::Gone,
             "a reused pid has a different start token"
         );
         unsafe {
             libc::kill(agent_pid as libc::pid_t, libc::SIGSTOP);
         }
         assert_eq!(
-            live_pane_process_group(shell_pid, agent_pid, token),
-            Some(job)
+            pane_process_liveness(shell_pid, agent_pid, token),
+            PaneProcessLiveness::Alive(job)
         );
 
         unsafe {
             libc::kill(agent_pid as libc::pid_t, libc::SIGKILL);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while live_pane_process_group(shell_pid, agent_pid, token).is_some()
+        while pane_process_liveness(shell_pid, agent_pid, token) != PaneProcessLiveness::Gone
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(
-            live_pane_process_group(shell_pid, agent_pid, token),
-            None,
+            pane_process_liveness(shell_pid, agent_pid, token),
+            PaneProcessLiveness::Gone,
             "an unreaped agent must not count as alive while its wrapper lives"
         );
         assert_eq!(
-            live_pane_process_group(shell_pid, job, wrapper_token),
-            Some(job)
+            pane_process_liveness(shell_pid, job, wrapper_token),
+            PaneProcessLiveness::Alive(job)
         );
         agent.wait().expect("reap agent");
-        assert_eq!(live_pane_process_group(shell_pid, agent_pid, token), None);
+        assert_eq!(
+            pane_process_liveness(shell_pid, agent_pid, token),
+            PaneProcessLiveness::Gone
+        );
         let _ = wrapper.kill();
         let _ = wrapper.wait();
     }

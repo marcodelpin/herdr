@@ -1807,7 +1807,18 @@ pub fn process_start_token(pid: u32) -> Option<u64> {
 /// Returns `pid` while that same process, matched by its creation time, is
 /// still running for the pane shell `shell_pid`. Windows has no job control,
 /// so the process stands in for its own group.
-pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+pub fn pane_process_liveness(
+    shell_pid: u32,
+    pid: u32,
+    start_token: u64,
+) -> super::PaneProcessLiveness {
+    live_pane_process_group(shell_pid, pid, start_token).map_or(
+        super::PaneProcessLiveness::Gone,
+        super::PaneProcessLiveness::Alive,
+    )
+}
+
+fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
     let identity = ProcessIdentity::open(pid)?;
     if !identity.running() || identity.creation_time() != Some(start_token) {
         return None;
