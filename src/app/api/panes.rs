@@ -1578,6 +1578,14 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        // A report the state setter drops by that rule changes nothing, so the
+        // API records neither its sequence nor its resume command (codex
+        // c1o5-r2 P2).
+        let dropped_by_named_agent_rule =
+            !crate::agent_resume::is_reserved_native_state_source(&params.source, &agent_label)
+                && self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
+                    terminal.named_agent_rule_drops(&params.source, &agent_label, named_agent)
+                });
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             named_agent,
             pane_id,
@@ -1588,8 +1596,9 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
-        let applied =
-            report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        let applied = report_is_newer
+            && !dropped_by_named_agent_rule
+            && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1615,7 +1624,7 @@ impl App {
             carrier_pid: params.carrier_pid,
             carrier_start: params.carrier_start,
         };
-        if report.agent_pid.is_none() {
+        if report.agent_pid.is_none() || report.agent_start.is_none() {
             return crate::terminal::NamedAgentVerdict::Unnamed;
         }
         let pane_terminal = self

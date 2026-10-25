@@ -787,16 +787,8 @@ impl TerminalState {
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
-        // herdr-c1o5: a recorded exit of agent X drops a report for X unless
-        // the report names an agent process that is alive: a live process is
-        // not the exited one, and a report naming none may be its late report
-        // (upstream e608a751).
-        if !crate::detect::full_lifecycle_hook_authority(&source, &agent_label)
-            && named_agent.witnessed_at().is_none()
-            && self.recent_agent_process_exit.is_some_and(|exit| {
-                crate::detect::parse_agent_label(&agent_label) == Some(exit.agent)
-            })
-        {
+        // herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]).
+        if self.named_agent_rule_drops(&source, &agent_label, named_agent) {
             return None;
         }
         let reanchor_sequence = match self.route_full_lifecycle_hook_report(
@@ -884,7 +876,7 @@ impl TerminalState {
             agent_label,
             state,
             message,
-            reported_at: now,
+            reported_at: named_agent.witnessed_at().unwrap_or(now),
             session_ref,
             named_agent_witnessed: named_agent.witnessed_at().is_some(),
         });
@@ -913,15 +905,44 @@ impl TerminalState {
             .is_none_or(|authority| authority.reported_at <= observed_at)
     }
 
-    /// herdr-c1o5: an authority from a report naming a live agent process,
-    /// accepted at or after the recorded exit of the agent it names, belongs
-    /// to another process than the exited one (ADR-0008 amendment 2026-10-24,
-    /// round 2): the exited agent leaving the foreground does not clear it.
+    /// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): whether
+    /// a `pane.report_agent` report is dropped by the rule on the agent
+    /// process it names. A refuted report is dropped. While a recorded exit
+    /// names the report's agent, a report without full-lifecycle authority is
+    /// dropped unless it was witnessed after that exit: a report naming none
+    /// may be the exited agent's late report (upstream e608a751). The API
+    /// layer asks the same question before it records the report's sequence
+    /// or resume command, so a dropped report changes nothing.
+    pub fn named_agent_rule_drops(
+        &self,
+        source: &str,
+        agent_label: &str,
+        named_agent: NamedAgentVerdict,
+    ) -> bool {
+        if crate::detect::session_identity_only_integration(source, agent_label) {
+            return false;
+        }
+        if named_agent == NamedAgentVerdict::Refuted {
+            return true;
+        }
+        !crate::detect::full_lifecycle_hook_authority(source, agent_label)
+            && self.recent_agent_process_exit.is_some_and(|exit| {
+                crate::detect::parse_agent_label(agent_label) == Some(exit.agent)
+                    && named_agent
+                        .witnessed_at()
+                        .is_none_or(|observed_at| observed_at <= exit.observed_at)
+            })
+    }
+
+    /// herdr-c1o5: an authority witnessed after the recorded exit of the agent
+    /// it names belongs to another process than the exited one (ADR-0008
+    /// amendment 2026-10-25, round-cap exit a]): the exited agent leaving the
+    /// foreground does not clear it.
     fn authority_outlived_exited_agent(&self, authority: &HookAuthority) -> bool {
         authority.named_agent_witnessed
             && self.recent_agent_process_exit.is_some_and(|exit| {
                 crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
-                    && exit.observed_at <= authority.reported_at
+                    && exit.observed_at < authority.reported_at
             })
     }
 
