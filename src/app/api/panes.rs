@@ -4590,11 +4590,16 @@ mod tests {
             .is_empty());
     }
 
-    /// herdr-jht1: a native Claude exits in the pane, then the tmux bridge
-    /// reports the Claude the pane shows, a process its shell did not start;
-    /// `witnessed` says whether the report names that process (herdr-c1o5).
-    /// Returns the app, the public pane id and the pane's terminal id.
-    fn app_with_exited_claude_then_bridge_report(
+    const BRIDGE_CLAUDE_SOURCE: &str = "tmux-bridge:claude-0123456789ab";
+
+    /// herdr-jht1: a native Claude exits in the pane, then `source` reports
+    /// `agent_label` as the agent the pane shows (the tmux bridge: a process
+    /// its shell did not start); `witnessed` says whether the report names
+    /// that process (herdr-c1o5). Returns the app, the public pane id and the
+    /// pane's terminal id.
+    fn app_with_exited_claude_then_report(
+        source: &str,
+        agent_label: &str,
         witnessed: bool,
     ) -> (App, String, crate::terminal::TerminalId) {
         let (mut app, pane_id) = app_with_test_workspace();
@@ -4636,8 +4641,8 @@ mod tests {
             );
         }
         terminal.set_hook_authority_naming_agent_at(
-            "tmux-bridge:claude-0123456789ab".into(),
-            "claude".into(),
+            source.into(),
+            agent_label.into(),
             AgentState::Idle,
             None,
             None,
@@ -4669,7 +4674,8 @@ mod tests {
     // source stays dropped.
     #[test]
     fn pane_metadata_naming_an_exited_agent_applies_once_a_later_witness_holds_the_pane() {
-        let (mut app, pane_id, terminal_id) = app_with_exited_claude_then_bridge_report(true);
+        let (mut app, pane_id, terminal_id) =
+            app_with_exited_claude_then_report(BRIDGE_CLAUDE_SOURCE, "claude", true);
         assert_eq!(
             app.state.terminals[&terminal_id].effective_agent_label(),
             Some("claude")
@@ -4706,7 +4712,8 @@ mod tests {
     // herdr-ccwait's tokens naming claude stay dropped.
     #[test]
     fn pane_metadata_naming_an_exited_agent_stays_dropped_without_a_later_witness() {
-        let (mut app, pane_id, terminal_id) = app_with_exited_claude_then_bridge_report(false);
+        let (mut app, pane_id, terminal_id) =
+            app_with_exited_claude_then_report(BRIDGE_CLAUDE_SOURCE, "claude", false);
 
         let response = app.handle_pane_report_metadata(
             "ccwait".into(),
@@ -4717,6 +4724,119 @@ mod tests {
         let terminal = &app.state.terminals[&terminal_id];
         assert!(terminal.metadata_tokens.values().is_empty());
         assert!(terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)));
+    }
+
+    // herdr-jht1 (codex jht1-r1 P3): an authority witnessed after the exit
+    // supersedes it only when it names the exited agent. A later codex
+    // authority holds the pane, so herdr-ccwait's tokens naming claude still
+    // describe the exited Claude and stay dropped.
+    #[test]
+    fn pane_metadata_naming_an_exited_agent_stays_dropped_under_a_later_witness_of_another_agent() {
+        let (mut app, pane_id, terminal_id) =
+            app_with_exited_claude_then_report("custom:codex", "codex", true);
+        assert_eq!(
+            app.state.terminals[&terminal_id].effective_agent_label(),
+            Some("codex")
+        );
+
+        let response = app.handle_pane_report_metadata(
+            "ccwait".into(),
+            ccwait_tokens_params(pane_id, "herdr:ccwait", "2.1.300 exited"),
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.metadata_tokens.values().is_empty());
+        assert!(terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)));
+    }
+
+    // herdr-jht1 (codex jht1-r1 P2): the native Claude exits at t1, the
+    // bridge's Claude is witnessed at t2 > t1 and its ccwait tokens apply,
+    // and only then does the detector deliver the exit stamped t1. The exit is
+    // superseded on arrival, so the ccwait watermark, newer than the exit,
+    // survives it: a delayed lower-seq report of the exited Claude stays
+    // dropped instead of overwriting the live Claude's tokens.
+    #[test]
+    fn pane_metadata_watermark_newer_than_a_superseded_exit_survives_its_late_delivery() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        // Past instants: every report below is accepted after all of them.
+        let detected_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(30))
+            .unwrap();
+        let exit_at = detected_at + std::time::Duration::from_millis(10);
+        let witnessed_at = detected_at + std::time::Duration::from_millis(20);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            detected_at,
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            BRIDGE_CLAUDE_SOURCE.into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(1),
+            crate::terminal::NamedAgentVerdict::Witnessed {
+                observed_at: witnessed_at,
+            },
+            witnessed_at,
+        );
+        let mut live = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.300 live");
+        live.seq = Some(200);
+        let response = app.handle_pane_report_metadata("live".into(), live);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                true,
+                exit_at,
+            );
+        let mut late = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.299 exited");
+        late.seq = Some(100);
+        let response = app.handle_pane_report_metadata("late".into(), late);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        // The exit record stands: the exited Claude's own source is dropped.
+        let response = app.handle_pane_report_metadata(
+            "official".into(),
+            ccwait_tokens_params(pane_id, "herdr:claude", "exited"),
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            (
+                terminal.effective_agent_label(),
+                terminal.metadata_tokens.values(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(200)),
+                terminal.metadata_report_sequence_is_fresh("herdr:claude", Some(1)),
+            ),
+            (
+                Some("claude"),
+                std::collections::HashMap::from([("ver_acct".into(), "2.1.300 live".into())]),
+                false,
+                true,
+            )
+        );
     }
 
     #[test]
