@@ -2393,6 +2393,88 @@ mod tests {
         );
     }
 
+    // herdr-3iee premise (ADR-0008 round 7, rule 18): pi Blocked, published at
+    // seq 4, is released over a deferred Claude Blocked. The release changes
+    // the subject, not the state, so the snapshot keeps seq 4; what it carries
+    // under that seq is Claude, Blocked, and no completion of pi's that a
+    // client acknowledgement of seq 4 could hide.
+    #[test]
+    fn a_release_restoring_a_blocked_agent_over_a_blocked_one_keeps_seq_and_blocked() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("release-blocked-over-blocked");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        // pi's Blocked as published: the seq the operator's client acknowledges.
+        app.state.next_agent_state_change_seq = 4;
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(5);
+        let t2 = t0 + std::time::Duration::from_millis(10);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            crate::terminal::NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.last_agent_state_change_seq = Some(4);
+        terminal.set_detected_agent_process_at(Agent::Claude, t0);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Blocked,
+            true,
+            false,
+            false,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+
+        let updates = app.handle_internal_event_with_pane_updates(AppEvent::HookAgentReleased {
+            pane_id,
+            source: "custom:pi".into(),
+            agent_label: "pi".into(),
+            known_agent: Some(Agent::Pi),
+            seq: Some(2),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        let snapshot = app.session_metadata_snapshot();
+        let [agent] = snapshot.agents.as_slice() else {
+            panic!("one agent: {:?}", snapshot.agents);
+        };
+        assert_eq!(
+            (
+                agent.agent.as_deref(),
+                agent.agent_status,
+                agent.state_change_seq,
+                agent.completion_seq,
+            ),
+            (
+                Some("claude"),
+                crate::api::schema::AgentStatus::Blocked,
+                4,
+                None
+            )
+        );
+    }
+
     // ADR-0008 round 7, rule 19: a release that leaves no agent publishes what
     // upstream publishes - the released agent with its final status, and the
     // pane's status under the released agent.
