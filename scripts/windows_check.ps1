@@ -14,23 +14,13 @@ function Invoke-Checked {
     }
 }
 
-function Invoke-CargoWithZigCacheRecovery {
-    param([string[]]$Arguments)
-
-    & cargo @Arguments
-    if ($LASTEXITCODE -eq 0) {
-        return
-    }
-
-    Write-Warning "cargo compile failed; clearing Zig build caches and retrying once"
-    Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
-    Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
-    Invoke-Checked cargo $Arguments
-}
-
+# Fork change (bd herdr-zs55, ADR-0020 amendment 1 in the herdr-AGENT wrapper): every cargo
+# command runs once. Only the zig-fetch-retry prefetch, which the workflows run before this
+# script, retries a transient Zig package download; a failed clippy is a verdict and is never
+# run again, so no build output is classified here.
+# Offline suite: scripts/test_windows_check.sh.
 Invoke-Checked cargo @("fmt", "--check")
-Invoke-CargoWithZigCacheRecovery @(
+Invoke-Checked cargo @(
     "clippy",
     "--all-targets",
     "--locked",

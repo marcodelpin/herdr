@@ -111,6 +111,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            self.host_shutdown_intent.get(),
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -349,6 +350,12 @@ impl HeadlessServer {
 
         // Reject only the requests already queued when shutdown reached cleanup.
         self.reject_queued_api_requests_for_shutdown();
+
+        // The loop handles no more requests. Stop admitting API connections and
+        // let every accepted one finish with its reply or an explicit error.
+        if let Some(api_server) = &self.api_server {
+            api_server.drain_for_shutdown();
+        }
 
         // Close all client connections.
         let staged_files = self

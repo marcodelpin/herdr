@@ -23,6 +23,71 @@ pub struct HookAuthority {
     #[serde(skip, default = "Instant::now")]
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    /// herdr-c1o5: when the API layer witnessed the agent process the report
+    /// named (ADR-0008 amendment 2026-10-25, round-cap exit a]). An unnamed
+    /// successor of the same source and session keeps it (round 5, rule 15),
+    /// so it can be older than `reported_at`. Never serialized: a restored or
+    /// handed-off authority names no live process.
+    #[serde(skip)]
+    pub witnessed_at: Option<Instant>,
+}
+
+/// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): the API
+/// layer's verdict on the agent process a `pane.report_agent` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedAgentVerdict {
+    /// The report names no agent process.
+    Unnamed,
+    /// The named process is not the claimed agent shown in this pane.
+    Refuted,
+    /// The named process is the claimed agent shown in this pane. It was
+    /// alive at `observed_at`, an instant taken before the first read.
+    Witnessed { observed_at: Instant },
+}
+
+/// herdr-c1o5 (ADR-0008 round 3, rule 13), the ordering rule: an observation
+/// made at `observed_at`, before `witness`, says nothing about the process
+/// herdr saw alive at the witness. No witness orders nothing.
+fn observed_before(observed_at: Instant, witness: Option<Instant>) -> bool {
+    witness.is_some_and(|witness| observed_at < witness)
+}
+
+/// herdr-c1o5 (ADR-0008 round 5, rule 15, amended in round 6): the witness a
+/// report naming no process keeps from the authority it replaces, live or
+/// buffered, when that authority has the same source and agent, and the same
+/// session where the report names one.
+fn inherited_witness(
+    previous: Option<&HookAuthority>,
+    source: &str,
+    agent_label: &str,
+    session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+) -> Option<Instant> {
+    previous
+        .filter(|previous| {
+            previous.source == source
+                && previous.agent_label == agent_label
+                && session_ref
+                    .is_none_or(|session_ref| previous.session_ref.as_ref() == Some(session_ref))
+        })
+        .and_then(|previous| previous.witnessed_at)
+}
+
+impl HookAuthority {
+    /// herdr-c1o5 (ADR-0008 round 3, rule 13): an observation made at
+    /// `observed_at` predates this authority's witness, so it never removes,
+    /// replaces, clears or hides this authority.
+    fn observed_before_witness(&self, observed_at: Instant) -> bool {
+        observed_before(observed_at, self.witnessed_at)
+    }
+}
+
+impl NamedAgentVerdict {
+    pub fn witnessed_at(self) -> Option<Instant> {
+        match self {
+            Self::Witnessed { observed_at } => Some(observed_at),
+            Self::Unnamed | Self::Refuted => None,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -106,7 +171,61 @@ pub(crate) struct TerminalTitleChange {
 pub struct TerminalStateMutation {
     pub effective_state_change: Option<EffectiveStateChange>,
     pub session_ref_changed: bool,
-    pub agent_released: bool,
+    /// ADR-0002, herdr-ct9 (P2-d): whether the persisted agent session's
+    /// `cwd` itself changed on this call, independent of
+    /// `session_ref_changed`. The two can disagree - a v10 -> v11 hook
+    /// upgrade can report the SAME session id (identity unchanged) with a
+    /// cwd for the first time - and only the site that actually writes
+    /// `TerminalState::persisted_agent_session`
+    /// (`set_agent_session_ref_for_session_start_with_reporter`) ever sets
+    /// this to anything but `false`. The caller must OR it into its own
+    /// persistence-dirty decision alongside `session_ref_changed`, or a
+    /// cwd-only update never gets saved.
+    pub persisted_agent_session_cwd_changed: bool,
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the agent this mutation
+    /// released, named where the release happens.
+    pub release: Option<AgentRelease>,
+}
+
+/// herdr-c1o5 (ADR-0008 round 7, rule 19): the agent a release ends and the
+/// state it leaves for that agent; the publisher reads it as is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRelease {
+    pub agent_label: Option<String>,
+    pub known_agent: Option<Agent>,
+    pub final_state: AgentState,
+}
+
+impl TerminalStateMutation {
+    pub fn agent_released(&self) -> bool {
+        self.release.is_some()
+    }
+
+    /// ADR-0008 round 4, consumer 4: two mutations made for one observation,
+    /// reported as one.
+    fn followed_by(self, next: Self) -> Self {
+        let effective_state_change =
+            match (self.effective_state_change, next.effective_state_change) {
+                (Some(first), Some(second)) => (first.previous_agent_label != second.agent_label
+                    || first.previous_state != second.state
+                    || first.previous_presentation != second.presentation)
+                    .then_some(EffectiveStateChange {
+                        previous_agent_label: first.previous_agent_label,
+                        previous_known_agent: first.previous_known_agent,
+                        previous_state: first.previous_state,
+                        previous_presentation: first.previous_presentation,
+                        ..second
+                    }),
+                (first, second) => second.or(first),
+            };
+        Self {
+            effective_state_change,
+            session_ref_changed: self.session_ref_changed || next.session_ref_changed,
+            persisted_agent_session_cwd_changed: self.persisted_agent_session_cwd_changed
+                || next.persisted_agent_session_cwd_changed,
+            release: self.release.or(next.release),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +238,19 @@ struct AgentNameOwner {
 struct RecentAgentProcessExit {
     agent: Agent,
     observed_at: Instant,
+}
+
+/// ADR-0008 round 4, consumer 3: the latest detector observation rule 13 did
+/// not apply, older than the live witness. The producer believes it published
+/// it and publishes on change only, so herdr applies it once no witness
+/// predates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredDetection {
+    agent: Option<Agent>,
+    fallback_state: AgentState,
+    visible_blocker: bool,
+    observed_at: Instant,
+    acquisition: bool,
 }
 
 /// Pure state for a server-owned terminal.
@@ -136,6 +268,11 @@ pub struct TerminalState {
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
+    /// The agent's own reported cwd (herdr-ct9) travels INSIDE this value's
+    /// `cwd` field, not as a sibling `TerminalState` field - see the doc
+    /// comment on `agent_resume::PersistedAgentSession` for why. `None`
+    /// when the current session was never reported with a cwd (old client,
+    /// managed launch, or a restore whose snapshot predates this field).
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
@@ -159,6 +296,7 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
+    deferred_detection: Option<DeferredDetection>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
@@ -199,6 +337,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
+            deferred_detection: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
@@ -212,7 +351,7 @@ impl TerminalState {
     ) -> TerminalStateMutation {
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
-            && !self.detected_state_observed_before_release_suppression(Some(agent), now);
+            && !self.detection_predates_current_state(Some(agent), now);
         let mutation = self.set_detected_state_with_screen_signals_at(
             Some(agent),
             AgentState::Unknown,
@@ -222,6 +361,14 @@ impl TerminalState {
             false,
             now,
         );
+        // ADR-0008 round 4, consumer 3: a deferred acquisition stays one.
+        if let Some(deferred) = self
+            .deferred_detection
+            .as_mut()
+            .filter(|deferred| deferred.observed_at == now && deferred.agent == Some(agent))
+        {
+            deferred.acquisition = true;
+        }
         if starts_acquisition {
             self.codex_prompt_ready = false;
             self.agent_process_acquisition_pending = true;
@@ -244,6 +391,7 @@ impl TerminalState {
 
     #[cfg(unix)]
     pub(crate) fn restore_handoff_agent_state(&mut self, snapshot: HandoffAgentState) {
+        self.deferred_detection = None;
         if let Some(sequence) = snapshot.sequence {
             self.hook_report_sequences
                 .insert(snapshot.authority.source.clone(), sequence);
@@ -366,25 +514,56 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
+        // ADR-0008 round 4, consumer 4: an observation without the agent of a
+        // witness-held authority, made at or after its witness, is the exit of
+        // the witnessed process that the producer could not report.
+        if !process_exited && agent.is_none() {
+            if let Some(held_agent) = self.witness_held_agent_unseen_at(now) {
+                let exit = self.set_detected_state_with_screen_signals_at(
+                    Some(held_agent),
+                    AgentState::Unknown,
+                    false,
+                    false,
+                    false,
+                    true,
+                    now,
+                );
+                let observation = self.set_detected_state_with_screen_signals_at(
+                    agent,
+                    fallback_state,
+                    visible_blocker,
+                    false,
+                    false,
+                    false,
+                    now,
+                );
+                return exit.followed_by(observation);
+            }
+        }
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
-        let newer_custom_authority = process_exited
+        // ADR-0008 round 3, rule 13, item 1: an authority this exit cannot
+        // clear, witnessed after it or (upstream) a custom-source report
+        // applied after it.
+        let authority_outlives_exit = process_exited
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 crate::detect::parse_agent_label(&authority.agent_label) == agent
-                    && !crate::agent_resume::is_official_agent_source(
-                        &authority.source,
-                        &authority.agent_label,
-                    )
-                    && authority.reported_at > now
+                    && (authority.observed_before_witness(now)
+                        || (!crate::agent_resume::is_official_agent_source(
+                            &authority.source,
+                            &authority.agent_label,
+                        ) && authority.reported_at > now))
             });
         let agent_released = process_exited
-            && !newer_custom_authority
+            && !authority_outlives_exit
             && (previous_agent_label.is_some() || self.agent_name.is_some());
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
+            // A newer observation supersedes a deferred one.
+            self.deferred_detection = None;
             if self
                 .hook_authority
                 .as_ref()
@@ -403,7 +582,8 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
-                agent_released: false,
+                persisted_agent_session_cwd_changed: false,
+                release: None,
             };
         }
         let replacement_process_detected = !process_exited
@@ -411,7 +591,21 @@ impl TerminalState {
             && self
                 .recent_agent_process_exit
                 .is_some_and(|exit| Some(exit.agent) == agent && exit.observed_at < now);
-        if !process_exited && self.detected_state_observed_before_release_suppression(agent, now) {
+        if !process_exited && self.detection_predates_current_state(agent, now) {
+            // ADR-0008 round 4, consumer 3: a detection older than the live
+            // witness is deferred, not dropped; one older than a release
+            // suppression is dropped (upstream). Round 5, rule 16: either way
+            // it takes the deferred one.
+            let previous_deferred = self.deferred_detection.take();
+            if !self.detected_state_observed_before_release_suppression(agent, now) {
+                self.defer_detection(
+                    previous_deferred,
+                    agent,
+                    fallback_state,
+                    visible_blocker,
+                    now,
+                );
+            }
             return TerminalStateMutation {
                 effective_state_change: self.recompute_effective_state(
                     previous_agent_label,
@@ -422,9 +616,12 @@ impl TerminalState {
                 ),
                 session_ref_changed: previous_session
                     != self.current_session_identity_for_persistence(),
-                agent_released: false,
+                persisted_agent_session_cwd_changed: false,
+                release: None,
             };
         }
+        // A newer observation or an exit supersedes a deferred one.
+        self.deferred_detection = None;
         self.detected_agent = agent;
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
@@ -459,10 +656,22 @@ impl TerminalState {
         if process_exited {
             let mut reset_sources = Vec::new();
             let mut stale_sessions = Vec::new();
+            let mut kept_sources = Vec::new();
             for (source, suppressed) in &mut self.suppressed_full_lifecycle_hook_reports {
                 if crate::detect::parse_agent_label(&suppressed.agent_label) != agent
                     || suppressed.reason == FullLifecycleHookSuppressionReason::HookClear
                 {
+                    continue;
+                }
+                // ADR-0008 round 3, rule 13, item 3: an entry whose buffered
+                // authority was witnessed after this exit keeps it, with the
+                // replacement session and the watermark it is released by.
+                if suppressed
+                    .pending_replacement_report
+                    .as_ref()
+                    .is_some_and(|pending| pending.authority.observed_before_witness(now))
+                {
+                    kept_sources.push(source.clone());
                     continue;
                 }
                 let exited_session_ref = suppressed
@@ -498,39 +707,39 @@ impl TerminalState {
                 self.hook_report_sequences.remove(&source);
             }
 
-            let official_session = self
-                .hook_authority
-                .as_ref()
-                .filter(|authority| {
-                    crate::agent_resume::is_official_agent_source(
-                        &authority.source,
-                        &authority.agent_label,
-                    ) && crate::detect::parse_agent_label(&authority.agent_label) == agent
-                })
-                .map(|authority| {
-                    (
-                        authority.source.clone(),
-                        authority.agent_label.clone(),
-                        authority.session_ref.clone(),
-                    )
-                })
-                .or_else(|| {
-                    self.persisted_agent_session.as_ref().and_then(|session| {
-                        (crate::agent_resume::is_official_agent_source(
-                            &session.source,
-                            &session.agent,
-                        ) && crate::detect::parse_agent_label(&session.agent) == agent)
-                            .then(|| {
-                                (
-                                    session.source.clone(),
-                                    session.agent.clone(),
-                                    Some(session.session_ref.clone()),
-                                )
-                            })
-                    })
-                });
+            let official_authority = self.hook_authority.as_ref().filter(|authority| {
+                crate::agent_resume::is_official_agent_source(
+                    &authority.source,
+                    &authority.agent_label,
+                ) && crate::detect::parse_agent_label(&authority.agent_label) == agent
+            });
+            // ADR-0008 round 3, rule 13, item 2: the source of a surviving
+            // official authority is not suppressed.
+            let official_session = match official_authority {
+                Some(_) if authority_outlives_exit => None,
+                Some(authority) => Some((
+                    authority.source.clone(),
+                    authority.agent_label.clone(),
+                    authority.session_ref.clone(),
+                )),
+                None => self.persisted_agent_session.as_ref().and_then(|session| {
+                    (crate::agent_resume::is_official_agent_source(&session.source, &session.agent)
+                        && crate::detect::parse_agent_label(&session.agent) == agent)
+                        .then(|| {
+                            (
+                                session.source.clone(),
+                                session.agent.clone(),
+                                Some(session.session_ref.clone()),
+                            )
+                        })
+                }),
+            };
             if let Some((source, agent_label, session_ref)) = official_session {
-                self.hook_report_sequences.remove(&source);
+                // ADR-0008 round 4, consumer 2: a kept entry keeps the
+                // watermark it is released by.
+                if !kept_sources.contains(&source) {
+                    self.hook_report_sequences.remove(&source);
+                }
                 self.suppress_full_lifecycle_hook_report_with_session_ref(
                     source,
                     agent_label,
@@ -541,14 +750,16 @@ impl TerminalState {
             }
             let cleared_hook_source = self.hook_authority.as_ref().and_then(|authority| {
                 (crate::detect::parse_agent_label(&authority.agent_label) == agent
-                    && !newer_custom_authority)
+                    && !authority_outlives_exit)
                     .then(|| authority.source.clone())
             });
             if let Some(source) = cleared_hook_source {
-                self.hook_report_sequences.remove(&source);
+                if !kept_sources.contains(&source) {
+                    self.hook_report_sequences.remove(&source);
+                }
                 self.hook_authority = None;
             }
-            if !newer_custom_authority
+            if !authority_outlives_exit
                 && self
                     .persisted_agent_session
                     .as_ref()
@@ -558,7 +769,7 @@ impl TerminalState {
             {
                 self.persisted_agent_session = None;
             }
-            if !newer_custom_authority
+            if !authority_outlives_exit
                 && agent.is_some()
                 && self
                     .reported_resume
@@ -614,6 +825,7 @@ impl TerminalState {
                     && self.hook_authority.as_ref().is_some_and(|authority| {
                         crate::detect::parse_agent_label(&authority.agent_label)
                             == previous_detected_agent
+                            && !self.authority_outlived_exited_agent(authority)
                     })))
         {
             let durable_session = self.hook_authority.as_ref().and_then(|authority| {
@@ -622,6 +834,7 @@ impl TerminalState {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         session_ref: session_ref.clone(),
+                        cwd: None,
                     }
                 })
             });
@@ -639,6 +852,8 @@ impl TerminalState {
         if agent.is_none() && self.recent_agent_process_exit.is_some() {
             self.clear_agent_name();
         }
+        let released_agent =
+            agent_released.then(|| (previous_agent_label.clone(), previous_known_agent));
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
@@ -653,7 +868,9 @@ impl TerminalState {
             effective_state_change,
             session_ref_changed: previous_session
                 != self.current_session_identity_for_persistence(),
-            agent_released,
+            persisted_agent_session_cwd_changed: false,
+            release: released_agent
+                .map(|(agent_label, known_agent)| self.release_of(agent_label, known_agent)),
         }
     }
 
@@ -678,6 +895,7 @@ impl TerminalState {
         .and_then(|mutation| mutation.effective_state_change)
     }
 
+    #[cfg(test)]
     pub fn set_hook_authority_with_session_ref(
         &mut self,
         source: String,
@@ -698,6 +916,7 @@ impl TerminalState {
         )
     }
 
+    #[cfg(test)]
     pub fn set_hook_authority_at(
         &mut self,
         source: String,
@@ -708,16 +927,40 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        self.set_hook_authority_naming_agent_at(
+            source,
+            agent_label,
+            state,
+            message,
+            session_ref,
+            seq,
+            NamedAgentVerdict::Unnamed,
+            now,
+        )
+    }
+
+    /// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): a
+    /// report with the API layer's verdict on the agent process it names.
+    #[allow(clippy::too_many_arguments)] // one report's fields plus its verdict
+    pub fn set_hook_authority_naming_agent_at(
+        &mut self,
+        source: String,
+        agent_label: String,
+        state: AgentState,
+        message: Option<String>,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        named_agent: NamedAgentVerdict,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
         if crate::detect::session_identity_only_integration(&source, &agent_label) {
             return None;
         }
-        if !crate::detect::full_lifecycle_hook_authority(&source, &agent_label)
-            && self.recent_agent_process_exit.is_some_and(|exit| {
-                crate::detect::parse_agent_label(&agent_label) == Some(exit.agent)
-            })
-        {
+        // herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]).
+        if self.named_agent_rule_drops(&source, &agent_label, named_agent) {
             return None;
         }
+        // ADR-0008 round 2, rule 12: a buffered report keeps its witness.
         let reanchor_sequence = match self.route_full_lifecycle_hook_report(
             &source,
             &agent_label,
@@ -725,21 +968,13 @@ impl TerminalState {
             message.as_deref(),
             &session_ref,
             seq,
-            now,
+            named_agent.witnessed_at().unwrap_or(now),
+            named_agent.witnessed_at(),
         ) {
             FullLifecycleHookReportRoute::Accept { reanchor_sequence } => reanchor_sequence,
             FullLifecycleHookReportRoute::Ignore => return None,
         };
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
-            return None;
-        }
-        if (source.as_str(), agent_label.as_str()) == ("herdr:codex", "codex")
-            && session_ref.as_ref().is_some_and(|incoming| {
-                self.current_session_identity_for_persistence().is_some_and(
-                    |(_, _, kind, value)| kind != incoming.kind || value != incoming.value,
-                )
-            })
-        {
             return None;
         }
         let owner_conflicts = self.current_session_owner_conflicts(&source, &agent_label);
@@ -760,8 +995,14 @@ impl TerminalState {
             ) {
                 session_ref
             } else {
-                self.conflicting_same_owner_session_ref(&source, &agent_label, &session_ref, None)
-                    .unwrap_or(session_ref)
+                self.conflicting_same_owner_session_ref(
+                    &source,
+                    &agent_label,
+                    &session_ref,
+                    None,
+                    None,
+                )
+                .unwrap_or(session_ref)
             }
         });
         if self.live_full_lifecycle_hook_authority_conflicts_with_session(
@@ -800,16 +1041,26 @@ impl TerminalState {
                 }
             }
         }
+        // ADR-0008 round 5, rule 15: a report of the same source and session
+        // naming no process keeps the witness of the authority it replaces.
+        let witnessed_at = named_agent.witnessed_at().or_else(|| {
+            inherited_witness(
+                self.hook_authority.as_ref(),
+                &source,
+                &agent_label,
+                session_ref.as_ref(),
+            )
+        });
         self.persisted_agent_session = None;
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
             state,
             message,
-            reported_at: now,
+            reported_at: named_agent.witnessed_at().unwrap_or(now),
             session_ref,
+            witnessed_at,
         });
-        let current_session = self.current_session_identity_for_persistence();
         let effective_state_change = self.recompute_effective_state(
             previous_agent_label,
             previous_known_agent,
@@ -820,10 +1071,13 @@ impl TerminalState {
         if state == AgentState::Working && self.state == AgentState::Working {
             self.agent_process_acquisition_pending = false;
         }
+        // ADR-0008 round 5, rule 17: measured after the replay.
+        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change,
             session_ref_changed: previous_session != current_session,
-            agent_released: false,
+            persisted_agent_session_cwd_changed: false,
+            release: None,
         })
     }
 
@@ -831,6 +1085,166 @@ impl TerminalState {
         self.hook_authority
             .as_ref()
             .is_none_or(|authority| authority.reported_at <= observed_at)
+    }
+
+    /// herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): whether
+    /// a `pane.report_agent` report is dropped by the rule on the agent
+    /// process it names. A refuted report is dropped. While a recorded exit
+    /// names the report's agent, a report without full-lifecycle authority is
+    /// dropped unless it was witnessed after that exit: a report naming none
+    /// may be the exited agent's late report (upstream e608a751). The API
+    /// layer asks the same question before it records the report's sequence
+    /// or resume command, so a dropped report changes nothing.
+    pub fn named_agent_rule_drops(
+        &self,
+        source: &str,
+        agent_label: &str,
+        named_agent: NamedAgentVerdict,
+    ) -> bool {
+        // ADR-0008 round 2, rule 11: a refuted report is dropped for every
+        // source.
+        if named_agent == NamedAgentVerdict::Refuted {
+            return true;
+        }
+        if crate::detect::session_identity_only_integration(source, agent_label) {
+            return false;
+        }
+        !crate::detect::full_lifecycle_hook_authority(source, agent_label)
+            && self.recent_agent_process_exit.is_some_and(|exit| {
+                crate::detect::parse_agent_label(agent_label) == Some(exit.agent)
+                    && !observed_before(exit.observed_at, named_agent.witnessed_at())
+            })
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 2, rule 11): the gate the API and the state
+    /// setters both ask. A reserved native-state source records only its
+    /// session, so only a refuted verdict drops it; every other source is
+    /// judged by `named_agent_rule_drops`.
+    pub fn report_dropped_by_named_agent_rule(
+        &self,
+        source: &str,
+        agent_label: &str,
+        named_agent: NamedAgentVerdict,
+    ) -> bool {
+        if crate::agent_resume::is_reserved_native_state_source(source, agent_label) {
+            return named_agent == NamedAgentVerdict::Refuted;
+        }
+        self.named_agent_rule_drops(source, agent_label, named_agent)
+    }
+
+    /// herdr-c1o5: an authority witnessed after the recorded exit of the agent
+    /// it names belongs to another process than the exited one (ADR-0008
+    /// amendment 2026-10-25, round-cap exit a]): the exited agent leaving the
+    /// foreground does not clear it.
+    fn authority_outlived_exited_agent(&self, authority: &HookAuthority) -> bool {
+        self.recent_agent_process_exit.is_some_and(|exit| {
+            crate::detect::parse_agent_label(&authority.agent_label) == Some(exit.agent)
+                && authority.observed_before_witness(exit.observed_at)
+        })
+    }
+
+    /// ADR-0008 round 4, rule 14: the recorded exit is superseded, the live
+    /// authority naming its agent having been witnessed after it.
+    fn recorded_exit_superseded(&self) -> bool {
+        self.hook_authority
+            .as_ref()
+            .is_some_and(|authority| self.authority_outlived_exited_agent(authority))
+    }
+
+    /// ADR-0008 round 4, consumer 5: the detector saw `agent` and no exit
+    /// stands against it; an exit superseded by the live witness does not, for
+    /// the live authority's source only (round 5, rule 15).
+    fn agent_process_present(&self, source: &str, agent: Option<Agent>) -> bool {
+        agent.is_some()
+            && self.detected_agent == agent
+            && (self.recent_agent_process_exit.is_none()
+                || (self.recorded_exit_superseded()
+                    && self
+                        .hook_authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.source == source)))
+    }
+
+    /// ADR-0008 round 4: a full-lifecycle authority held by its witness alone,
+    /// the detector not having seen its process since the recorded exit. It
+    /// does not silence the detector.
+    fn full_lifecycle_authority_held_by_witness(&self) -> bool {
+        self.recorded_exit_superseded()
+            && self.hook_authority.as_ref().is_some_and(|authority| {
+                crate::detect::full_lifecycle_hook_authority(
+                    &authority.source,
+                    &authority.agent_label,
+                )
+            })
+    }
+
+    /// The agent of a witness-held authority, when `observed_at` is not before
+    /// its witness.
+    fn witness_held_agent_unseen_at(&self, observed_at: Instant) -> Option<Agent> {
+        if !self.full_lifecycle_authority_held_by_witness() {
+            return None;
+        }
+        self.hook_authority
+            .as_ref()
+            .filter(|authority| !authority.observed_before_witness(observed_at))
+            .and_then(|authority| crate::detect::parse_agent_label(&authority.agent_label))
+    }
+
+    fn defer_detection(
+        &mut self,
+        previous: Option<DeferredDetection>,
+        agent: Option<Agent>,
+        fallback_state: AgentState,
+        visible_blocker: bool,
+        observed_at: Instant,
+    ) {
+        let acquisition =
+            previous.is_some_and(|deferred| deferred.acquisition && deferred.agent == agent);
+        self.deferred_detection = Some(DeferredDetection {
+            agent,
+            fallback_state,
+            visible_blocker,
+            observed_at,
+            acquisition,
+        });
+    }
+
+    /// ADR-0008 round 4, the way back of consumer 3: the deferred detection is
+    /// applied with its own observation time once no live witness predates
+    /// it, and dropped when a release suppression is newer than it.
+    fn replay_deferred_detection(&mut self) {
+        let Some(deferred) = self.deferred_detection else {
+            return;
+        };
+        if self
+            .hook_authority
+            .as_ref()
+            .is_some_and(|authority| authority.observed_before_witness(deferred.observed_at))
+        {
+            return;
+        }
+        self.deferred_detection = None;
+        if self.detected_state_observed_before_release_suppression(
+            deferred.agent,
+            deferred.observed_at,
+        ) {
+            return;
+        }
+        if deferred.acquisition
+            && !self.should_ignore_detected_state_under_full_lifecycle_hook(deferred.agent, false)
+        {
+            self.codex_prompt_ready = false;
+            self.agent_process_acquisition_pending = true;
+        }
+        self.set_detected_state_with_screen_signals_at(
+            deferred.agent,
+            deferred.fallback_state,
+            deferred.visible_blocker,
+            false,
+            false,
+            false,
+            deferred.observed_at,
+        );
     }
 
     fn fallback_not_older_than_hook(&self) -> bool {
@@ -856,6 +1270,7 @@ impl TerminalState {
         process_exited: bool,
     ) -> bool {
         self.live_full_lifecycle_hook_authority()
+            && !self.full_lifecycle_authority_held_by_witness()
             && !process_exited
             && !self.hook_authority_conflicts_with_detected_agent(detected_agent)
     }
@@ -895,27 +1310,6 @@ impl TerminalState {
         }
     }
 
-    fn suppress_full_lifecycle_hook_report(
-        &mut self,
-        source: &str,
-        agent_label: &str,
-        reason: FullLifecycleHookSuppressionReason,
-    ) {
-        if crate::detect::full_lifecycle_hook_authority(source, agent_label) {
-            let session_ref = self
-                .hook_authority
-                .as_ref()
-                .and_then(|authority| authority.session_ref.clone());
-            self.suppress_full_lifecycle_hook_report_with_session_ref(
-                source.to_string(),
-                agent_label.to_string(),
-                session_ref,
-                reason,
-                Instant::now(),
-            );
-        }
-    }
-
     fn suppress_full_lifecycle_hook_report_with_session_ref(
         &mut self,
         source: String,
@@ -924,6 +1318,23 @@ impl TerminalState {
         reason: FullLifecycleHookSuppressionReason,
         observed_at: Instant,
     ) {
+        // ADR-0008 round 3, rule 13, item 4: the buffered authority of the entry
+        // this replaces survives a suppression older than its witness, with the
+        // replacement session it is released by.
+        let (replacement_session_ref, pending_replacement_report) = self
+            .suppressed_full_lifecycle_hook_reports
+            .remove(&source)
+            .and_then(|replaced| {
+                let pending = replaced
+                    .pending_replacement_report
+                    .filter(|pending| pending.authority.observed_before_witness(observed_at))?;
+                let replacement_session_ref =
+                    replaced.replacement_session_ref.filter(|session_ref| {
+                        pending.authority.session_ref.as_ref() == Some(session_ref)
+                    });
+                Some((replacement_session_ref, Some(pending)))
+            })
+            .unwrap_or((None, None));
         self.suppressed_full_lifecycle_hook_reports.insert(
             source,
             SuppressedFullLifecycleHookReport {
@@ -931,12 +1342,13 @@ impl TerminalState {
                 session_ref,
                 observed_at,
                 reason,
-                replacement_session_ref: None,
-                pending_replacement_report: None,
+                replacement_session_ref,
+                pending_replacement_report,
             },
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // one report's fields plus its witness
     fn route_full_lifecycle_hook_report(
         &mut self,
         source: &str,
@@ -946,6 +1358,7 @@ impl TerminalState {
         session_ref: &Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         reported_at: Instant,
+        witnessed_at: Option<Instant>,
     ) -> FullLifecycleHookReportRoute {
         if !crate::detect::full_lifecycle_hook_authority(source, agent_label) {
             return FullLifecycleHookReportRoute::Accept {
@@ -957,9 +1370,7 @@ impl TerminalState {
         }
 
         let known_agent = crate::detect::parse_agent_label(agent_label);
-        let process_present = known_agent.is_some()
-            && self.detected_agent == known_agent
-            && self.recent_agent_process_exit.is_none();
+        let process_present = self.agent_process_present(source, known_agent);
         let anchored_session_ref = self
             .hook_authority
             .as_ref()
@@ -1054,8 +1465,22 @@ impl TerminalState {
             .as_ref()
             .is_none_or(|pending| seq > pending.seq);
         if replace_pending {
+            // ADR-0008 round 6, rule 15 amended: an unnamed successor of the
+            // buffered authority keeps its witness, as one of the live one does.
+            let witnessed_at = witnessed_at.or_else(|| {
+                inherited_witness(
+                    suppressed
+                        .pending_replacement_report
+                        .as_ref()
+                        .map(|pending| &pending.authority),
+                    source,
+                    agent_label,
+                    Some(&session_ref),
+                )
+            });
             suppressed.pending_replacement_report = Some(PendingFullLifecycleHookReport {
                 authority: HookAuthority {
+                    witnessed_at,
                     source: source.to_string(),
                     agent_label: agent_label.to_string(),
                     state,
@@ -1229,19 +1654,37 @@ impl TerminalState {
                 stale_session.session_ref,
             );
         }
+        // ADR-0008 round 4, consumer 4: the live authority keeps its watermark.
+        let live_source = self
+            .hook_authority
+            .as_ref()
+            .map(|authority| authority.source.clone());
         self.hook_report_sequences.retain(|source, _| {
             validated_replacement_sessions
                 .iter()
                 .any(|(validated_source, _, _, _)| validated_source == source)
+                || live_source.as_deref() == Some(source.as_str())
                 || !crate::detect::full_lifecycle_hook_authority(source, detected_label)
         });
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+            // codex ar-r3 (P2 #2): this INSTALLS a session for whichever
+            // agent was just (re)detected, unconditionally replacing
+            // whatever `persisted_agent_session` held before - which, before
+            // ADR-0002's amendment, could be a DIFFERENT agent's session
+            // still carrying the sibling `persisted_agent_session_cwd`
+            // field, silently pairing that stale cwd with this new session.
+            // Embedding `cwd` in the session value itself (rather than a
+            // field this constructor has no reason to know about) makes
+            // that impossible: this buffered/replayed report never carried
+            // a cwd of its own, so `None` here is not an omission, it is
+            // the only value the type lets it be.
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
                 agent: agent_label,
                 session_ref,
+                cwd: None,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
@@ -1290,6 +1733,21 @@ impl TerminalState {
         if remove_source {
             self.stale_full_lifecycle_hook_sessions.remove(source);
         }
+    }
+
+    /// A detection, not an exit, older than the state it would change is not
+    /// applied: older than a release suppression (upstream), or older than the
+    /// live authority's witness (ADR-0008 round 3, rule 13, item 5).
+    fn detection_predates_current_state(
+        &self,
+        detected_agent: Option<Agent>,
+        observed_at: Instant,
+    ) -> bool {
+        self.detected_state_observed_before_release_suppression(detected_agent, observed_at)
+            || self
+                .hook_authority
+                .as_ref()
+                .is_some_and(|authority| authority.observed_before_witness(observed_at))
     }
 
     fn detected_state_observed_before_release_suppression(
@@ -1350,6 +1808,7 @@ impl TerminalState {
         agent_label: &str,
         session_ref: &crate::agent_resume::AgentSessionRef,
         session_start_source: Option<&str>,
+        reporter_is_foreground: Option<bool>,
     ) -> Option<crate::agent_resume::AgentSessionRef> {
         self.current_session_identity_for_persistence().and_then(
             |(current_source, current_agent, current_kind, current_value)| {
@@ -1362,6 +1821,7 @@ impl TerminalState {
                         source,
                         agent_label,
                         session_start_source,
+                        reporter_is_foreground,
                     ))
                 .then_some(crate::agent_resume::AgentSessionRef {
                     kind: current_kind,
@@ -1391,11 +1851,48 @@ impl TerminalState {
                 })
     }
 
+    /// herdr-3ir: whether the reporter is known NOT to be the pane's
+    /// foreground process group for a `herdr:claude` report - the report
+    /// came from a nested, non-interactive worker (e.g. a headless
+    /// `claude -p` run from inside the pane's own Bash tool), not the
+    /// session the operator is looking at. `reporter_is_foreground` is
+    /// computed by the caller from the reporter's own pid (ADR-0002);
+    /// `None` (old client, Windows, or a vanished pid) fails open to
+    /// today's behavior.
+    ///
+    /// Extracted to a single named predicate (P2-c, herdr-3ir/4r8/ct9 fix
+    /// round) so `session_report_allows_session_replacement` below and the
+    /// pre-seq-watermark gate in
+    /// `set_agent_session_ref_for_session_start_with_reporter` share ONE
+    /// implementation rather than two independently-maintained copies of
+    /// the same rule - a duplicate would let one drift from the other, and
+    /// would make a mutation to either copy alone fail to prove the OTHER
+    /// is load-bearing.
+    pub(crate) fn claude_report_rejected_for_non_foreground_reporter(
+        source: &str,
+        agent_label: &str,
+        reporter_is_foreground: Option<bool>,
+    ) -> bool {
+        (source, agent_label) == ("herdr:claude", "claude") && reporter_is_foreground == Some(false)
+    }
+
+    /// herdr-3ir: a `herdr:claude` report that would replace the pane's
+    /// persisted session is refused when the reporter is known NOT to be the
+    /// pane's foreground process group - see
+    /// `claude_report_rejected_for_non_foreground_reporter` above.
     fn session_report_allows_session_replacement(
         source: &str,
         agent_label: &str,
         session_start_source: Option<&str>,
+        reporter_is_foreground: Option<bool>,
     ) -> bool {
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            source,
+            agent_label,
+            reporter_is_foreground,
+        ) {
+            return false;
+        }
         matches!(
             (source, agent_label, session_start_source),
             (
@@ -1442,6 +1939,10 @@ impl TerminalState {
             == ("herdr:opencode", "opencode", Some("select"), None)
     }
 
+    /// The one setter for `persisted_agent_session` - `session.cwd` already
+    /// carries whatever cwd (if any) belongs to it (ADR-0002, herdr-ct9
+    /// amendment), so there is nothing left for a caller to pass or forget
+    /// separately.
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
@@ -1449,10 +1950,15 @@ impl TerminalState {
         self.persisted_agent_session = Some(session);
     }
 
+    /// A managed launch (herdr itself starting a NEW agent process, not
+    /// resuming one) never carries a resume cwd of its own - force it to
+    /// `None` regardless of what the caller passed, so `persisted_agent_session`
+    /// and `managed_agent_launch_session` cannot silently disagree.
     pub fn set_managed_agent_launch_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        let session = session.with_cwd(None);
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
     }
@@ -1475,11 +1981,38 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        self.set_agent_session_ref_for_session_start_with_reporter(
+            source,
+            agent_label,
+            session_ref,
+            seq,
+            session_start_source,
+            None,
+            None,
+        )
+    }
+
+    /// Same contract as `set_agent_session_ref_for_session_start`, plus the
+    /// two ADR-0002 inputs a plain hook/CLI report never carries:
+    /// `reporter_is_foreground` (herdr-3ir - `None` fails open exactly like
+    /// the 5-arg form above) and `agent_session_cwd` (herdr-ct9 - persisted
+    /// alongside the session ref whenever this call actually replaces it).
+    /// This is the variant the real `pane.report_agent_session` API path
+    /// calls; the 5-arg form stays the stable entry point every existing
+    /// caller (tests included) already uses.
+    pub fn set_agent_session_ref_for_session_start_with_reporter(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+        reporter_is_foreground: Option<bool>,
+        agent_session_cwd: Option<String>,
+    ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
-        let process_present = known_agent.is_some()
-            && self.detected_agent == known_agent
-            && self.recent_agent_process_exit.is_none();
+        let process_present = self.agent_process_present(&source, known_agent);
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
         let generation_gated = self
@@ -1582,7 +2115,7 @@ impl TerminalState {
 
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
-                let current_session = self.current_session_identity_for_persistence();
+                // ADR-0008 round 5, rule 17: measured after the replay.
                 return Some(TerminalStateMutation {
                     effective_state_change: self.recompute_effective_state(
                         previous_agent_label,
@@ -1591,10 +2124,52 @@ impl TerminalState {
                         previous_presentation,
                         now,
                     ),
-                    session_ref_changed: previous_session != current_session,
-                    agent_released: false,
+                    session_ref_changed: previous_session
+                        != self.current_session_identity_for_persistence(),
+                    persisted_agent_session_cwd_changed: false,
+                    release: None,
                 });
             }
+            return None;
+        }
+        // P2-c (herdr-3ir/4r8/ct9 fix round, ADR-0002 amendment): checked
+        // BEFORE the seq freshness check below and before ANY state
+        // mutation, so a report the herdr-3ir foreground gate is about to
+        // reject never advances the per-source seq watermark and never
+        // touches the session ref or its cwd - unconditionally, regardless
+        // of whether this report's session id happens to match the pane's
+        // current one.
+        //
+        // codex ar-r3 (P2 #1): the ORIGINAL fix here only rejected when the
+        // reported session id DIFFERED from the pane's current one
+        // (`same_owner_session_ref_differs`), on the theory that a same-id
+        // report changes nothing worth blocking. That missed the cwd: a
+        // nested `claude -p --resume <same-id>` worker started in a
+        // DIFFERENT directory still reaches this function with the SAME
+        // session id and its OWN `agent_session_cwd`, and the pre-amendment
+        // code fell through to the unconditional
+        // `self.persisted_agent_session_cwd = agent_session_cwd` assignment
+        // further down, silently overwriting the interactive pane's cwd
+        // with the worker's. Rejecting the WHOLE report - identity and cwd
+        // together - closes that hole; there is no case where a
+        // non-foreground `herdr:claude` reporter should be allowed to move
+        // either.
+        //
+        // Shares `claude_report_rejected_for_non_foreground_reporter` with
+        // `session_report_allows_session_replacement` below (ONE predicate,
+        // not two), so this is the EXACT clause that can make THIS report
+        // the reason for its own rejection - every OTHER rejection reason
+        // (in particular an unrecognized `session_start_source` on a
+        // same-owner, differing-value report) is unchanged and still
+        // advances the watermark via the normal `accept_hook_report` call
+        // right below; see
+        // `different_same_agent_session_ref_is_ignored_until_current_session_clears`,
+        // which depends on exactly that and would otherwise regress.
+        if Self::claude_report_rejected_for_non_foreground_reporter(
+            &source,
+            &agent_label,
+            reporter_is_foreground,
+        ) {
             return None;
         }
         if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
@@ -1607,6 +2182,7 @@ impl TerminalState {
             &source,
             &agent_label,
             session_start_source.as_deref(),
+            reporter_is_foreground,
         );
         let replacing_identity_only_session =
             crate::detect::session_identity_only_integration(&source, &agent_label)
@@ -1640,6 +2216,7 @@ impl TerminalState {
                 &agent_label,
                 &session_ref,
                 session_start_source.as_deref(),
+                reporter_is_foreground,
             )
             .is_some()
         {
@@ -1660,16 +2237,13 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        if (source.as_str(), agent_label.as_str()) == ("herdr:codex", "codex")
-            && session_replacement_allowed
-            && self.hook_authority.as_ref().is_some_and(|authority| {
-                authority.source == source
-                    && authority.agent_label == agent_label
-                    && authority.session_ref.as_ref() != Some(&session_ref)
-            })
-        {
-            self.hook_authority = None;
-        }
+        // P2-d: captured so the mutation can report a cwd-only change even
+        // when the session identity itself did not move (see the new field's
+        // doc comment on `TerminalStateMutation`).
+        let previous_persisted_agent_session_cwd = self
+            .persisted_agent_session
+            .as_ref()
+            .and_then(|session| session.cwd.clone());
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -1687,12 +2261,20 @@ impl TerminalState {
             self.hook_authority = None;
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+        // ADR-0002, herdr-ct9 amendment: `cwd` travels IN the session value
+        // itself, set in the SAME assignment as the rest of its identity -
+        // there is no separate field left to forget.
         let persisted_session = crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
             session_ref,
+            cwd: agent_session_cwd,
         };
-        if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
+        if self
+            .managed_agent_launch_session
+            .as_ref()
+            .is_some_and(|launch_session| launch_session.same_identity(&persisted_session))
+        {
             self.managed_agent_launch_session = None;
         }
         self.persisted_agent_session = Some(persisted_session);
@@ -1701,6 +2283,12 @@ impl TerminalState {
             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
             self.agent_process_acquisition_pending = true;
         }
+        let current_persisted_agent_session_cwd = self
+            .persisted_agent_session
+            .as_ref()
+            .and_then(|session| session.cwd.clone());
+        let persisted_agent_session_cwd_changed =
+            previous_persisted_agent_session_cwd != current_persisted_agent_session_cwd;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1709,8 +2297,11 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
-            agent_released: false,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed,
+            release: None,
         })
     }
 
@@ -1822,8 +2413,11 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session.is_some(),
-            agent_released: false,
+            // ADR-0008 round 5, rule 17: and what the replay installed.
+            session_ref_changed: previous_session.is_some()
+                || previous_session != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed: false,
+            release: None,
         })
     }
 
@@ -1847,39 +2441,63 @@ impl TerminalState {
         if !self.accept_hook_report(source, seq) {
             return None;
         }
-        let preserve_foreign_persisted_session = self
-            .persisted_agent_session
-            .as_ref()
-            .is_some_and(|session| session.source != source || session.agent != agent_label);
-        let process_owns_agent =
-            crate::detect::parse_agent_label(agent_label).is_some_and(|agent| {
-                self.detected_agent == Some(agent) && self.recent_agent_process_exit.is_none()
-            });
-
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        self.suppress_full_lifecycle_hook_report(
-            source,
-            agent_label,
-            FullLifecycleHookSuppressionReason::HookClear,
-        );
+        // ADR-0008 round 5, rule 17: the detection the released authority's
+        // witness held back is applied first, and an authority of the released
+        // source it installs is released too; ownership is then decided from
+        // the detector view, as upstream.
+        let released_session_ref = self
+            .hook_authority
+            .take()
+            .and_then(|authority| authority.session_ref);
+        self.replay_deferred_detection();
+        if self
+            .hook_authority
+            .as_ref()
+            .is_some_and(|authority| authority.source == source)
+        {
+            self.hook_authority = None;
+        }
+        let preserve_foreign_persisted_session = self
+            .persisted_agent_session
+            .as_ref()
+            .is_some_and(|session| session.source != source || session.agent != agent_label);
+        let released_agent = crate::detect::parse_agent_label(agent_label);
+        let process_owns_agent =
+            released_agent.is_some_and(|agent| self.agent_process_present(source, Some(agent)));
+        // ADR-0008 round 6, rule 18: a release speaks for the released agent
+        // only; the detector's view of another agent, standing or replayed,
+        // stays.
+        let detector_shows_other_agent = self
+            .detected_agent
+            .is_some_and(|detected| Some(detected) != released_agent);
+        if crate::detect::full_lifecycle_hook_authority(source, agent_label) {
+            self.suppress_full_lifecycle_hook_report_with_session_ref(
+                source.to_string(),
+                agent_label.to_string(),
+                released_session_ref,
+                FullLifecycleHookSuppressionReason::HookClear,
+                Instant::now(),
+            );
+        }
         if !process_owns_agent {
-            self.detected_agent = None;
-            self.fallback_state = AgentState::Unknown;
-            self.fallback_visible_blocker = false;
-            self.fallback_observed_at = None;
+            if !detector_shows_other_agent {
+                self.detected_agent = None;
+                self.fallback_state = AgentState::Unknown;
+                self.fallback_visible_blocker = false;
+                self.fallback_observed_at = None;
+            }
             self.clear_agent_name();
         }
-        self.hook_authority = None;
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
         }
-        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1888,9 +2506,33 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
-            agent_released: !process_owns_agent,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed: false,
+            release: (!process_owns_agent)
+                .then(|| self.release_of(Some(agent_label.to_string()), released_agent)),
         })
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the release of the named agent
+    /// as this state leaves it. Its final state is the pane's while the
+    /// released agent is still the effective one or no agent is, and Unknown
+    /// when another agent is effective.
+    fn release_of(&self, agent_label: Option<String>, known_agent: Option<Agent>) -> AgentRelease {
+        let final_state = if self
+            .effective_agent_label()
+            .is_none_or(|effective| Some(effective) == agent_label.as_deref())
+        {
+            self.state
+        } else {
+            AgentState::Unknown
+        };
+        AgentRelease {
+            agent_label,
+            known_agent,
+            final_state,
+        }
     }
 
     /// A reporter that Herdr cannot also identify by process holds this pane,
@@ -1916,6 +2558,10 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let released_label = self
+            .hook_authority
+            .as_ref()
+            .map(|authority| authority.agent_label.clone());
         self.hook_authority = None;
         self.set_reported_resume(None);
         self.detected_agent = None;
@@ -1923,7 +2569,6 @@ impl TerminalState {
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
         self.clear_agent_name();
-        let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1932,8 +2577,18 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
-            agent_released: true,
+            // ADR-0008 round 5, rule 17: measured after the replay.
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
+            persisted_agent_session_cwd_changed: false,
+            release: Some(
+                self.release_of(
+                    released_label.clone(),
+                    released_label
+                        .as_deref()
+                        .and_then(crate::detect::parse_agent_label),
+                ),
+            ),
         })
     }
 
@@ -2051,7 +2706,12 @@ impl TerminalState {
     fn hook_authority_is_effective(&self, authority: &HookAuthority) -> bool {
         !crate::detect::full_lifecycle_hook_authority(&authority.source, &authority.agent_label)
             || crate::detect::parse_agent_label(&authority.agent_label).is_none_or(|agent| {
-                self.detected_agent == Some(agent) && self.recent_agent_process_exit.is_none()
+                // ADR-0008 round 3, rule 13, item 7: an exit observed before
+                // the witness does not hide the authority.
+                self.detected_agent == Some(agent)
+                    && self
+                        .recent_agent_process_exit
+                        .is_none_or(|exit| authority.observed_before_witness(exit.observed_at))
             })
     }
 
@@ -2090,8 +2750,11 @@ impl TerminalState {
         }
     }
 
+    /// Whether the detector is silenced: a witness-held authority does not
+    /// silence it (ADR-0008 round 4), so the producer keeps publishing.
     pub fn full_lifecycle_hook_authority_active(&self) -> bool {
         self.live_full_lifecycle_hook_authority()
+            && !self.full_lifecycle_authority_held_by_witness()
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {
@@ -2334,7 +2997,11 @@ impl TerminalState {
             .managed_agent_launch_session
             .take()
             .as_ref()
-            .is_some_and(|session| self.persisted_agent_session.as_ref() == Some(session))
+            .is_some_and(|session| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .is_some_and(|current| current.same_identity(session))
+            })
         {
             self.persisted_agent_session = None;
         }
@@ -2344,6 +3011,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.deferred_detection = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -2428,6 +3096,9 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
+        // ADR-0008 round 4: every mutation ends here, so a deferred detection
+        // no witness predates any more is applied first.
+        self.replay_deferred_detection();
         let state = if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else {
@@ -2477,6 +3148,443 @@ mod tests {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
     }
 
+    // herdr-3ir (ADR-0002): a `herdr:claude` report that would replace the
+    // pane's persisted session is refused when the reporter is known not to
+    // be the pane's foreground process group. `reporter_is_foreground` is
+    // computed by the API layer from the reporter's own pid, never inside
+    // `TerminalState` itself - these tests pass it in directly.
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_pane_foreground_replaces_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a foreground reporter's resume report should replace the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_resume_report_from_non_foreground_reporter_is_rejected() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // This is the measured incident: a nested `claude -p` worker (a
+        // child in its own process group) fires the same SessionStart hook
+        // and reports its own headless session id with session_start_source
+        // "resume". It must not overwrite the pane's interactive session.
+        let mutation = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(21),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+
+        assert!(
+            mutation.is_none(),
+            "a nested worker's resume report must not replace the pane's session"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_without_agent_pid_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // The 5-arg entry point every existing caller uses (an old client
+        // with no pid plumbing, or any non-claude report) has no reporter
+        // identity to give at all - it must keep replacing the session
+        // exactly as before this fix.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+            )
+            .expect("a report with no reporter pid should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    #[test]
+    fn agent_restore_3ir_report_reporter_pid_unresolvable_keeps_todays_behavior() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // The caller sent an agent_pid, but resolving it (or the pane's own
+        // foreground group) failed - e.g. the pid raced and exited between
+        // the report and the lookup, or this build is Windows. The API
+        // layer reduces that to `None`, same as no pid at all: fail open.
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("headless-session"),
+                Some(21),
+                Some("resume".into()),
+                None,
+                None,
+            )
+            .expect("an unresolvable reporter should keep replacing the session");
+
+        assert!(mutation.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("headless-session")
+        );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-c: a report REJECTED by the
+    // herdr-3ir foreground gate must not commit its seq to the per-source
+    // watermark - otherwise its (higher) seq can starve a legitimate,
+    // lower-seq report that was simply delayed and arrives afterwards.
+    #[test]
+    fn agent_restore_p2c_rejected_report_does_not_starve_a_later_lower_seq_foreground_report() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: None,
+        });
+
+        // A non-foreground (nested worker) report arrives FIRST, with a
+        // HIGHER seq than the legitimate foreground report still in flight,
+        // and is correctly rejected by the herdr-3ir gate.
+        let rejected = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("headless-session"),
+            Some(201),
+            Some("resume".into()),
+            Some(false),
+            None,
+        );
+        assert!(
+            rejected.is_none(),
+            "the non-foreground report must still be rejected"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("interactive-session"),
+            "a rejected report must not replace the session"
+        );
+
+        // The legitimate foreground report, delayed, arrives afterwards with
+        // a LOWER seq than the report just rejected. Before this fix, the
+        // rejected report's seq=201 was already committed to the watermark
+        // (accept_hook_report ran before the foreground gate), so this
+        // seq=200 report would fail the staleness check (200 <= 201) and be
+        // silently dropped - exactly the failure this test guards against.
+        let accepted = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("foreground-session"),
+                Some(200),
+                Some("resume".into()),
+                Some(true),
+                None,
+            )
+            .expect("a rejected report must not consume the seq a later legitimate report needs");
+
+        assert!(accepted.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("foreground-session")
+        );
+    }
+
+    // ADR-0002 amendment, codex ar-r3 P2 #1: a NESTED, non-foreground
+    // `claude -p --resume <same-id>` worker reports the pane's OWN session
+    // id (not a different one) from a DIFFERENT cwd. Before the amendment
+    // the herdr-3ir gate only rejected when the reported id DIFFERED from
+    // the pane's current one, so this exact report fell through, advanced
+    // the seq watermark, and overwrote the interactive session's cwd with
+    // the worker's - even though the session "didn't change". The gate must
+    // reject the WHOLE report, cwd included, and must not touch the
+    // watermark either, so a delayed lower-seq foreground report (e.g. a
+    // `/clear`) still lands.
+    #[test]
+    fn agent_restore_p2c_amendment_same_id_non_foreground_report_leaves_cwd_and_watermark_unchanged(
+    ) {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("interactive-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+
+        // Same session id as the pane's own, higher seq, but from a nested
+        // non-foreground worker reporting a DIFFERENT cwd.
+        let rejected = terminal.set_agent_session_ref_for_session_start_with_reporter(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("interactive-session"),
+            Some(301),
+            Some("resume".into()),
+            Some(false),
+            Some("/worker-cwd".into()),
+        );
+        assert!(
+            rejected.is_none(),
+            "a same-id report from a non-foreground reporter must still be rejected"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/project-a"),
+            "the rejected report must not move the cwd, even though the session id matched"
+        );
+
+        // A delayed, legitimate foreground report (e.g. `/clear`) with a
+        // LOWER seq than the rejected one must still be accepted - proving
+        // the rejected report never touched the watermark.
+        let accepted = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("cleared-session"),
+                Some(300),
+                Some("clear".into()),
+                Some(true),
+                Some("/project-a".into()),
+            )
+            .expect("a same-id rejection must not consume the seq a later legitimate report needs");
+        assert!(accepted.session_ref_changed);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("cleared-session")
+        );
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-d: the SAME session id is reported
+    // again, this time carrying a cwd for the first time (the shape of a
+    // v10 -> v11 hook upgrade's first post-upgrade report). The session
+    // identity does not change, but the cwd does, and the mutation must say
+    // so through its OWN field rather than only through `session_ref_changed`.
+    #[test]
+    fn agent_restore_p2d_cwd_only_change_sets_its_own_changed_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
+        });
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone()),
+            None
+        );
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("a same-identity report with a new cwd must still be accepted");
+
+        assert!(
+            !mutation.session_ref_changed,
+            "the session identity did not change"
+        );
+        assert!(
+            mutation.persisted_agent_session_cwd_changed,
+            "the cwd DID change and must be reported so a caller can persist it"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/work/project")
+        );
+    }
+
+    // The mirror: neither the identity nor the cwd changes - both flags stay
+    // false, so an unrelated re-report of unchanged state never marks the
+    // session dirty.
+    #[test]
+    fn agent_restore_p2d_unchanged_cwd_does_not_set_the_flag() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/work/project".into()),
+        });
+
+        let mutation = terminal
+            .set_agent_session_ref_for_session_start_with_reporter(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(2),
+                Some("resume".into()),
+                Some(true),
+                Some("/work/project".into()),
+            )
+            .expect("an unchanged report should still be accepted");
+
+        assert!(!mutation.session_ref_changed);
+        assert!(!mutation.persisted_agent_session_cwd_changed);
+    }
+
+    // ADR-0002 amendment, codex ar-r3 P2 #2: Claude reports a session with a
+    // cwd, then exits; Mastracode's OWN SessionStart hook had ALREADY fired
+    // (a common race - the hook can run before herdr's screen detection
+    // confirms the new agent), so its session sat buffered as a
+    // `replacement_session_ref` while Claude was still nominally detected.
+    // Once Mastracode is detected on screen, the buffered report is
+    // installed via `clear_full_lifecycle_hook_suppression_for_detected_agent`
+    // - which, before the amendment, replaced `persisted_agent_session`
+    // (Claude's, already cleared to `None` by its own exit) but left the
+    // SIBLING `persisted_agent_session_cwd` field untouched, so Claude's
+    // "/project-a" silently became Mastracode's cwd. With `cwd` embedded in
+    // the session value there is no sibling field left to forget: the new
+    // session must have `cwd: None`, and a snapshot capture taken afterward
+    // must carry none either.
+    #[test]
+    fn agent_restore_p2_amendment_cwd_does_not_survive_a_session_replaced_by_another_agents_startup(
+    ) {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: Some("/project-a".into()),
+        });
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+
+        // Mastracode's own hook fires while Claude is still the detected
+        // agent - buffered, not yet active.
+        let buffered = terminal.set_agent_session_ref_for_session_start(
+            "herdr:mastracode".into(),
+            "mastracode".into(),
+            crate::agent_resume::AgentSessionRef::id("mastracode-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            buffered.is_none(),
+            "mastracode's session should not activate before its process is detected"
+        );
+
+        // Claude exits - clears `persisted_agent_session` (its session AND,
+        // now that it lives inside the same value, its cwd).
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert!(terminal.persisted_agent_session.is_none());
+
+        // Mastracode is detected on screen - installs its buffered session.
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Mastracode),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            Instant::now(),
+        );
+
+        let session = terminal
+            .persisted_agent_session
+            .as_ref()
+            .expect("mastracode's buffered session should now be installed");
+        assert_eq!(session.source, "herdr:mastracode");
+        assert_eq!(session.session_ref.value, "mastracode-session");
+        assert_eq!(
+            session.cwd, None,
+            "claude's stale cwd must not have survived onto mastracode's session"
+        );
+    }
+
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
             .unwrap()
@@ -2497,6 +3605,7 @@ mod tests {
             source: source.into(),
             agent: agent_label.into(),
             session_ref,
+            cwd: None,
         });
     }
 
@@ -2617,6 +3726,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
@@ -3041,6 +4151,7 @@ mod tests {
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(old_session)
                 .expect("test session path should be valid"),
+            cwd: None,
         });
 
         let startup = terminal.set_agent_session_ref_for_session_start(
@@ -4375,6 +5486,1941 @@ mod tests {
         assert_eq!(terminal.state, AgentState::Unknown);
     }
 
+    // herdr-c1o5: a native claude ran in the pane, quit, and a tmux client
+    // took the foreground. herdr never sees claude in the foreground again, so
+    // the recorded exit must not hide a live claude another reporter (the tmux
+    // bridge) reports into the pane.
+    #[test]
+    fn foreign_source_report_after_native_agent_exit_is_applied() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_hook_authority(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            1_792_824_213_173_431_999,
+            true,
+            Instant::now(),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // herdr-c1o5 guard: the exit still drops a late report of the reporter
+    // that held the pane when its agent exited (upstream e608a751).
+    #[test]
+    fn late_report_of_exited_reporter_stays_dropped_after_native_agent_exit() {
+        for source in ["herdr:claude", "custom:claude-hook"] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            terminal.set_hook_authority(
+                source.into(),
+                "claude".into(),
+                AgentState::Working,
+                None,
+                Some(1),
+            );
+            terminal.set_detected_state_with_visible_blocker(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                true,
+            );
+            terminal.set_detected_state(None, AgentState::Unknown);
+
+            terminal.set_hook_authority(
+                source.into(),
+                "claude".into(),
+                AgentState::Idle,
+                None,
+                Some(2),
+            );
+
+            assert_eq!(terminal.effective_agent_label(), None, "{source}");
+        }
+    }
+
+    // herdr-c1o5 round 2: the tmux bridge's source, shared by every claude of
+    // one tmux socket.
+    const BRIDGE_SOURCE: &str = "tmux-bridge:claude-7cbd633a2afc";
+
+    fn report_naming_agent(
+        terminal: &mut TerminalState,
+        source: &str,
+        state: AgentState,
+        seq: u64,
+        agent_alive: bool,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
+        terminal.set_hook_authority_naming_agent_at(
+            source.into(),
+            "claude".into(),
+            state,
+            None,
+            None,
+            Some(seq),
+            if agent_alive {
+                NamedAgentVerdict::Witnessed { observed_at: now }
+            } else {
+                NamedAgentVerdict::Refuted
+            },
+            now,
+        )
+    }
+
+    fn native_claude_exits(terminal: &mut TerminalState) {
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.set_hook_authority(
+            "herdr:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+    }
+
+    // codex c1o5-r1 P1-1: the bridge report lands BEFORE the detector clear.
+    #[test]
+    fn exit_then_live_bridge_report_survives_detector_clear() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            1,
+            true,
+            Instant::now(),
+        );
+
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // Scope guard for P1-1: the detector seeing another agent still clears it.
+    #[test]
+    fn live_bridge_authority_still_yields_to_a_detected_other_agent() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            1,
+            true,
+            Instant::now(),
+        );
+
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+
+        assert_eq!(terminal.effective_agent_label(), Some("codex"));
+    }
+
+    // codex c1o5-r1 P1-2: custom:a and custom:b both report the native claude,
+    // custom:b holds the slot at exit; a delayed report of custom:a, or a
+    // delayed first report of another source, names no process and stays
+    // dropped.
+    #[test]
+    fn exit_drops_unnamed_reports_of_every_custom_reporter() {
+        for (late_source, late_seq) in [("custom:a", 11), ("custom:c", 1), (BRIDGE_SOURCE, 1)] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            for source in ["custom:a", "custom:b"] {
+                terminal.set_hook_authority(
+                    source.into(),
+                    "claude".into(),
+                    AgentState::Working,
+                    None,
+                    Some(10),
+                );
+            }
+            terminal.set_detected_state_with_visible_blocker(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                true,
+            );
+            terminal.set_detected_state(None, AgentState::Unknown);
+
+            terminal.set_hook_authority(
+                late_source.into(),
+                "claude".into(),
+                AgentState::Working,
+                None,
+                Some(late_seq),
+            );
+
+            assert_eq!(terminal.effective_agent_label(), None, "{late_source}");
+            assert_ne!(terminal.state, AgentState::Working, "{late_source}");
+        }
+    }
+
+    // codex c1o5-r1 P1-3: exit observed at t1, bridge report at t2, the exit
+    // processed late with observed_at t1, then the bridge's next report.
+    #[test]
+    fn delayed_exit_keeps_applying_newer_live_bridge_reports() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        let exit_observed_at = Instant::now();
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            exit_observed_at + Duration::from_millis(5),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            exit_observed_at,
+        );
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            2,
+            true,
+            exit_observed_at + Duration::from_millis(10),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // codex c1o5-r1 P2-4: the bridge source held the pane when the native
+    // claude exited; the same source then reports a new, live claude.
+    #[test]
+    fn recorded_bridge_source_reporting_a_new_live_claude_is_applied() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            Instant::now(),
+        );
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Blocked,
+            2,
+            true,
+            Instant::now(),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // A report naming a dead agent process never shows it after an exit.
+    #[test]
+    fn exit_drops_report_naming_a_dead_agent_process() {
+        let mut terminal = test_terminal();
+        native_claude_exits(&mut terminal);
+        terminal.set_detected_state(None, AgentState::Unknown);
+
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            false,
+            Instant::now(),
+        );
+
+        assert_eq!(terminal.effective_agent_label(), None);
+    }
+
+    // codex c1o5-r2 P1: custom:a names native claude A, read alive at t0; A
+    // exits and the detector observes it at t1; the report is applied at t2,
+    // before the queued exit is processed; then a detector clear at t3.
+    #[test]
+    fn witness_older_than_a_queued_exit_does_not_survive_it() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:a".into(),
+            "claude".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), None);
+        assert_ne!(terminal.state, AgentState::Blocked);
+    }
+
+    fn pi_session(id: &str) -> Option<crate::agent_resume::AgentSessionRef> {
+        crate::agent_resume::session_ref_from_report("herdr:pi", "pi", Some(id.into()), None)
+    }
+
+    fn assert_witnessed_authority(terminal: &TerminalState, witness: Instant) {
+        let authority = terminal.hook_authority.as_ref().expect("a hook authority");
+        assert_eq!(authority.witnessed_at, Some(witness), "{authority:?}");
+        assert_eq!(authority.reported_at, witness, "{authority:?}");
+    }
+
+    // codex c1o5-r3 P2-3 and c1o5-r4 P3: a herdr:pi report witnessed at t0 is
+    // buffered, no pi being detected yet, and applied at t2; S's startup report
+    // follows; the detector saw pi working at t1, after the witness. The
+    // release replays the buffered report with its witness.
+    #[test]
+    fn buffered_witnessed_report_is_released_by_a_detection_after_its_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let session_ref = pi_session("pi-session");
+        assert!(session_ref.is_some(), "the report carries a session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "the report is buffered");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(
+            terminal.state,
+            AgentState::Blocked,
+            "the hook, not the detector"
+        );
+        assert_witnessed_authority(&terminal, t0);
+    }
+
+    // codex c1o5-r4 P2: herdr:pi session S, seq 2, Blocked, witnessed at t1,
+    // is buffered; S's startup report arrives at seq 1; a pi exit observed at
+    // t0 < t1 is consumed after them; the replacement pi is detected working
+    // at t3. Returns the witness.
+    fn buffered_report_then_older_exit(terminal: &mut TerminalState) -> Instant {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t1 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t0,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+        t1
+    }
+
+    #[test]
+    fn an_exit_older_than_a_buffered_witness_keeps_the_buffered_report() {
+        let mut terminal = test_terminal();
+        let witness = buffered_report_then_older_exit(&mut terminal);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, witness);
+    }
+
+    // ADR-0008 round 3, item 4: the same with a persisted herdr:pi session,
+    // whose process-exit suppression rewrites the source's entry.
+    #[test]
+    fn an_exit_older_than_a_buffered_witness_keeps_it_over_a_persisted_session() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("earlier-pi-session").expect("a pi session"),
+            cwd: None,
+        });
+        let witness = buffered_report_then_older_exit(&mut terminal);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, witness);
+    }
+
+    // ADR-0008 round 3, items 1, 2 and 7: a live herdr:pi authority witnessed
+    // at t2; a pi exit observed at t1 < t2 is consumed after it, then one
+    // observed at t3 > t2.
+    #[test]
+    fn an_exit_older_than_a_live_witness_keeps_the_official_authority() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref,
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "the report is applied");
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_witnessed_authority(&terminal, t2);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t3,
+        );
+        assert_eq!(
+            terminal.effective_agent_label(),
+            None,
+            "an exit after the witness"
+        );
+    }
+
+    // ADR-0008 round 3, item 5: a bridge claude witnessed at t2 holds the
+    // pane while a herdr:pi report is buffered; the detector saw pi at t1 < t2,
+    // then again at t3 > t2.
+    #[test]
+    fn a_detection_older_than_a_live_witness_releases_nothing() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Unnamed,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        report_naming_agent(
+            &mut terminal,
+            BRIDGE_SOURCE,
+            AgentState::Working,
+            1,
+            true,
+            t2,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_witnessed_authority(&terminal, t2);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+        assert_eq!(
+            terminal.effective_agent_label(),
+            Some("pi"),
+            "a detection after it"
+        );
+        assert_eq!(terminal.state, AgentState::Blocked);
+    }
+
+    // codex c1o5-r5 P2-1: live herdr:pi, session S, seq 2, Blocked, witnessed
+    // at t2; a queued pi exit observed at t1 < t2 is consumed after it.
+    // Returns [t0, t1, t2, t3, t4].
+    fn official_authority_kept_across_an_older_exit(terminal: &mut TerminalState) -> [Instant; 5] {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let t4 = t0 + Duration::from_millis(30);
+        let session_ref = pi_session("pi-session");
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref,
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        assert!(terminal.record_reported_resume("herdr:pi", "pi", None, pi_resume_argv()));
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        [t0, t1, t2, t3, t4]
+    }
+
+    // codex c1o5-r5 P2-1: S's seq 3 Working, witnessed at t3, then a pi
+    // detection at t4.
+    #[test]
+    fn a_kept_official_authority_accepts_its_next_report() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, t4] = official_authority_kept_across_an_older_exit(&mut terminal);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            pi_session("pi-session"),
+            Some(3),
+            NamedAgentVerdict::Witnessed { observed_at: t3 },
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "seq 3 is applied");
+        assert_witnessed_authority(&terminal, t3);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t4,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(
+            terminal.recent_agent_process_exit.is_none(),
+            "the detector saw pi after the exit"
+        );
+        assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&3));
+    }
+
+    // codex c1o5-r5 P2-1, disappearance: the authority is held by its witness
+    // alone, so the producer keeps publishing, and an observation at t3 > t2
+    // without pi ends it as an exit observed then.
+    #[test]
+    fn a_witness_held_authority_ends_on_a_newer_observation_without_its_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(
+            !terminal.full_lifecycle_hook_authority_active(),
+            "a witness-held authority does not silence the detector"
+        );
+
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), None, "no dead label");
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal
+                .recent_agent_process_exit
+                .map(|exit| (exit.agent, exit.observed_at)),
+            Some((Agent::Pi, t3))
+        );
+    }
+
+    // codex c1o5-r5 P2-2: persisted herdr:pi session OLD; S seq 20 Blocked
+    // witnessed at t2 is buffered; S's startup at seq 10; a pi exit observed at
+    // t1 < t2; a delayed session R startup at seq 9; a pi detection at t3.
+    #[test]
+    fn a_late_session_start_cannot_pass_a_kept_buffer_watermark() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("old-session").expect("a pi session"),
+            cwd: None,
+        });
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(20),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(10),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("r-session"),
+            Some(9),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t3,
+        );
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report replayed");
+        assert_witnessed_authority(&terminal, t2);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+    }
+
+    // codex c1o5-r5 P2-3: a native pi's acquisition and first Working
+    // observation, both older than a witnessed custom:pi report, are consumed
+    // after it; then that authority is cleared while pi runs.
+    #[test]
+    fn a_deferred_detection_is_applied_when_the_authority_is_cleared() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Working,
+            false,
+            false,
+            true,
+            false,
+            t1,
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "the witnessed report");
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "the detector's view");
+    }
+
+    // codex c1o5-r6 P2-1: S's seq 3 Working names no process; it replaces the
+    // witness-held authority of its source and session and keeps its witness.
+    #[test]
+    fn an_unnamed_successor_keeps_the_witness_it_replaces() {
+        let mut terminal = test_terminal();
+        let [_, t1, t2, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            pi_session("pi-session"),
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "seq 3 is applied");
+        assert_eq!(terminal.hook_report_sequences.get("herdr:pi"), Some(&3));
+        let authority = terminal.hook_authority.as_ref().expect("a hook authority");
+        assert_eq!(authority.reported_at, t3, "its apply time");
+        assert!(authority.observed_before_witness(t1), "S's witness at t2");
+        assert!(
+            !authority.observed_before_witness(t2),
+            "not a witness at t3"
+        );
+    }
+
+    // codex c1o5-r6 P2-2: native pi detected; a custom:pi authority without a
+    // session witnessed at t2; the native exit at t1 consumed after it; a
+    // delayed herdr:pi SessionStart for the exited native session S.
+    #[test]
+    fn a_superseded_exit_grants_presence_to_its_own_source_only() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t0);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"), "custom:pi");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert_eq!(terminal.persisted_agent_session, None, "S stays buffered");
+        assert_eq!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .and_then(|entry| session_value(&entry.replacement_session_ref)),
+            id_session("s-session")
+        );
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t3);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session"),
+            "a pi detection after the exit releases it"
+        );
+    }
+
+    // codex c1o5-r6 P2-3: custom:pi witnessed at t4; a Claude observation from
+    // t1 deferred; a pi SessionStart suppression at t5; the producer's newer pi
+    // observation from t2 dropped by it; then custom:pi cleared.
+    #[test]
+    fn a_dropped_newer_detection_supersedes_the_deferred_one() {
+        let mut terminal = test_terminal();
+        let base = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("a monotonic clock older than 200 ms");
+        let t1 = base + Duration::from_millis(5);
+        let t2 = base + Duration::from_millis(10);
+        let t4 = base + Duration::from_millis(20);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t4 },
+            t4,
+        );
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert!(terminal.deferred_detection.is_some(), "Claude is deferred");
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .is_some_and(|entry| entry.observed_at > t4),
+            "a suppression at t5"
+        );
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t2);
+        assert_eq!(terminal.deferred_detection, None, "the newer observation");
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_ne!(terminal.effective_agent_label(), Some("claude"));
+        assert_ne!(terminal.detected_agent, Some(Agent::Claude));
+    }
+
+    // codex c1o5-r6 P2-4: S's seq 2 buffered with its seq 1 SessionStart; a
+    // witnessed custom:pi authority without a session; a pi detection after
+    // the entry and before the custom witness deferred; custom:pi cleared.
+    #[test]
+    fn a_replayed_detection_reports_the_session_it_installs() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(2),
+            NamedAgentVerdict::Unnamed,
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "S's report is buffered");
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert!(
+            terminal.deferred_detection.is_some(),
+            "the detection is deferred"
+        );
+
+        let mutation = terminal
+            .clear_hook_authority_with_mutation(Some("custom:pi"), Some(2))
+            .expect("the clear is applied");
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report released");
+        assert!(mutation.session_ref_changed, "{mutation:?}");
+    }
+
+    // codex c1o5-r6 P2-5: witnessed custom:pi at t2; a native pi acquisition and
+    // Working observation from before t2 deferred; a name given; the custom
+    // source released while native pi runs.
+    #[test]
+    fn a_release_counts_the_deferred_detection_of_a_running_agent() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        terminal.set_agent_name("worker".into());
+
+        let mutation = terminal
+            .release_agent_with_mutation("custom:pi", "pi", Some(2))
+            .expect("the release is applied");
+        assert!(!mutation.agent_released(), "{mutation:?}");
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    // codex c1o5-r7 P2-1 (ADR-0008 round 6, rule 18): custom:pi witnessed at
+    // t2; a native Claude observation from t1 < t2 is deferred; the release of
+    // custom:pi replays it. The release speaks for pi only: Claude stays.
+    #[test]
+    fn a_release_keeps_another_agent_its_replay_restores() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Claude, t0);
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert_eq!(
+            terminal.deferred_detection.map(|deferred| deferred.agent),
+            Some(Some(Agent::Claude)),
+            "the Claude observation is deferred"
+        );
+
+        let mutation = terminal
+            .release_agent_with_mutation("custom:pi", "pi", Some(2))
+            .expect("the release is applied");
+        assert!(mutation.agent_released(), "{mutation:?}");
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.detected_agent, Some(Agent::Claude));
+        assert_eq!(terminal.effective_agent_label(), Some("claude"));
+        assert_eq!(terminal.state, AgentState::Working);
+    }
+
+    // codex c1o5-r7 P2-1, bridge variant: herdr:pi session S, witnessed at t0,
+    // is buffered (no pi detected); a bridge claude is witnessed at t2; a pi
+    // detection from t1 < t2 is deferred; the release of the bridge claude
+    // replays it, which releases S's buffered authority. Pi stays effective.
+    #[test]
+    fn a_bridge_release_keeps_the_pi_authority_its_replay_installs() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let session_ref = pi_session("pi-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t0 },
+            t0,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref,
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.hook_authority.is_none(), "S's report is buffered");
+        terminal.set_hook_authority_naming_agent_at(
+            BRIDGE_SOURCE.into(),
+            "claude".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert_eq!(
+            terminal.deferred_detection.map(|deferred| deferred.agent),
+            Some(Some(Agent::Pi)),
+            "the pi detection is deferred"
+        );
+
+        let mutation = terminal
+            .release_agent_with_mutation(BRIDGE_SOURCE, "claude", Some(2))
+            .expect("the release is applied");
+        assert!(mutation.agent_released(), "{mutation:?}");
+        assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Blocked, "S's report");
+        assert_witnessed_authority(&terminal, t0);
+    }
+
+    // codex c1o5-r7 P2-2 (ADR-0008 round 6, rule 15 amended): herdr:pi session
+    // S, seq 2, witnessed at t2, is buffered; S's SessionStart seq 1 is
+    // accepted while pi is undetected; S's seq 3 Working, naming no process,
+    // replaces the buffered report; a pi exit observed at t1 < t2 is consumed;
+    // pi is detected idle at t4. The successor keeps the buffered witness.
+    #[test]
+    fn an_unnamed_buffered_successor_keeps_the_buffered_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(15);
+        let t4 = t0 + Duration::from_millis(20);
+        let session_ref = pi_session("s-session");
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            session_ref.clone(),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            session_ref.clone(),
+            Some(1),
+            Some("startup".into()),
+        );
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            session_ref,
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+        assert!(
+            terminal.hook_authority.is_none(),
+            "S's reports are buffered"
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Idle, t4);
+
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working, "S's seq 3");
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.witnessed_at),
+            Some(t2)
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("s-session")
+        );
+    }
+
+    // codex c1o5-r8 P3 (ADR-0008 round 7): the witness a buffered successor
+    // inherits is bound to the whole session reference, kind included:
+    // herdr:pi seq 2 Id("/tmp/pi.jsonl") witnessed at t2 is buffered; an
+    // unnamed seq 3 Path("/tmp/pi.jsonl") replaces it and keeps no witness.
+    #[test]
+    fn an_unnamed_buffered_successor_of_another_session_kind_keeps_no_witness() {
+        use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind};
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(15);
+        let id = AgentSessionRef {
+            kind: AgentSessionRefKind::Id,
+            value: "/tmp/pi.jsonl".into(),
+        };
+        let path = AgentSessionRef {
+            kind: AgentSessionRefKind::Path,
+            ..id.clone()
+        };
+        let pending = |terminal: &TerminalState| {
+            terminal
+                .suppressed_full_lifecycle_hook_reports
+                .get("herdr:pi")
+                .and_then(|suppressed| suppressed.pending_replacement_report.as_ref())
+                .map(|pending| {
+                    (
+                        pending.authority.session_ref.clone(),
+                        pending.authority.witnessed_at,
+                    )
+                })
+        };
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            Some(id.clone()),
+            Some(2),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        assert_eq!(
+            pending(&terminal),
+            Some((Some(id), Some(t2))),
+            "the witnessed report is buffered"
+        );
+
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(path.clone()),
+            Some(3),
+            NamedAgentVerdict::Unnamed,
+            t3,
+        );
+
+        assert_eq!(pending(&terminal), Some((Some(path), None)));
+    }
+
+    // codex c1o5-r7 P3: the snapshot tells session kinds apart, and reads the
+    // persisted session's agent and cwd.
+    #[test]
+    fn the_snapshot_reads_session_kinds_and_the_persisted_session() {
+        use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind, PersistedAgentSession};
+        let t0 = Instant::now();
+        let id = AgentSessionRef {
+            kind: AgentSessionRefKind::Id,
+            value: "/tmp/pi.jsonl".into(),
+        };
+        let path = AgentSessionRef {
+            kind: AgentSessionRefKind::Path,
+            ..id.clone()
+        };
+        let with_authority = |session_ref: &AgentSessionRef| {
+            let mut terminal = test_terminal();
+            terminal.hook_authority = Some(HookAuthority {
+                source: "herdr:pi".into(),
+                agent_label: "pi".into(),
+                state: AgentState::Working,
+                message: None,
+                reported_at: t0,
+                session_ref: Some(session_ref.clone()),
+                witnessed_at: None,
+            });
+            terminal
+        };
+        assert_ne!(
+            pane_parts(&with_authority(&id)),
+            pane_parts(&with_authority(&path))
+        );
+
+        let with_persisted = |agent: &str, cwd: Option<&str>| {
+            let mut terminal = test_terminal();
+            terminal.persisted_agent_session = Some(PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: agent.into(),
+                session_ref: id.clone(),
+                cwd: cwd.map(str::to_string),
+            });
+            terminal
+        };
+        let base = pane_parts(&with_persisted("pi", None));
+        assert_ne!(base, pane_parts(&with_persisted("pi", Some("/tmp"))));
+        assert_ne!(base, pane_parts(&with_persisted("omp", None)));
+    }
+
+    // ADR-0008 round 4, rule 14, and round 5: every part of the pane state,
+    // compared as one value by the complete-state tests below.
+    // ADR-0008 round 6, P3: a session is its whole reference, kind and value.
+    type SessionPart = Option<crate::agent_resume::AgentSessionRef>;
+    type PersistedPart = (
+        String,
+        String,
+        crate::agent_resume::AgentSessionRef,
+        Option<String>,
+    );
+    type AuthorityPart = (
+        String,
+        String,
+        AgentState,
+        Instant,
+        Option<Instant>,
+        SessionPart,
+    );
+    type EntryPart = (
+        String,
+        String,
+        SessionPart,
+        Instant,
+        FullLifecycleHookSuppressionReason,
+        SessionPart,
+        Option<(u64, AuthorityPart)>,
+    );
+    type ResumePart = (String, String, Vec<String>);
+
+    #[derive(Debug, PartialEq)]
+    struct PaneParts {
+        authority: Option<AuthorityPart>,
+        exit: Option<(Agent, Instant)>,
+        entries: Vec<EntryPart>,
+        watermarks: Vec<(String, u64)>,
+        detector: (Option<Agent>, AgentState, bool, Option<Instant>),
+        deferred: Option<DeferredDetection>,
+        session: Option<PersistedPart>,
+        resume: Option<ResumePart>,
+    }
+
+    fn session_value(session_ref: &Option<crate::agent_resume::AgentSessionRef>) -> SessionPart {
+        session_ref.clone()
+    }
+
+    fn id_session(value: &str) -> SessionPart {
+        Some(crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: value.into(),
+        })
+    }
+
+    fn persisted_part(source: &str, agent: &str, session: &str) -> Option<PersistedPart> {
+        id_session(session).map(|session_ref| (source.into(), agent.into(), session_ref, None))
+    }
+
+    fn authority_part(authority: &HookAuthority) -> AuthorityPart {
+        (
+            authority.source.clone(),
+            authority.agent_label.clone(),
+            authority.state,
+            authority.reported_at,
+            authority.witnessed_at,
+            session_value(&authority.session_ref),
+        )
+    }
+
+    fn authority_of(
+        source: &str,
+        agent_label: &str,
+        state: AgentState,
+        reported_at: Instant,
+        witness: Option<Instant>,
+        session: Option<&str>,
+    ) -> AuthorityPart {
+        (
+            source.into(),
+            agent_label.into(),
+            state,
+            reported_at,
+            witness,
+            session.and_then(id_session),
+        )
+    }
+
+    fn pi_resume_argv() -> Vec<String> {
+        vec!["pi".into(), "--session".into(), "pi-session".into()]
+    }
+
+    fn pi_resume() -> Option<ResumePart> {
+        Some(("herdr:pi".into(), "pi".into(), pi_resume_argv()))
+    }
+
+    fn pane_parts(terminal: &TerminalState) -> PaneParts {
+        let mut entries: Vec<EntryPart> = terminal
+            .suppressed_full_lifecycle_hook_reports
+            .iter()
+            .map(|(source, entry)| {
+                (
+                    source.clone(),
+                    entry.agent_label.clone(),
+                    session_value(&entry.session_ref),
+                    entry.observed_at,
+                    entry.reason,
+                    session_value(&entry.replacement_session_ref),
+                    entry
+                        .pending_replacement_report
+                        .as_ref()
+                        .map(|pending| (pending.seq, authority_part(&pending.authority))),
+                )
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut watermarks: Vec<(String, u64)> = terminal
+            .hook_report_sequences
+            .iter()
+            .map(|(source, seq)| (source.clone(), *seq))
+            .collect();
+        watermarks.sort();
+        PaneParts {
+            authority: terminal.hook_authority.as_ref().map(authority_part),
+            exit: terminal
+                .recent_agent_process_exit
+                .map(|exit| (exit.agent, exit.observed_at)),
+            entries,
+            watermarks,
+            detector: (
+                terminal.detected_agent,
+                terminal.fallback_state,
+                terminal.fallback_visible_blocker,
+                terminal.fallback_observed_at,
+            ),
+            deferred: terminal.deferred_detection,
+            session: terminal.persisted_agent_session.as_ref().map(|session| {
+                (
+                    session.source.clone(),
+                    session.agent.clone(),
+                    session.session_ref.clone(),
+                    session.cwd.clone(),
+                )
+            }),
+            resume: terminal.reported_resume.as_ref().map(|resume| {
+                (
+                    resume.source.clone(),
+                    resume.agent.clone(),
+                    resume.argv.clone(),
+                )
+            }),
+        }
+    }
+
+    fn pi_report(terminal: &mut TerminalState, state: AgentState, seq: u64, witness: Instant) {
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            state,
+            None,
+            pi_session("pi-session"),
+            Some(seq),
+            NamedAgentVerdict::Witnessed {
+                observed_at: witness,
+            },
+            witness,
+        );
+    }
+
+    fn observe(terminal: &mut TerminalState, agent: Option<Agent>, state: AgentState, at: Instant) {
+        terminal.set_detected_state_with_screen_signals_at(
+            agent,
+            state,
+            false,
+            false,
+            state == AgentState::Working,
+            false,
+            at,
+        );
+    }
+
+    // Consumer 1: an exit older than the live witness, which keeps the
+    // authority's reported resume.
+    #[test]
+    fn complete_state_consumer_1_exit_older_than_the_live_witness() {
+        let mut terminal = test_terminal();
+        let [_, t1, t2, _, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
+                    AgentState::Blocked,
+                    t2,
+                    Some(t2),
+                    Some("pi-session")
+                )),
+                exit: Some((Agent::Pi, t1)),
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 2)],
+                detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
+                deferred: None,
+                session: None,
+                resume: pi_resume(),
+            }
+        );
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(!terminal.full_lifecycle_hook_authority_active());
+    }
+
+    // Consumer 5: a report of the witness-held authority's source.
+    #[test]
+    fn complete_state_consumer_5_report_while_held_by_its_witness() {
+        let mut terminal = test_terminal();
+        let [_, t1, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        pi_report(&mut terminal, AgentState::Working, 3, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
+                    AgentState::Working,
+                    t3,
+                    Some(t3),
+                    Some("pi-session")
+                )),
+                exit: Some((Agent::Pi, t1)),
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 3)],
+                detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
+                deferred: None,
+                session: None,
+                resume: pi_resume(),
+            }
+        );
+    }
+
+    // Consumer 4, the held agent: a pi detection newer than the witness.
+    #[test]
+    fn complete_state_consumer_4_newer_detection_of_the_held_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, t4] = official_authority_kept_across_an_older_exit(&mut terminal);
+        pi_report(&mut terminal, AgentState::Working, 3, t3);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t4);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
+                    AgentState::Working,
+                    t3,
+                    Some(t3),
+                    Some("pi-session")
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 3)],
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t4)),
+                deferred: None,
+                session: None,
+                resume: pi_resume(),
+            }
+        );
+        assert!(
+            terminal.full_lifecycle_hook_authority_active(),
+            "detector-held again"
+        );
+    }
+
+    // Consumer 4, no agent: an observation without pi newer than the witness
+    // is the exit of the witnessed process, then the observation itself.
+    #[test]
+    fn complete_state_consumer_4_newer_observation_without_the_held_agent() {
+        let mut terminal = test_terminal();
+        let [_, _, _, t3, _] = official_authority_kept_across_an_older_exit(&mut terminal);
+        let mutation = terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            t3,
+        );
+        assert!(mutation.agent_released(), "{mutation:?}");
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: Some((Agent::Pi, t3)),
+                entries: vec![(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    id_session("pi-session"),
+                    t3,
+                    FullLifecycleHookSuppressionReason::ProcessExit,
+                    None,
+                    None
+                )],
+                watermarks: vec![],
+                detector: (None, AgentState::Unknown, false, Some(t3)),
+                deferred: None,
+                session: None,
+                resume: None,
+            }
+        );
+    }
+
+    // Consumers 2 and 7: an exit older than a buffered witness, with the
+    // persisted-session suppression rewriting the entry; then a late session
+    // start and a pi detection.
+    #[test]
+    fn complete_state_consumer_2_exit_older_than_a_buffered_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: pi_session("old-session").expect("a pi session"),
+            cwd: None,
+        });
+        terminal.set_hook_authority_naming_agent_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            pi_session("s-session"),
+            Some(20),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("s-session"),
+            Some(10),
+            Some("startup".into()),
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            t1,
+        );
+        let after_exit = PaneParts {
+            authority: None,
+            exit: Some((Agent::Pi, t1)),
+            entries: vec![(
+                "herdr:pi".into(),
+                "pi".into(),
+                id_session("old-session"),
+                t1,
+                FullLifecycleHookSuppressionReason::ProcessExit,
+                id_session("s-session"),
+                Some((
+                    20,
+                    authority_of(
+                        "herdr:pi",
+                        "pi",
+                        AgentState::Blocked,
+                        t2,
+                        Some(t2),
+                        Some("s-session"),
+                    ),
+                )),
+            )],
+            watermarks: vec![("herdr:pi".into(), 10)],
+            detector: (Some(Agent::Pi), AgentState::Idle, false, Some(t1)),
+            deferred: None,
+            session: None,
+            resume: None,
+        };
+        assert_eq!(pane_parts(&terminal), after_exit);
+
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            pi_session("r-session"),
+            Some(9),
+            Some("startup".into()),
+        );
+        assert_eq!(pane_parts(&terminal), after_exit, "seq 9 is not newer");
+
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "herdr:pi",
+                    "pi",
+                    AgentState::Blocked,
+                    t2,
+                    Some(t2),
+                    Some("s-session")
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("herdr:pi".into(), 20)],
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t3)),
+                deferred: None,
+                session: persisted_part("herdr:pi", "pi", "s-session"),
+                resume: None,
+            }
+        );
+    }
+
+    // Consumer 3: detections older than the live witness are deferred, then
+    // applied when the authority is cleared.
+    #[test]
+    fn complete_state_consumer_3_detection_older_than_the_live_witness() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        terminal.set_detected_agent_process_at(Agent::Pi, t0);
+        observe(&mut terminal, Some(Agent::Pi), AgentState::Working, t1);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "custom:pi",
+                    "pi",
+                    AgentState::Blocked,
+                    t2,
+                    Some(t2),
+                    None
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (None, AgentState::Unknown, false, None),
+                deferred: Some(DeferredDetection {
+                    agent: Some(Agent::Pi),
+                    fallback_state: AgentState::Working,
+                    visible_blocker: false,
+                    observed_at: t1,
+                    acquisition: true,
+                }),
+                session: None,
+                resume: None,
+            }
+        );
+
+        terminal.clear_hook_authority(Some("custom:pi"), Some(2));
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 2)],
+                detector: (Some(Agent::Pi), AgentState::Working, false, Some(t1)),
+                deferred: None,
+                session: None,
+                resume: None,
+            }
+        );
+        assert!(!terminal.agent_process_acquisition_pending, "Working");
+    }
+
+    // Consumer 6: the detector clear, by an observation older than the witness
+    // (deferred, nothing cleared), then by a newer one of another agent.
+    #[test]
+    fn complete_state_consumer_6_detector_clear() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        let session_ref = crate::agent_resume::AgentSessionRef {
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "custom-session".into(),
+        };
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:pi".into(),
+            "pi".into(),
+            AgentState::Blocked,
+            None,
+            Some(session_ref),
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t1);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: Some(authority_of(
+                    "custom:pi",
+                    "pi",
+                    AgentState::Blocked,
+                    t2,
+                    Some(t2),
+                    Some("custom-session")
+                )),
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (None, AgentState::Unknown, false, None),
+                deferred: Some(DeferredDetection {
+                    agent: Some(Agent::Claude),
+                    fallback_state: AgentState::Working,
+                    visible_blocker: false,
+                    observed_at: t1,
+                    acquisition: false,
+                }),
+                session: None,
+                resume: None,
+            }
+        );
+
+        observe(&mut terminal, Some(Agent::Claude), AgentState::Working, t3);
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:pi".into(), 1)],
+                detector: (Some(Agent::Claude), AgentState::Working, false, Some(t3)),
+                deferred: None,
+                session: persisted_part("custom:pi", "pi", "custom-session"),
+                resume: None,
+            }
+        );
+    }
+
+    // Consumer 8: an idle shell older than the witness of a self-reported
+    // agent changes nothing; a newer one clears it.
+    #[test]
+    fn complete_state_consumer_8_idle_shell() {
+        let mut terminal = test_terminal();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t0 + Duration::from_millis(10);
+        let t3 = t0 + Duration::from_millis(20);
+        terminal.set_hook_authority_naming_agent_at(
+            "custom:foo".into(),
+            "foo".into(),
+            AgentState::Working,
+            None,
+            None,
+            Some(1),
+            NamedAgentVerdict::Witnessed { observed_at: t2 },
+            t2,
+        );
+        let held = PaneParts {
+            authority: Some(authority_of(
+                "custom:foo",
+                "foo",
+                AgentState::Working,
+                t2,
+                Some(t2),
+                None,
+            )),
+            exit: None,
+            entries: vec![],
+            watermarks: vec![("custom:foo".into(), 1)],
+            detector: (None, AgentState::Unknown, false, None),
+            deferred: None,
+            session: None,
+            resume: None,
+        };
+        assert_eq!(pane_parts(&terminal), held);
+        assert!(terminal.clear_self_reported_agent(t1).is_none());
+        assert_eq!(pane_parts(&terminal), held);
+
+        assert!(terminal.clear_self_reported_agent(t3).is_some());
+        assert_eq!(
+            pane_parts(&terminal),
+            PaneParts {
+                authority: None,
+                exit: None,
+                entries: vec![],
+                watermarks: vec![("custom:foo".into(), 1)],
+                detector: (None, AgentState::Unknown, false, None),
+                deferred: None,
+                session: None,
+                resume: None,
+            }
+        );
+    }
+
     #[test]
     fn process_exit_clears_matching_hook_authority_before_reporting_idle() {
         let mut terminal = test_terminal();
@@ -4438,7 +7484,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_process_exit_preserves_newer_custom_authority() {
+    fn stale_process_exit_preserves_authority_outlives_exit() {
         let mut terminal = test_terminal();
         let observed = Instant::now();
         terminal.set_detected_state_with_screen_signals_at(
@@ -4470,7 +7516,7 @@ mod tests {
             observed,
         );
 
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(
             terminal
@@ -5464,6 +8510,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Grok), AgentState::Idle);
 
@@ -5494,6 +8541,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                cwd: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5530,6 +8578,7 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                cwd: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5565,6 +8614,7 @@ mod tests {
                     source: "herdr:codex".into(),
                     agent: "codex".into(),
                     session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                    cwd: None,
                 });
                 terminal.set_detected_state(detected_agent, AgentState::Idle);
 
@@ -5599,6 +8649,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5896,7 +8947,7 @@ mod tests {
             true,
             now,
         );
-        assert!(exit.agent_released);
+        assert!(exit.agent_released());
         assert_eq!(
             terminal.agent_name.as_deref(),
             Some("reviewer"),
@@ -5970,7 +9021,7 @@ mod tests {
         let mutation = terminal
             .release_agent_with_mutation("herdr:codex", "codex", None)
             .expect("detected agent release should be accepted");
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert_eq!(terminal.agent_name.as_deref(), Some("replacement"));
         assert_eq!(terminal.detected_agent, Some(Agent::Codex));
     }
@@ -5993,7 +9044,7 @@ mod tests {
             .release_agent_with_mutation("custom:pi", "pi", Some(11))
             .expect("custom release should be accepted");
 
-        assert!(!mutation.agent_released);
+        assert!(!mutation.agent_released());
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.detected_agent, Some(Agent::Pi));
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
@@ -6108,6 +9159,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            cwd: None,
         });
 
         let mutation = terminal
@@ -6126,6 +9178,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
 
@@ -6153,6 +9206,7 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: session_ref.clone(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6186,6 +9240,7 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6218,6 +9273,7 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            cwd: None,
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
@@ -6327,6 +9383,7 @@ mod tests {
             source: "herdr:opencode".into(),
             agent: "opencode".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+            cwd: None,
         });
 
         let first =
@@ -6346,6 +9403,7 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            cwd: None,
         });
 
         let mutation = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);

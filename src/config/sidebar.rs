@@ -139,9 +139,22 @@ pub enum SpaceSidebarToken {
 }
 
 impl AgentSidebarToken {
+    #[cfg(test)]
     pub(crate) fn style_for_value(&self, value: &str) -> Option<SidebarTokenStyle> {
+        self.style_for(value, &|_| None)
+    }
+
+    // style_for resolves the style with `lookup` answering the other custom tokens of the same
+    // pane, for rules that name a `source` (herdr-upm).
+    pub(crate) fn style_for<'v>(
+        &self,
+        value: &str,
+        lookup: &dyn Fn(&str) -> Option<&'v str>,
+    ) -> Option<SidebarTokenStyle> {
         match self {
-            Self::Styled { style, rules, .. } => rules::matching_style(rules, *style, value),
+            Self::Styled { style, rules, .. } => {
+                rules::matching_style(rules, *style, value, lookup)
+            }
             _ => Some(SidebarTokenStyle::default()),
         }
     }
@@ -155,9 +168,17 @@ impl AgentSidebarToken {
 }
 
 impl SpaceSidebarToken {
-    pub(crate) fn style_for_value(&self, value: &str) -> Option<SidebarTokenStyle> {
+    // style_for resolves the style with `lookup` answering the other custom tokens of the same
+    // pane, for rules that name a `source` (herdr-upm).
+    pub(crate) fn style_for<'v>(
+        &self,
+        value: &str,
+        lookup: &dyn Fn(&str) -> Option<&'v str>,
+    ) -> Option<SidebarTokenStyle> {
         match self {
-            Self::Styled { style, rules, .. } => rules::matching_style(rules, *style, value),
+            Self::Styled { style, rules, .. } => {
+                rules::matching_style(rules, *style, value, lookup)
+            }
             _ => Some(SidebarTokenStyle::default()),
         }
     }

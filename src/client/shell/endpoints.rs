@@ -24,6 +24,24 @@ pub(crate) struct ClientShellEndpoint {
     pub(crate) methods: Option<HashSet<String>>,
 }
 
+impl ClientShellEndpoint {
+    /// Whether this endpoint's rows are drawn from a CACHED snapshot rather than from
+    /// live activity: a disconnected endpoint keeps showing its last state, so its
+    /// glyphs stay static and schedule no repaint.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.status != ClientEndpointStatus::Online
+    }
+}
+
+/// Whether the single-endpoint sidebar draws cached rows: the Local endpoint is listed
+/// but not online (federation on, last SSH profile removed, recovery still running).
+pub(super) fn local_rows_are_stale(endpoints: &[ClientShellEndpoint]) -> bool {
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.endpoint_id.is_local())
+        .is_some_and(ClientShellEndpoint::is_stale)
+}
+
 pub(super) struct MachineHit {
     pub(super) rect: Rect,
     pub(super) status_badge: Rect,

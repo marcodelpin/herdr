@@ -1,0 +1,32 @@
+# Fork-only composite action (bd herdr-5bka). Every fork workflow job that builds the
+# ghostty-vt crate runs this right after "Install Zig" and before any build or test step:
+# it prefetches the vendored libghostty-vt Zig packages and retries ONLY that fetch, so a
+# runner DNS failure no longer kills a job before its verdict. Test steps are never
+# wrapped or retried. Logic and knobs: fetch.sh in this directory.
+name: Prefetch libghostty-vt Zig packages (retried)
+description: Fetch the Zig dependencies of vendor/libghostty-vt with a bounded retry; never retries a test.
+
+inputs:
+  rust-target:
+    description: Rust target triple the job builds; empty means rustc's host triple.
+    required: false
+    default: ''
+  attempts:
+    description: Total fetch attempts before the job fails.
+    required: false
+    default: '4'
+  backoff-seconds:
+    description: Backoff unit; attempt N waits N times this before the next attempt.
+    required: false
+    default: '15'
+
+runs:
+  using: composite
+  steps:
+    - name: Prefetch libghostty-vt Zig packages
+      shell: bash
+      env:
+        ZIG_FETCH_RUST_TARGET: ${{ inputs.rust-target }}
+        ZIG_FETCH_ATTEMPTS: ${{ inputs.attempts }}
+        ZIG_FETCH_BACKOFF_SECONDS: ${{ inputs.backoff-seconds }}
+      run: bash "${GITHUB_ACTION_PATH//\\//}/fetch.sh"

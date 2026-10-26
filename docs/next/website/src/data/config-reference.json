@@ -1054,11 +1054,23 @@
           "key": "ui.status_indicators",
           "type": "enum",
           "default": "\"dots\"",
-          "description": "Choose compact color dots or distinct static symbols for agent states.",
+          "description": "Choose compact color dots or distinct symbols for agent states.",
           "values": [
             "dots",
             "symbols"
           ]
+        },
+        {
+          "key": "ui.animate_working",
+          "type": "boolean",
+          "default": "true",
+          "description": "Animate the working state icon as a spinner: braille frames for dots, rotating quarter circles for symbols. The waiting hourglass turns over once a second on the same setting; every other state stays static."
+        },
+        {
+          "key": "ui.waiting_indicator",
+          "type": "boolean",
+          "default": "true",
+          "description": "Show the waiting hourglass on an idle or done pane that reports the wait or stale metadata token, instead of its idle icon."
         },
         {
           "key": "ui.sidebar.agents.row_gap",
@@ -1441,6 +1453,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.agent_launchers",
+          "type": "table of strings",
+          "default": "{}",
+          "description": "Per-agent launcher override for native agent session restore, keyed by agent id. When set to a non-empty, non-whitespace string with no control characters, herdr types it verbatim as a prefix in the pane's own shell syntax, followed by a space and the stock resume arguments (for example \"cas\" in bash, or \"& 'C:\\Agent Tools\\cas.ps1'\" in PowerShell). Missing, empty, whitespace-only, or containing a control character means no override."
         }
       ]
     },

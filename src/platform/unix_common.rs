@@ -253,6 +253,7 @@ pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }
 
+#[cfg(not(test))]
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
@@ -335,13 +336,26 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
     Some(description)
 }
 
+// The disposition is process-wide. Under cfg(test) the unit tests share one
+// process, so these helpers leave it alone: SIG_DFL there would turn any other
+// test's write to a closed socket into a SIGPIPE kill of the test binary
+// (herdr-x843). The subprocess tests in tests/broken_pipe.rs cover the real
+// behavior against the built binary.
+#[cfg(not(test))]
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }
 
+#[cfg(not(test))]
 pub(crate) fn end_cli_output() {
     set_sigpipe_disposition(libc::SIG_IGN);
 }
+
+#[cfg(test)]
+pub(crate) fn begin_cli_output() {}
+
+#[cfg(test)]
+pub(crate) fn end_cli_output() {}
 
 pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
     super::RemoteSshConfigPaths {
@@ -739,5 +753,36 @@ mod shared_ssh_tests {
             std::io::ErrorKind::PermissionDenied
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+// herdr-x843: the unit tests share one process. A cli test that prints flips
+// SIGPIPE to its default through begin_cli_output, and from then on any other
+// test that writes to a closed socket kills the whole test binary (signal 13).
+#[cfg(test)]
+mod sigpipe_tests {
+    fn sigpipe_handler() -> libc::sighandler_t {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut action) };
+        action.sa_sigaction
+    }
+
+    #[test]
+    fn cli_output_helpers_leave_sigpipe_ignored_in_the_test_binary() {
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN, "Rust starts ignoring it");
+        super::begin_cli_output();
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN);
+        super::end_cli_output();
+        assert_eq!(sigpipe_handler(), libc::SIG_IGN);
+    }
+
+    #[test]
+    fn write_to_a_closed_socket_is_an_error_not_a_signal() {
+        use std::io::Write;
+        let (mut near, far) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(far);
+        super::begin_cli_output();
+        let err = near.write_all(b"x").expect_err("peer is closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

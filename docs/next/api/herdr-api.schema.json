@@ -2888,6 +2888,15 @@
             "agent": {
               "type": "string"
             },
+            "agent_pid": {
+              "description": "The agent process this report is about (herdr-c1o5, round-cap exit\na]), for a reporter outside that process such as a tmux bridge. With\n`agent_start` the report is applied only when Herdr finds that process\nalive, classified as the reported agent, and shown in this pane (in its\nforeground process group, or through `carrier_pid`). Optional and\nadditive: a report without it keeps today's behavior.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "agent_session_id": {
               "type": [
                 "string",
@@ -2897,6 +2906,33 @@
             "agent_session_path": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "agent_start": {
+              "description": "Start token of `agent_pid` (Linux: `/proc/<pid>/stat` field 22).\nWithout it `agent_pid` names no process.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "carrier_pid": {
+              "description": "The process in this pane through which the agent is shown (herdr-c1o5,\nround-cap exit a]), for an agent outside every herdr pane such as a\ntmux claude: for the tmux bridge, the tmux client in this pane. Counts\nonly with `carrier_start` and only in the pane's foreground process\ngroup.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "carrier_start": {
+              "description": "Start token of `carrier_pid`, same format as `agent_start`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             },
@@ -2946,6 +2982,22 @@
           "properties": {
             "agent": {
               "type": "string"
+            },
+            "agent_pid": {
+              "description": "The reporter's own pid (ADR-0002, herdr-3ir), sent only by the Claude\nintegration hook from `$CLAUDE_PID`. Used server-side to refuse a\nsame-owner session replacement whenever the reporter is not the\npane's foreground process group. Optional and additive: an old\nclient that never sends it keeps today's behavior unchanged.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "agent_session_cwd": {
+              "description": "The agent's own cwd at the moment it bound this session id (ADR-0002,\nherdr-ct9), sent only by the Claude integration hook from the\nSessionStart payload's `cwd` field. Persisted alongside the session\nreference and used as the resume shell's cwd instead of the pane's\nshell cwd, when it names a directory that still exists. Optional and\nadditive.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "agent_session_id": {
               "type": [

@@ -15,31 +15,49 @@ pub(super) fn render_collapsed(
         if row.agent.focused {
             buffer.set_style(rect, Style::default().bg(config.palette.active_row_bg));
         }
-        let initial = row.machine_label.chars().next().unwrap_or('?');
-        put_text(
+        let initial = row.machine_label.chars().next().unwrap_or('?').to_string();
+        let (icon, clock) = lookup_display_icon(row.agent.display, config, row.stale);
+        let written = put_text(
             buffer,
             rect.x,
             rect.y,
             rect.width,
-            &format!(
-                "{initial}{}",
-                status_icon(row.agent.status, config.status_indicators)
-            ),
+            &format!("{initial}{icon}"),
             Style::default()
                 .fg(if row.stale {
                     config.palette.overlay0
                 } else {
-                    status_color(row.agent.status, &config.palette)
+                    display_state_color(row.agent.display, &config.palette)
                 })
                 .add_modifier(if row.stale {
                     Modifier::DIM
                 } else {
-                    Modifier::empty()
+                    display_state_modifier(row.agent.display)
                 }),
+        );
+        config.mark_spinner_drawn_if(
+            clock,
+            icon_reached_frame(written, super::render::display_width(&initial), icon),
         );
         hits.endpoint_agents
             .push((rect, row.endpoint_id, row.agent.pane_id));
     }
+}
+
+/// The host-count sources of the agents header (herdr-8u7): every endpoint that is not disabled
+/// names a server; only an online one may contribute its counts.
+pub(super) fn host_sources(
+    endpoints: &[ClientShellEndpoint],
+) -> impl Iterator<Item = super::agent_sidebar::HostSource<'_>> {
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.status != crate::client::endpoint::ClientEndpointStatus::Disabled
+        })
+        .map(|endpoint| super::agent_sidebar::HostSource {
+            snapshot: endpoint.snapshot.as_deref(),
+            online: endpoint.status == crate::client::endpoint::ClientEndpointStatus::Online,
+        })
 }
 
 pub(super) fn render_expanded(
@@ -52,16 +70,21 @@ pub(super) fn render_expanded(
     agent_scroll: &mut usize,
     hits: &mut ShellHitMap,
 ) {
+    let rows = agent_rows(endpoints, active_endpoint_id, config);
+    // One model for the host counts (herdr-8u7): every non-disabled endpoint names a server; only
+    // online ones contribute counts, and a total over fewer servers than known is a lower bound.
+    let host = super::agent_sidebar::host_counts(host_sources(endpoints));
+    let counts = super::agent_sidebar::header_counts(rows.len(), &host.token_sets, host.expected);
     if !super::agent_sidebar::render_agent_panel_header(
         buffer,
         area,
         agent_view_label,
+        &counts,
         config,
         hits,
     ) {
         return;
     }
-    let rows = agent_rows(endpoints, active_endpoint_id, config);
     super::agent_sidebar::render_agent_list(
         buffer,
         area,
@@ -72,7 +95,7 @@ pub(super) fn render_expanded(
         hits,
         |row| row.agent.rows.len(),
         |buffer, rect, row, hits| {
-            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, config);
+            super::agent_sidebar::render_agent_row(buffer, rect, &row.agent, row.stale, config);
             if row.stale {
                 buffer.set_style(
                     rect,
@@ -174,4 +197,45 @@ fn agent_rows(
         })
     })
     .collect()
+}
+
+#[cfg(test)]
+mod host_sources_tests {
+    use super::host_sources;
+    use crate::client::endpoint::ClientEndpointStatus;
+
+    fn endpoint(
+        status: ClientEndpointStatus,
+        boot: Option<(&str, &str)>,
+    ) -> super::ClientShellEndpoint {
+        let mut endpoint = super::super::endpoints::local_endpoint();
+        endpoint.status = status;
+        endpoint.snapshot = boot.map(|(boot_id, workers)| {
+            let mut snapshot = crate::client::shell::tests::snapshot();
+            snapshot.boot_id = boot_id.into();
+            snapshot.workspaces[0].tokens = vec![("agents_w".to_owned(), workers.to_owned())];
+            Box::new(snapshot)
+        });
+        endpoint
+    }
+
+    fn header(endpoints: &[super::ClientShellEndpoint]) -> String {
+        let host = super::super::agent_sidebar::host_counts(host_sources(endpoints));
+        super::super::agent_sidebar::header_counts(0, &host.token_sets, host.expected)
+    }
+
+    // herdr-8u7 through the real endpoint mapping: disabled endpoints name no server, an offline
+    // alias of an online server neither contributes its stale counts nor marks the total, and an
+    // unreachable endpoint with no snapshot marks it.
+    #[test]
+    fn host_sources_maps_endpoint_status_into_the_count_model() {
+        let online = endpoint(ClientEndpointStatus::Online, Some(("boot-1", "2")));
+        let alias = endpoint(ClientEndpointStatus::Reconnecting, Some(("boot-1", "9")));
+        let disabled = endpoint(ClientEndpointStatus::Disabled, Some(("boot-3", "5")));
+        assert_eq!(header(&[alias, online, disabled]), "P:0 W:2");
+
+        let online = endpoint(ClientEndpointStatus::Online, Some(("boot-1", "2")));
+        let connecting = endpoint(ClientEndpointStatus::Connecting, None);
+        assert_eq!(header(&[online, connecting]), "P:0 W:2?");
+    }
 }

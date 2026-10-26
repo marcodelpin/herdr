@@ -376,6 +376,28 @@ pub struct PaneReportAgentParams {
     /// first element must be a plain command name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_argv: Option<Vec<String>>,
+    /// The agent process this report is about (herdr-c1o5, round-cap exit
+    /// a]), for a reporter outside that process such as a tmux bridge. With
+    /// `agent_start` the report is applied only when Herdr finds that process
+    /// alive, classified as the reported agent, and shown in this pane (in its
+    /// foreground process group, or through `carrier_pid`). Optional and
+    /// additive: a report without it keeps today's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pid: Option<u32>,
+    /// Start token of `agent_pid` (Linux: `/proc/<pid>/stat` field 22).
+    /// Without it `agent_pid` names no process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_start: Option<u64>,
+    /// The process in this pane through which the agent is shown (herdr-c1o5,
+    /// round-cap exit a]), for an agent outside every herdr pane such as a
+    /// tmux claude: for the tmux bridge, the tmux client in this pane. Counts
+    /// only with `carrier_start` and only in the pane's foreground process
+    /// group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_pid: Option<u32>,
+    /// Start token of `carrier_pid`, same format as `agent_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_start: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -395,6 +417,21 @@ pub struct PaneReportAgentSessionParams {
     /// first element must be a plain command name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_argv: Option<Vec<String>>,
+    /// The reporter's own pid (ADR-0002, herdr-3ir), sent only by the Claude
+    /// integration hook from `$CLAUDE_PID`. Used server-side to refuse a
+    /// same-owner session replacement whenever the reporter is not the
+    /// pane's foreground process group. Optional and additive: an old
+    /// client that never sends it keeps today's behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_pid: Option<u32>,
+    /// The agent's own cwd at the moment it bound this session id (ADR-0002,
+    /// herdr-ct9), sent only by the Claude integration hook from the
+    /// SessionStart payload's `cwd` field. Persisted alongside the session
+    /// reference and used as the resume shell's cwd instead of the pane's
+    /// shell cwd, when it names a directory that still exists. Optional and
+    /// additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -126,6 +126,10 @@ jobs:
         with:
           cache-bin: false
 
+      - name: Prefetch Zig packages (fetch retried; never a build)
+        if: steps.plan.outputs.should_publish == 'true'
+        uses: ./.github/actions/zig-fetch-retry
+
       - name: Run checks
         if: steps.plan.outputs.should_publish == 'true'
         run: |
@@ -219,6 +223,11 @@ jobs:
           Remove-Item -Recurse -Force .zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/.zig-cache -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
+
+      - name: Prefetch Zig packages (fetch retried; never a build)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: ${{ matrix.target }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

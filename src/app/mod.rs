@@ -4,7 +4,7 @@
 //! - `actions.rs` — state mutations (testable without PTYs/async)
 
 pub(crate) mod actions;
-mod agent_resume;
+pub(crate) mod agent_resume;
 #[cfg(test)]
 mod agent_suspend_tests;
 pub(crate) mod agent_view;
@@ -19,6 +19,7 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
+mod named_agent;
 mod popup;
 mod runtime;
 mod session;
@@ -36,7 +37,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -142,6 +143,14 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    /// herdr-3cr r3: dedupe keys of the deferred agent resumes started so
+    /// far, so a native fallback cannot resume a session a second time.
+    started_agent_resume_keys: std::collections::HashSet<String>,
+    /// herdr-3cr r4: plans whose native fallback yielded to another
+    /// terminal's still-pending plan of the same session, by that dedupe
+    /// key. If the pending owner fails instead of starting, they get their
+    /// plan back (`release_agent_resume_key`).
+    yielded_agent_resumes: std::collections::HashMap<String, Vec<agent_resume::YieldedAgentResume>>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -548,6 +557,7 @@ impl App {
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
             kitty_graphics_enabled: config.kitty_graphics_enabled(),
             default_shell: config.terminal.default_shell.clone(),
+            agent_launchers: config.session.agent_launchers.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
@@ -655,6 +665,8 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            started_agent_resume_keys: std::collections::HashSet::new(),
+            yielded_agent_resumes: std::collections::HashMap::new(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,
@@ -1002,6 +1014,10 @@ impl App {
             self.state.default_shell = config.terminal.default_shell.clone();
             self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
+        }
+
+        if !invalid_section("session") {
+            self.state.agent_launchers = config.session.agent_launchers.clone();
         }
 
         if !invalid_section("worktrees") {
@@ -1803,6 +1819,28 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_launcher_config_reload_updates_live_map() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-agent-launchers");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[session.agent_launchers]\nclaude = \"cas\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(app.state.agent_launchers.is_empty());
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.state.agent_launchers.get("claude"),
+            Some(&"cas".to_string())
+        );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

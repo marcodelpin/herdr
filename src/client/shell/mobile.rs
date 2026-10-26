@@ -15,6 +15,24 @@ struct MobileItem {
     lines: Vec<Line<'static>>,
     background: Color,
     target: Option<ClientMobileTarget>,
+    /// The animated glyph on the first line, when there is one.
+    spinner: Option<ItemSpinner>,
+}
+
+/// The animated glyph on an item's first line: the clock it advances on, the columns
+/// drawn before it on that line, and the glyph itself. The item marks the composition
+/// only when that line is inside the viewport AND the row is wide enough to have
+/// emitted the glyph, so a switcher a few columns wide animates nothing.
+struct ItemSpinner {
+    clock: SpinnerClock,
+    lead: u16,
+    icon: &'static str,
+}
+
+impl ItemSpinner {
+    fn new(clock: Option<SpinnerClock>, lead: u16, icon: &'static str) -> Option<Self> {
+        clock.map(|clock| Self { clock, lead, icon })
+    }
 }
 
 impl MobileItem {
@@ -29,6 +47,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: None,
+            spinner: None,
         }
     }
 
@@ -43,6 +62,7 @@ impl MobileItem {
             ))],
             background: palette.panel_bg,
             target: Some(target),
+            spinner: None,
         }
     }
 }
@@ -52,6 +72,7 @@ pub(super) fn render_mobile_header(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
     hits: &mut ShellHitMap,
 ) {
     if area.is_empty() {
@@ -69,7 +90,7 @@ pub(super) fn render_mobile_header(
     hits.mobile_switch = button;
     let status_width = button.x.saturating_sub(area.x).saturating_sub(1);
     let status = Rect::new(area.x, area.y, status_width, area.height);
-    render_header_status(buffer, status, snapshot, config);
+    render_header_status(buffer, status, snapshot, config, stale);
     render_header_button(buffer, button, snapshot, config);
 }
 
@@ -78,6 +99,7 @@ fn render_header_status(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
 ) {
     if area.is_empty() {
         return;
@@ -102,19 +124,24 @@ fn render_header_status(
     let tab_status = compact_tab_status(snapshot, workspace);
     let tab_width = display_width(&tab_status).saturating_add(1).min(area.width);
     let name_width = area.width.saturating_sub(tab_width);
-    put_text(
+    let display = super::sidebar::workspace_display_state(
+        snapshot,
+        &[workspace],
+        workspace.agent_status,
+        config,
+    );
+    let (icon, clock) = lookup_display_icon(display, config, stale);
+    // The glyph sits one column into the padded text, so a one-column budget paints
+    // the pad and nothing else.
+    let written = put_text(
         buffer,
         area.x,
         area.y,
         name_width.min(3),
-        &format!(
-            " {} ",
-            status_icon(workspace.agent_status, config.status_indicators)
-        ),
-        Style::default()
-            .fg(status_color(workspace.agent_status, palette))
-            .bg(palette.panel_bg),
+        &format!(" {icon} "),
+        display_state_style(display, palette).bg(palette.panel_bg),
     );
+    config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 1, icon));
     put_text(
         buffer,
         area.x.saturating_add(3),
@@ -140,6 +167,7 @@ fn render_header_status(
             Rect::new(area.x, area.y + 1, area.width, 1),
             snapshot,
             config,
+            stale,
         );
     }
 }
@@ -196,6 +224,7 @@ fn render_header_button(
             status_icon(
                 crate::api::schema::AgentStatus::Blocked,
                 config.status_indicators,
+                None,
             ),
             Style::default().fg(palette.red).bg(palette.surface0),
         );
@@ -238,6 +267,7 @@ fn render_agent_summary(
     area: Rect,
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
+    stale: bool,
 ) {
     use crate::api::schema::AgentStatus;
     let counts = [
@@ -293,11 +323,19 @@ fn render_agent_summary(
         if count == 0 {
             continue;
         }
-        let symbol = match (config.status_indicators, status) {
-            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => Some("◉"),
-            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => Some("●"),
-            (crate::config::StatusIndicatorStyle::Dots, _) => None,
-            _ => Some(status_icon(status, config.status_indicators)),
+        let (symbol, spinner) = match (config.status_indicators, status) {
+            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => {
+                (Some("\u{25c9}"), None)
+            }
+            (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => {
+                (Some("\u{25cf}"), None)
+            }
+            (crate::config::StatusIndicatorStyle::Dots, _) => (None, None),
+            _ => {
+                let (icon, spinner) =
+                    lookup_display_icon(DisplayState::Status(status), config, stale);
+                (Some(icon), spinner)
+            }
         };
         let text = symbol.map_or_else(
             || format!("{count} {label}"),
@@ -308,6 +346,9 @@ fn render_agent_summary(
         if area.right().saturating_sub(x) < needed {
             omitted = true;
             break;
+        }
+        if let Some(clock) = spinner {
+            config.mark_spinner_drawn(clock);
         }
         if !separator.is_empty() {
             x = put_segment(
@@ -324,7 +365,7 @@ fn render_agent_summary(
         let color = if shown == 0 {
             match status {
                 AgentStatus::Done => config.palette.blue,
-                _ => status_color(status, &config.palette),
+                _ => display_state_color(DisplayState::Status(status), &config.palette),
             }
         } else {
             config.palette.overlay1
@@ -377,6 +418,10 @@ pub(super) fn render_mobile_switcher(
     }
     let palette = &config.palette;
     Clear.render(area, buffer);
+    if area == buffer.area {
+        // The switcher hides the header and every row drawn under it.
+        config.clear_spinner_drawn();
+    }
     buffer.set_style(area, Style::default().bg(palette.panel_bg));
     hits.mobile_switch = Rect::default();
     if area.height <= 2 {
@@ -504,6 +549,13 @@ pub(super) fn render_mobile_switcher(
             let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
             let rect = Rect::new(content.x, y, content.width, height);
             buffer.set_style(rect, Style::default().bg(item.background));
+            if let Some(spinner) = &item.spinner {
+                config.mark_spinner_drawn_if(
+                    Some(spinner.clock),
+                    visible_start == item_start
+                        && icon_reached_frame(content.width, spinner.lead, spinner.icon),
+                );
+            }
             for row in visible_start..visible_end {
                 let line = item.lines[row - item_start].clone();
                 Paragraph::new(line).render(
@@ -607,6 +659,7 @@ fn mobile_items(
                 ],
                 background,
                 target: Some(ClientMobileTarget::Machine(endpoint.endpoint_id.clone())),
+                spinner: None,
             });
         }
     }
@@ -632,6 +685,7 @@ fn mobile_items(
                 ))],
                 background: palette.panel_bg,
                 target: None,
+                spinner: None,
             });
         }
         for row in agents {
@@ -700,20 +754,24 @@ fn mobile_items(
             } else {
                 Modifier::empty()
             };
+            let display = agent_display_state(agent, config);
+            let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
+            let prefix = "  ";
+            let spinner = ItemSpinner::new(spinner, display_width(prefix), icon);
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
-                        Span::styled("  ", Style::default().bg(background)),
+                        Span::styled(prefix, Style::default().bg(background)),
                         Span::styled(
-                            status_icon(agent.agent_status, config.status_indicators),
+                            icon,
                             Style::default()
                                 .fg(if endpoint.stale() {
                                     palette.overlay0
                                 } else {
-                                    status_color(agent.agent_status, palette)
+                                    display_state_color(display, palette)
                                 })
                                 .bg(background)
-                                .add_modifier(dim),
+                                .add_modifier(dim | display_state_modifier(display)),
                         ),
                         Span::styled(" ", Style::default().bg(background)),
                         Span::styled(
@@ -743,6 +801,7 @@ fn mobile_items(
                     endpoint_id: endpoint.endpoint_id.clone(),
                     pane_id: agent.pane_id.clone(),
                 }),
+                spinner,
             });
         }
     }
@@ -816,29 +875,41 @@ fn mobile_items(
             } else {
                 palette.text
             };
+            let display = super::sidebar::workspace_display_state(
+                endpoint.snapshot,
+                &[workspace],
+                workspace.agent_status,
+                config,
+            );
             let status = if endpoint.stale() {
                 palette.overlay0
             } else {
-                status_color(workspace.agent_status, palette)
+                display_state_color(display, palette)
             };
             let stale_detail = if endpoint.stale() {
                 format!(" · {}", mobile_endpoint_state(endpoint.status))
             } else {
                 String::new()
             };
+            let (icon, spinner) = lookup_display_icon(display, config, endpoint.stale());
+            let prefix = format!("  {connector}");
+            let spinner = ItemSpinner::new(spinner, display_width(&prefix), icon);
             items.push(MobileItem {
                 lines: vec![
                     Line::from(vec![
                         Span::styled(
-                            format!("  {connector}"),
+                            prefix,
                             Style::default()
                                 .fg(palette.overlay0)
                                 .bg(background)
                                 .add_modifier(dim),
                         ),
                         Span::styled(
-                            status_icon(workspace.agent_status, config.status_indicators),
-                            Style::default().fg(status).bg(background).add_modifier(dim),
+                            icon,
+                            Style::default()
+                                .fg(status)
+                                .bg(background)
+                                .add_modifier(dim | display_state_modifier(display)),
                         ),
                         Span::styled(" ", Style::default().bg(background)),
                         Span::styled(
@@ -875,6 +946,7 @@ fn mobile_items(
                     endpoint_id: endpoint.endpoint_id.clone(),
                     workspace_id: workspace.workspace_id.clone(),
                 }),
+                spinner,
             });
         }
     }
@@ -919,6 +991,7 @@ fn mobile_items(
                     endpoint_id: active_endpoint_id.clone(),
                     tab_id: tab.tab_id.clone(),
                 }),
+                spinner: None,
             });
         }
     }
@@ -935,6 +1008,7 @@ fn mobile_items(
             ))],
             background: palette.panel_bg,
             target: Some(ClientMobileTarget::Menu(index)),
+            spinner: None,
         });
     }
     items

@@ -25,6 +25,12 @@ pub struct AgentResumePlan {
     pub agent: String,
     pub argv: Vec<String>,
     pub dedupe_key: String,
+    /// herdr-nrr: `Some` only for a reported resume command - the directory
+    /// its dedupe key reserved at restore time. The command (for example
+    /// `agent --continue`) names a session only relative to that directory,
+    /// so the deferred launch runs it there or not at all. `None` for a
+    /// native plan, whose argv names its session explicitly.
+    pub launch_dir: Option<std::path::PathBuf>,
 }
 
 /// A resume command reported by the agent itself, run in the restored pane.
@@ -39,6 +45,7 @@ impl ReportedAgentResume {
     /// The same command can name different sessions in different directories,
     /// for example `agent --continue`, so the directory is part of its identity.
     pub fn plan(&self, cwd: &Path) -> AgentResumePlan {
+        let dir = resume_dir_identity(cwd);
         AgentResumePlan {
             agent: self.agent.clone(),
             argv: self.argv.clone(),
@@ -46,11 +53,32 @@ impl ReportedAgentResume {
                 "{}\u{0}{}\u{0}{}\u{0}argv\u{0}{}",
                 self.source,
                 self.agent,
-                cwd.display(),
+                dir.display(),
                 self.argv.join("\u{0}")
             ),
+            launch_dir: Some(dir),
         }
     }
+}
+
+/// herdr-3cr (codex h3cr-r1 P2-4): one spelling per directory for a reported
+/// resume command's identity, so `/d`, `/d/`, `/d/.` and a symlink to `/d`
+/// reserve the same dedupe key and match the same launch directory. An
+/// existing directory resolves to its canonical path; one that cannot be
+/// resolved keeps its lexical components (trailing slashes and `.` dropped).
+pub fn resume_dir_identity(dir: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.components().collect())
+}
+
+/// herdr-3cr r3 (codex h3cr-r2b P2-2): the one rule for whether an agent's
+/// reported cwd names a directory restore may use. Cold-restore admission,
+/// the reported command's reservation and the deferred launch all call it,
+/// so a pane is never admitted (and never reserves a session) on a cwd the
+/// launch then refuses. A relative cwd is rejected: it would resolve against
+/// the server's working directory, not the directory the agent ran in.
+pub fn usable_agent_cwd(cwd: &str) -> Option<std::path::PathBuf> {
+    let path = Path::new(cwd);
+    (path.is_absolute() && path.is_dir()).then(|| path.to_path_buf())
 }
 
 /// Restore types the command into the pane's shell, so the executable must be a
@@ -88,11 +116,45 @@ pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// ADR-0002, herdr-ct9 amendment: the agent's own reported cwd travels AS
+/// PART OF the session value it belongs to, not as a sibling field on
+/// `TerminalState`. Two adversarial review rounds found the sibling-field
+/// shape structurally unsafe - every place that sets, replaces or clears a
+/// `PersistedAgentSession` has to remember the cwd too, and three call sites
+/// did not (a same-id non-foreground report rewrote it, a session removal
+/// left it for the next agent's session to inherit, a cold restore
+/// overwrote the pane's own cwd with it and lost the fallback). Embedding it
+/// here makes the compiler enforce the discipline: every construction site
+/// must say what the cwd is, so `None` is a decision, never an omission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedAgentSession {
     pub source: String,
     pub agent: String,
     pub session_ref: AgentSessionRef,
+    pub cwd: Option<String>,
+}
+
+impl PersistedAgentSession {
+    /// Replaces the cwd, keeping the rest of the session identity as-is.
+    /// The one place production code should reach for after building or
+    /// cloning a session whose cwd is not yet known at construction time.
+    pub fn with_cwd(mut self, cwd: Option<String>) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
+    /// Whether `self` and `other` name the SAME session (source, agent,
+    /// session ref), ignoring `cwd`. The `cwd` a later report attaches to an
+    /// otherwise-unchanged session must not make an identity check that
+    /// predates ADR-0002's cwd field start reporting "different session" -
+    /// full `PartialEq` (which DOES compare `cwd`) is for asserting the
+    /// value is byte-for-byte unchanged, this is for "is it still the same
+    /// conversation".
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.agent == other.agent
+            && self.session_ref == other.session_ref
+    }
 }
 
 impl AgentSessionRef {
@@ -147,6 +209,7 @@ pub fn persisted_session_from_launch_args(
         source: "herdr:codex".into(),
         agent: "codex".into(),
         session_ref: AgentSessionRef::id(session_id.clone())?,
+        cwd: None,
     })
 }
 
@@ -164,6 +227,7 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
+            | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
             | ("herdr:droid", "droid")
@@ -192,6 +256,7 @@ pub fn session_ref_from_snapshot(
         source: source.to_string(),
         agent: agent.to_string(),
         session_ref,
+        cwd: None,
     })
 }
 
@@ -314,6 +379,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         agent: agent.to_string(),
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),
+        launch_dir: None,
     })
 }
 
@@ -406,7 +472,7 @@ mod tests {
     #[test]
     fn native_state_reservation_excludes_full_lifecycle_sources() {
         assert!(is_reserved_native_state_source("herdr:claude", "claude"));
-        assert!(!is_reserved_native_state_source("herdr:codex", "codex"));
+        assert!(is_reserved_native_state_source("herdr:codex", "codex"));
         assert!(is_reserved_native_state_source("herdr:devin", "devin"));
         assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
         assert!(!is_reserved_native_state_source(

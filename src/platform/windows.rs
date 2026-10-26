@@ -15,7 +15,12 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+mod console_stop;
+#[cfg(test)]
+mod console_stop_tests;
 mod notifications;
+
+pub(crate) use console_stop::spawn_server_signal_monitor;
 pub(crate) use notifications::{
     foreground_desktop_notification_host, maybe_activate_desktop_notification,
     show_actionable_desktop_notification, show_desktop_notification,
@@ -1589,6 +1594,33 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
 }
 
+/// ADR-0002, herdr-3ir: Windows has no POSIX process-group/controlling-
+/// terminal model, and the Job-Object heuristic `foreground_process_group_id`
+/// above uses does not discriminate a nested worker the way `setsid()` does
+/// on Unix (a Job Object assigned at pane-spawn is typically inherited down
+/// the whole descendant tree). Documented no-op: the herdr-3ir reporter-
+/// foreground gate fails open on Windows rather than ship a heuristic that
+/// cannot tell a nested worker from the interactive session.
+pub fn process_group_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// ADR-0002, herdr-4r8: a monotonic marker for when `pid` started, reusing
+/// the same `GetProcessTimes` creation-FILETIME read `process_creation_time`
+/// already performs for other callers.
+pub fn process_start_marker(pid: u32) -> Option<u64> {
+    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    process_creation_time(process.0)
+}
+
+/// ADR-0002, herdr-4r8, P1-a: Windows has no pid-namespace concept.
+/// Documented no-op so a registry record's `pidDomain` is never treated as
+/// foreign here - it is simply incomparable, and the caller falls open to
+/// the existing pid+start-marker check.
+pub fn local_pid_domain() -> Option<String> {
+    None
+}
+
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
     process_cwd_from_handle(process.0)
@@ -1865,6 +1897,12 @@ fn process_entry_identifies_agent_read(entry: &WindowsProcessEntry) -> Option<bo
     }
     entry.command().cmdline.as_ref()?;
     Some(crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some())
+}
+
+/// herdr-c1o5: no job-control read here, so a named report is refuted
+/// (ADR-0008 round 2, residuals).
+pub fn process_job_read(_pid: u32) -> Option<super::ProcessJobRead> {
+    None
 }
 
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
@@ -2686,6 +2724,15 @@ pub fn process_exists(pid: u32) -> bool {
     let mut exit_code = 0;
     let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) } != 0;
     ok && exit_code == STILL_ACTIVE
+}
+
+/// ADR-0002, herdr-3ir/4r8/ct9 fix round, codex ar-r4 (P2 #2): Windows has no
+/// zombie-process concept - `process_exists` above already checks
+/// `GetExitCodeProcess` against `STILL_ACTIVE`, so an exited process is
+/// already reported as not existing and never reaches this predicate.
+/// Documented no-op, keeping today's behaviour.
+pub fn process_is_zombie(_pid: u32) -> bool {
+    false
 }
 
 static LAST_CLIPBOARD_WRITE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -4146,13 +4193,15 @@ mod tests {
         let changed = cwd.join("Changed");
         fs::create_dir(&changed).expect("create changed cwd");
         let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        // Both children are named by absolute path on purpose: the native shell, and on a
+        // 64-bit reader the x86 SysWOW64 shell, whose cwd lives only in its x86 PEB.
         let shells = [
             windows.join("System32").join("cmd.exe"),
             #[cfg(target_pointer_width = "64")]
             windows.join("SysWOW64").join("cmd.exe"),
         ];
         let mut observations = Vec::new();
-        for shell in shells {
+        for (index, shell) in shells.into_iter().enumerate() {
             let mut child = Command::new(&shell)
                 .args(["/D", "/Q", "/K"])
                 .current_dir(super::normalize_cwd_for_launch_platform(&launch_cwd))
@@ -4172,22 +4221,38 @@ mod tests {
                 }
             };
             let initial = observe(&cwd);
+            // The marker is written only after `cd` succeeded, so the cwd read below is judged
+            // against a shell that has really moved. Under a loaded runner the x86 shell has
+            // taken more than 5 s to run the line (herdr-l4p5); that latency is the shell's,
+            // and it gets its own generous wait and its own failure message.
+            let cd_done = cwd.join(format!("cd-done-{index}"));
             use std::io::Write;
             writeln!(
                 child.stdin.as_ref().unwrap(),
-                "cd /d \"{}\"\r",
-                changed.display()
+                "cd /d \"{}\" && echo done> \"{}\"\r",
+                changed.display(),
+                cd_done.display()
             )
             .expect("change cmd cwd");
+            let cd_deadline = Instant::now() + Duration::from_secs(60);
+            while !cd_done.is_file() && Instant::now() < cd_deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let shell_ran_cd = cd_done.is_file();
             let after_cd = observe(&changed);
             let pane_cwd = super::pane_process_cwd(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            observations.push((shell, initial, after_cd, pane_cwd));
+            observations.push((shell, initial, shell_ran_cd, after_cd, pane_cwd));
         }
         let _ = fs::remove_dir_all(&cwd);
-        for (shell, initial, after_cd, pane_cwd) in observations {
+        for (shell, initial, shell_ran_cd, after_cd, pane_cwd) in observations {
             assert_eq!(initial, Some(cwd.clone()), "{} launch cwd", shell.display());
+            assert!(
+                shell_ran_cd,
+                "{} did not run cd within 60 s (shell latency, not the cwd reader)",
+                shell.display()
+            );
             assert_eq!(
                 after_cd,
                 Some(changed.clone()),

@@ -110,6 +110,9 @@ pub enum AppEvent {
         message: Option<String>,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        /// herdr-c1o5: the API layer's verdict on the agent process the
+        /// report names (ADR-0008 amendment 2026-10-25, round-cap exit a]).
+        named_agent: crate::terminal::NamedAgentVerdict,
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {
@@ -119,6 +122,16 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        /// Whether the reporter's own process group matched the pane's
+        /// foreground process group at report time (ADR-0002, herdr-3ir).
+        /// Computed once at the API layer (which alone has the platform/IO
+        /// access to answer it), never re-derived in `TerminalState`.
+        /// `None` when unknown (no reporter pid, unresolvable, or a
+        /// platform with no primitive) - fails open to today's behavior.
+        reporter_is_foreground: Option<bool>,
+        /// The agent's own reported cwd at the moment it bound this session
+        /// id (ADR-0002, herdr-ct9), persisted alongside the session ref.
+        agent_session_cwd: Option<String>,
     },
     /// A reporter supplied the command that resumes its own session.
     AgentResumeReported {

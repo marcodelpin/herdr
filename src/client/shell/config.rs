@@ -125,6 +125,8 @@ impl ClientShellConfig {
             agents: config.ui.sidebar.agents.clone(),
             agent_panel_sort: config.ui.agent_panel_sort,
             status_indicators: config.ui.status_indicators,
+            animate_working: config.ui.animate_working,
+            waiting_indicator: config.ui.waiting_indicator,
             sound_enabled: config.ui.sound.enabled,
             toast_delivery: config.ui.toast.delivery,
             toast_delay_seconds: config.ui.toast.delay_seconds,
@@ -159,6 +161,10 @@ impl ClientShellConfig {
             preferences: preferences::ClientChromePreferences::default(),
             startup_config_diagnostic: None,
             startup_onboarding: false,
+            spinner_frame: 0,
+            spinner_drawn: std::cell::Cell::new(false),
+            waiting_frame: 0,
+            waiting_drawn: std::cell::Cell::new(false),
         }
     }
 
@@ -176,6 +182,63 @@ impl ClientShellConfig {
         self.keybinding_source = source;
         self.keybinds.keybinds.custom_commands.clear();
         self
+    }
+
+    /// Picks the frame of every spinner clock for the composition about to be drawn.
+    pub(super) fn begin_spinner_frame(&mut self, epoch: std::time::Instant) {
+        let elapsed = epoch.elapsed();
+        self.spinner_frame = spinner_frame_at(elapsed);
+        self.waiting_frame = waiting_frame_at(elapsed);
+        self.spinner_drawn.set(false);
+        self.waiting_drawn.set(false);
+    }
+
+    /// The clock a row in `display` animates on, or `None` when its icon stays
+    /// static. A pure lookup: only `mark_spinner_drawn` records that a frame reached
+    /// the screen.
+    pub(super) fn spinner_clock_for(&self, display: DisplayState) -> Option<SpinnerClock> {
+        if !self.animate_working {
+            return None;
+        }
+        match display {
+            DisplayState::Status(crate::api::schema::AgentStatus::Working) => {
+                Some(SpinnerClock::Working)
+            }
+            DisplayState::Waiting => Some(SpinnerClock::Waiting),
+            DisplayState::Status(_) | DisplayState::Stale => None,
+        }
+    }
+
+    /// The frame `clock` is on in the composition being drawn.
+    pub(super) fn spinner_frame_for(&self, clock: SpinnerClock) -> usize {
+        match clock {
+            SpinnerClock::Working => self.spinner_frame,
+            SpinnerClock::Waiting => self.waiting_frame,
+        }
+    }
+
+    /// Records that the composition put an animated glyph into the frame, so the
+    /// client timer keeps advancing that clock.
+    pub(super) fn mark_spinner_drawn(&self, clock: SpinnerClock) {
+        match clock {
+            SpinnerClock::Working => self.spinner_drawn.set(true),
+            SpinnerClock::Waiting => self.waiting_drawn.set(true),
+        }
+    }
+
+    /// Records `clock` only when the glyph actually reached the frame. A row whose
+    /// icon budget could not hold it shows nothing, so scheduling a repaint for it
+    /// would spin the client on a frame that never changes.
+    pub(super) fn mark_spinner_drawn_if(&self, clock: Option<SpinnerClock>, drawn: bool) {
+        if let Some(clock) = clock.filter(|_| drawn) {
+            self.mark_spinner_drawn(clock);
+        }
+    }
+
+    /// Forgets every animated glyph drawn so far, for a layer that covers them all.
+    pub(super) fn clear_spinner_drawn(&self) {
+        self.spinner_drawn.set(false);
+        self.waiting_drawn.set(false);
     }
 
     pub(crate) fn uses_endpoint_keybindings(&self) -> bool {
@@ -352,6 +415,8 @@ impl ClientShellConfig {
                 self.agents = ui.sidebar.agents.clone();
                 self.agent_panel_sort = ui.agent_panel_sort;
                 self.status_indicators = ui.status_indicators;
+                self.animate_working = ui.animate_working;
+                self.waiting_indicator = ui.waiting_indicator;
                 self.sound_enabled = ui.sound.enabled;
                 self.toast_delivery = ui.toast.delivery;
                 self.toast_delay_seconds = ui.toast.delay_seconds;
@@ -483,6 +548,8 @@ mod tests {
         next.ui.tab_bar_position = TabBarPositionConfig::Bottom;
         next.ui.agent_panel_sort = crate::config::AgentPanelSortConfig::Priority;
         next.ui.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+        next.ui.animate_working = false;
+        next.ui.waiting_indicator = false;
         next.ui.sidebar.agents = toml::from_str("rows = [[{ token = 'machine', rules = [{ equals = 'Local', bold = true }] }]]\nrow_gap = 2").unwrap();
         next.keys.prefix = crate::config::BindingConfig::one("ctrl+a");
 
@@ -499,6 +566,8 @@ mod tests {
             shell.status_indicators,
             crate::config::StatusIndicatorStyle::Symbols
         );
+        assert!(!shell.animate_working);
+        assert!(!shell.waiting_indicator);
         assert_eq!(shell.agents.row_gap, 2);
         assert_eq!(
             shell.agents.rows[0][0]

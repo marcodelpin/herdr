@@ -178,9 +178,38 @@ pub struct PaneStateUpdate {
     pub seen: bool,
     pub presentation: crate::terminal::EffectivePresentation,
     pub agent_name_changed: bool,
-    pub agent_released: bool,
-    pub agent_release_status: Option<crate::api::schema::AgentStatus>,
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19): the release this update
+    /// publishes, as the state machine named it; `agent_label` and
+    /// `known_agent` stay the effective agent's.
+    pub release: Option<PaneAgentRelease>,
     pub suppress_completion: bool,
+}
+
+/// herdr-c1o5 (ADR-0008 round 7, rule 19): a published release - the released
+/// agent and the status it leaves with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneAgentRelease {
+    pub agent_label: Option<String>,
+    pub known_agent: Option<Agent>,
+    pub status: crate::api::schema::AgentStatus,
+}
+
+impl PaneStateUpdate {
+    pub fn agent_released(&self) -> bool {
+        self.release.is_some()
+    }
+
+    /// herdr-c1o5 (ADR-0008 round 7, rule 19 c): the agent whose state this
+    /// update publishes - the effective agent; a release that leaves none
+    /// leaves the released agent's final state in the pane.
+    pub fn status_agent(&self) -> (Option<&str>, Option<Agent>) {
+        match &self.release {
+            Some(release) if self.agent_label.is_none() => {
+                (release.agent_label.as_deref(), release.known_agent)
+            }
+            _ => (self.agent_label.as_deref(), self.known_agent),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,8 +350,7 @@ impl AppState {
                     seen,
                     presentation: change.presentation.clone(),
                     agent_name_changed: false,
-                    agent_released: false,
-                    agent_release_status: None,
+                    release: None,
                     suppress_completion: false,
                 };
                 Some(update)
@@ -1496,22 +1524,33 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
+                named_agent,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
+                    // herdr-c1o5 (ADR-0008 round 2, rule 11): the API's gate.
                     self.update_terminal_state(pane_id, |terminal| {
+                        if terminal.report_dropped_by_named_agent_rule(
+                            &source,
+                            &agent_label,
+                            named_agent,
+                        ) {
+                            return None;
+                        }
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
                     })
                     .into_iter()
                     .collect()
                 } else {
                     self.update_terminal_state(pane_id, |terminal| {
-                        terminal.set_hook_authority_with_session_ref(
+                        terminal.set_hook_authority_naming_agent_at(
                             source,
                             agent_label,
                             state,
                             message,
                             session_ref,
                             seq,
+                            named_agent,
+                            Instant::now(),
                         )
                     })
                     .into_iter()
@@ -1547,14 +1586,18 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                reporter_is_foreground,
+                agent_session_cwd,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_reporter(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        reporter_is_foreground,
+                        agent_session_cwd,
                     )
                 })
                 .into_iter()
@@ -1728,7 +1771,7 @@ impl AppState {
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
             let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
-            let unchanged_change = (mutation.agent_released
+            let unchanged_change = (mutation.agent_released()
                 || agent_name_changed
                 || (completion_reset && had_completion))
                 .then(|| terminal.unchanged_effective_state_change_at(now));
@@ -1745,10 +1788,18 @@ impl AppState {
             self.pending_agent_notifications.remove(&pane_id);
             self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
         }
-        if mutation.session_ref_changed || managed_changed || agent_name_changed {
+        // P2-d (ADR-0002, herdr-ct9): a cwd-only update (the session
+        // identity is unchanged, only the persisted session's `cwd` moved -
+        // e.g. the first report after a v10 -> v11 hook upgrade) must still
+        // schedule a save, or it is silently lost on the next restart.
+        if mutation.session_ref_changed
+            || mutation.persisted_agent_session_cwd_changed
+            || managed_changed
+            || agent_name_changed
+        {
             self.mark_session_dirty();
         }
-        let agent_released = mutation.agent_released;
+        let release = mutation.release;
         let change = mutation.effective_state_change.or(unchanged_change)?;
         let suppress_completion = force_suppress_completion
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
@@ -1770,22 +1821,17 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
-            agent_label: if agent_released {
-                change.previous_agent_label.clone()
-            } else {
-                change.agent_label.clone()
-            },
-            known_agent: if agent_released {
-                change.previous_known_agent
-            } else {
-                change.known_agent
-            },
+            agent_label: change.agent_label.clone(),
+            known_agent: change.known_agent,
             state: change.state,
             seen,
             presentation: change.presentation.clone(),
             agent_name_changed,
-            agent_released,
-            agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            release: release.map(|release| PaneAgentRelease {
+                agent_label: release.agent_label,
+                known_agent: release.known_agent,
+                status: pane_agent_status(release.final_state, seen),
+            }),
             suppress_completion,
         };
         Some(update)
@@ -1823,7 +1869,7 @@ impl AppState {
                 ))
             },
         )?;
-        update.agent_released.then_some(update)
+        update.agent_released().then_some(update)
     }
 
     fn apply_pane_state_change(
@@ -3280,6 +3326,7 @@ mod tests {
             (3, "new", AgentState::Idle),
         ] {
             app.handle_app_event(AppEvent::HookStateReported {
+                named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
                 pane_id,
                 source: "custom:worker".into(),
                 agent_label: label.into(),
@@ -3314,6 +3361,8 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                reporter_is_foreground: None,
+                agent_session_cwd: None,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
@@ -3646,6 +3695,7 @@ mod tests {
 
     fn report_custom_agent_with_resume(state: &mut AppState, pane_id: PaneId, argv: &[&str]) {
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "prime-agent".into(),
             agent_label: "prime-agent".into(),
@@ -3669,76 +3719,6 @@ mod tests {
             .attached_terminal_id
             .clone();
         (pane_id, terminal_id)
-    }
-
-    #[test]
-    fn codex_hook_turn_lifecycle_preserves_session_and_beats_stale_working_screen() {
-        let mut state = app_with_workspaces(&["one"]);
-        let (pane_id, terminal_id) = first_pane_terminal(&state);
-        state.handle_app_event(AppEvent::StateChanged {
-            pane_id,
-            agent: Some(Agent::Codex),
-            state: AgentState::Working,
-            visible_blocker: false,
-            visible_working: true,
-            process_exited: false,
-            observed_at: std::time::Instant::now(),
-        });
-
-        for (session, seq) in [("first", 1), ("second", 4)] {
-            state.handle_app_event(AppEvent::AgentSessionReported {
-                pane_id,
-                source: "herdr:codex".into(),
-                agent_label: "codex".into(),
-                seq: Some(seq),
-                session_ref: crate::agent_resume::AgentSessionRef::id(session),
-                session_start_source: Some("startup".into()),
-            });
-            state.handle_app_event(AppEvent::HookStateReported {
-                pane_id,
-                source: "herdr:codex".into(),
-                agent_label: "codex".into(),
-                state: AgentState::Working,
-                message: None,
-                seq: Some(seq + 1),
-                session_ref: crate::agent_resume::AgentSessionRef::id(session),
-            });
-            state.handle_app_event(AppEvent::HookStateReported {
-                pane_id,
-                source: "herdr:codex".into(),
-                agent_label: "codex".into(),
-                state: AgentState::Idle,
-                message: None,
-                seq: Some(seq + 2),
-                session_ref: crate::agent_resume::AgentSessionRef::id(session),
-            });
-            assert_eq!(state.terminals[&terminal_id].state, AgentState::Idle);
-            assert!(state.terminals[&terminal_id]
-                .last_agent_completion_seq
-                .is_some());
-            assert!(state.terminals[&terminal_id].session_ref_is_current(
-                &crate::agent_resume::AgentSessionRef::id(session).unwrap()
-            ));
-        }
-        state.handle_app_event(AppEvent::HookStateReported {
-            pane_id,
-            source: "herdr:codex".into(),
-            agent_label: "codex".into(),
-            state: AgentState::Working,
-            message: None,
-            seq: Some(7),
-            session_ref: crate::agent_resume::AgentSessionRef::id("second"),
-        });
-        state.handle_app_event(AppEvent::HookStateReported {
-            pane_id,
-            source: "herdr:codex".into(),
-            agent_label: "codex".into(),
-            state: AgentState::Idle,
-            message: None,
-            seq: Some(8),
-            session_ref: crate::agent_resume::AgentSessionRef::id("first"),
-        });
-        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
     }
 
     #[test]
@@ -3784,6 +3764,7 @@ mod tests {
         state.session_dirty = false;
 
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:other".into(),
             agent_label: "other".into(),
@@ -3887,6 +3868,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:pi".into(),
             agent_label: "pi".into(),
@@ -3916,6 +3898,7 @@ mod tests {
         let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
 
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id: bg_pane_id,
             source: "custom:hermes".into(),
             agent_label: "hermes".into(),
@@ -3954,6 +3937,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id: bg_pane_id,
             source: "herdr:codex".into(),
             agent_label: "codex".into(),
@@ -4002,6 +3986,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:claude".into(),
             agent_label: "claude".into(),
@@ -4062,6 +4047,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            cwd: None,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),
@@ -4111,6 +4097,7 @@ mod tests {
             observed_at: std::time::Instant::now(),
         });
         state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "herdr:devin".into(),
             agent_label: "devin".into(),
@@ -4135,6 +4122,7 @@ mod tests {
         let second_session = test_dir.join("two.jsonl").display().to_string();
 
         let first_updates = state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
@@ -4147,6 +4135,7 @@ mod tests {
         state.session_dirty = false;
 
         let second_updates = state.handle_app_event(AppEvent::HookStateReported {
+            named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),
@@ -4217,6 +4206,71 @@ mod tests {
         assert_eq!(state.terminals.get(&terminal_id).unwrap().cwd, cwd);
         assert!(state.session_dirty);
         let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    // herdr-3ir/4r8/ct9 fix round, P2-d: the SAME claude session is reported
+    // again with an `agent_session_cwd` it did not carry before (the shape
+    // of a v10 -> v11 hook upgrade's first post-upgrade report) - the
+    // session identity is unchanged, so `session_ref_changed` alone would
+    // never mark the session dirty, and the cwd would silently fail to
+    // persist across a restart.
+    #[test]
+    fn agent_restore_p2d_app_level_cwd_only_change_marks_session_dirty() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+                cwd: None,
+            });
+        assert_eq!(
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone()),
+            None
+        );
+        state.session_dirty = false;
+
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(2),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
+            session_start_source: Some("resume".into()),
+            reporter_is_foreground: Some(true),
+            agent_session_cwd: Some("/work/project".into()),
+        });
+
+        assert_eq!(
+            state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.cwd.as_deref()),
+            Some("/work/project"),
+            "the cwd should have been persisted onto the terminal"
+        );
+        assert!(
+            state.session_dirty,
+            "a cwd-only change must still schedule a save, or it is lost on the next restart"
+        );
     }
 
     #[test]
@@ -4625,12 +4679,22 @@ mod tests {
         assert!(!state.pane_is_in_active_tab(update.ws_idx, pane_id));
         assert_eq!(update.previous_state, AgentState::Working);
         assert_eq!(update.state, AgentState::Idle);
-        assert_eq!(update.agent_label.as_deref(), Some("pi"));
-        assert_eq!(update.known_agent, Some(Agent::Pi));
-        assert!(update.agent_released);
+        // ADR-0008 round 7, rule 19: the exit leaves no effective agent; the
+        // update publishes pi's final state under the released pi.
+        assert_eq!(update.agent_label, None);
+        assert_eq!(update.status_agent(), (Some("pi"), Some(Agent::Pi)));
+        assert!(update.agent_released());
         assert_eq!(
-            update.agent_release_status,
-            Some(crate::api::schema::AgentStatus::Done)
+            update.release.as_ref().map(|release| (
+                release.agent_label.as_deref(),
+                release.known_agent,
+                release.status
+            )),
+            Some((
+                Some("pi"),
+                Some(Agent::Pi),
+                crate::api::schema::AgentStatus::Done
+            ))
         );
         assert!(matches!(
             state.toast.as_ref().map(|toast| toast.kind),

@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -270,6 +273,16 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Per-agent launcher override for native agent session restore, keyed by
+    /// the same agent id the resume plan carries (for example "claude"). The
+    /// value is typed VERBATIM as a shell command prefix, written in the
+    /// pane's own shell syntax - for example `"cas"` for a bash pane, or
+    /// `"& 'C:\\Agent Tools\\cas.ps1'"` for a PowerShell pane - followed by a
+    /// space and the stock resume arguments, so a restored pane can run
+    /// through an account or flag wrapper instead of the bare agent binary.
+    /// Missing, empty, all-whitespace, or containing a control character
+    /// means no override. Default: empty.
+    pub agent_launchers: BTreeMap<String, String>,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +290,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            agent_launchers: BTreeMap::new(),
         }
     }
 }
@@ -998,6 +1012,12 @@ pub struct UiConfig {
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
     /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
+    /// Animate the Working state icon as a spinner, and turn the waiting hourglass over once a
+    /// second on the same setting; every other state stays static. Default: true.
+    pub animate_working: bool,
+    /// Show the WAITING / STALE state icon on an idle or done pane that reports the
+    /// `wait` / `stale` metadata tokens, instead of its idle icon. Default: true.
+    pub waiting_indicator: bool,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1226,6 +1246,8 @@ impl Default for UiConfig {
             agent_panel_sort: AgentPanelSortConfig::Spaces,
             _legacy_agent_panel_scope: None,
             status_indicators: StatusIndicatorStyle::Dots,
+            animate_working: true,
+            waiting_indicator: true,
             sidebar: SidebarConfig::default(),
             accent: "cyan".into(),
             toast: ToastConfig::default(),
@@ -1447,6 +1469,26 @@ startup_per_agent_delay_ms = 0
     }
 
     #[test]
+    fn agent_launcher_config_defaults_empty_and_parses_alongside_resume_flag() {
+        let default_config = Config::default();
+        assert!(default_config.session.agent_launchers.is_empty());
+
+        let toml = r#"
+[session]
+resume_agents_on_restore = false
+
+[session.agent_launchers]
+claude = "cas"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(
+            config.session.agent_launchers.get("claude"),
+            Some(&"cas".to_string())
+        );
+    }
+
+    #[test]
     fn agent_panel_sort_config_parses_alias_and_defaults() {
         assert_eq!(
             Config::default().ui.agent_panel_sort,
@@ -1490,6 +1532,34 @@ status_indicators = "symbols"
         )
         .unwrap();
         assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Symbols);
+    }
+
+    #[test]
+    fn animate_working_defaults_to_true_and_parses_false() {
+        assert!(Config::default().ui.animate_working);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+animate_working = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.ui.animate_working);
+    }
+
+    #[test]
+    fn waiting_indicator_defaults_to_true_and_parses_false() {
+        assert!(Config::default().ui.waiting_indicator);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+waiting_indicator = false
+"#,
+        )
+        .unwrap();
+        assert!(!config.ui.waiting_indicator);
     }
 
     #[test]

@@ -478,6 +478,10 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.validate_input_submission(bytes)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -590,6 +594,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_incarnation(&self) -> Option<(u32, u64)> {
+        self.0.child_incarnation()
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -630,6 +638,11 @@ impl TerminalRuntime {
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: crate::pty::actor::PtyIoActorHandle) -> Self {
+        Self(crate::pane::PaneRuntime::test_with_actor(actor))
     }
 
     pub(crate) fn test_with_channel_capacity(

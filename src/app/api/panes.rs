@@ -1565,6 +1565,10 @@ impl App {
         if let Err(message) = validate_optional_resume_argv(params.resume_argv.as_deref()) {
             return encode_error(id, "invalid_resume_argv", message);
         }
+        // herdr-c1o5 (ADR-0008 amendment 2026-10-25, round-cap exit a]): the
+        // agent process the report names is judged here, where the process
+        // table may be read, never inside TerminalState.
+        let named_agent = self.judge_named_agent(ws_idx, pane_id, &agent_label, &params);
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
@@ -1574,7 +1578,19 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        // A report the state setter drops by that rule changes nothing, so the
+        // API records neither its sequence nor its resume command (codex
+        // c1o5-r2 P2). Every source goes through that gate (codex c1o5-r3 P2-2).
+        let dropped_by_named_agent_rule =
+            self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
+                terminal.report_dropped_by_named_agent_rule(
+                    &params.source,
+                    &agent_label,
+                    named_agent,
+                )
+            });
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
+            named_agent,
             pane_id,
             session_ref: session_ref.clone(),
             source: params.source.clone(),
@@ -1583,8 +1599,9 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
-        let applied =
-            report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        let applied = report_is_newer
+            && !dropped_by_named_agent_rule
+            && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1593,6 +1610,52 @@ impl App {
             agent_label,
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
+        )
+    }
+
+    fn judge_named_agent(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        agent_label: &str,
+        params: &PaneReportAgentParams,
+    ) -> crate::terminal::NamedAgentVerdict {
+        let report = crate::app::named_agent::NamedAgentReport {
+            claimed: crate::detect::parse_agent_label(agent_label),
+            agent_pid: params.agent_pid,
+            agent_start: params.agent_start,
+            carrier_pid: params.carrier_pid,
+            carrier_start: params.carrier_start,
+        };
+        if report.agent_pid.is_none() || report.agent_start.is_none() {
+            return crate::terminal::NamedAgentVerdict::Unnamed;
+        }
+        let pane_terminal = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned();
+        let pane = self
+            .lookup_runtime(ws_idx, pane_id)
+            .and_then(|(runtime, _)| runtime.child_incarnation())
+            .map(
+                |(pid, start_token)| crate::app::named_agent::ShellIncarnation { pid, start_token },
+            );
+        let others: Vec<u32> = self
+            .terminal_runtimes
+            .iter()
+            .filter(|(terminal_id, _)| Some(*terminal_id) != pane_terminal.as_ref())
+            .filter_map(|(_, runtime)| runtime.child_pid())
+            .collect();
+        crate::app::named_agent::judge_named_agent(
+            &crate::app::named_agent::PlatformProcessTable,
+            report,
+            crate::app::named_agent::PaneShells {
+                pane,
+                others: &others,
+            },
+            std::time::Instant::now,
         )
     }
 
@@ -1619,6 +1682,18 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        // ADR-0002, herdr-3ir: whether the reporter's own process group
+        // matches the pane's foreground process group, computed here (the
+        // one place that has both the reporter's pid and the pane's runtime)
+        // rather than inside TerminalState, which stays pure. Any missing
+        // piece - no agent_pid, no runtime, an unresolvable pid - yields
+        // `None`, which fails open to today's behavior.
+        let reporter_is_foreground = params.agent_pid.and_then(|pid| {
+            let shell_pid = self.lookup_runtime(ws_idx, pane_id)?.0.child_pid()?;
+            let fg = crate::detect::foreground_process_group_id(shell_pid)?;
+            let theirs = crate::detect::process_group_id(pid)?;
+            Some(fg == theirs)
+        });
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1628,9 +1703,23 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            reporter_is_foreground,
+            agent_session_cwd: params.agent_session_cwd,
         });
-        let applied =
-            report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        // herdr-nrr (ADR-0002 on top of #4687): a report the 3ir foreground
+        // gate refuses changes no state, so the resume_argv it carries is
+        // refused with it. `session_report_applied` alone does not cover
+        // this: a refused report naming the session that is ALREADY current
+        // would pass it, record the command and advance the watermark.
+        let refused_by_foreground_gate =
+            crate::terminal::TerminalState::claude_report_rejected_for_non_foreground_reporter(
+                &params.source,
+                &agent_label,
+                reporter_is_foreground,
+            );
+        let applied = report_is_newer
+            && !refused_by_foreground_gate
+            && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
             id,
             ws_idx,
@@ -1946,6 +2035,9 @@ impl App {
             Ok(bytes) => bytes,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
+        if let Err(err) = runtime.validate_input_submission(&bytes) {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }

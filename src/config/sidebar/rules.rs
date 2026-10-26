@@ -6,6 +6,9 @@ use super::{SidebarTokenColor, SidebarTokenStyle};
 #[serde(try_from = "RawRule", into = "RawRule")]
 pub struct SidebarTokenRule {
     condition: Condition,
+    // source names another custom token (without the `$`) whose value the condition reads instead
+    // of the styled token's own value, e.g. colour `machine` by `$ctx` (herdr-upm).
+    source: Option<String>,
     ignore_case: bool,
     style: SidebarTokenStyle,
     hide: Option<bool>,
@@ -26,6 +29,8 @@ enum Condition {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     equals: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,8 +96,13 @@ impl TryFrom<RawRule> for SidebarTokenRule {
                 Condition::LessThan(value)
             }
         };
+        let source = match raw.source {
+            None => None,
+            Some(value) => Some(parse_source(&value)?),
+        };
         Ok(Self {
             condition,
+            source,
             ignore_case: raw.ignore_case.unwrap_or(false),
             hide: raw.hide,
             style: SidebarTokenStyle {
@@ -107,6 +117,7 @@ impl TryFrom<RawRule> for SidebarTokenRule {
 impl From<SidebarTokenRule> for RawRule {
     fn from(rule: SidebarTokenRule) -> Self {
         let mut raw = Self {
+            source: rule.source.map(|name| format!("${name}")),
             ignore_case: rule.ignore_case.then_some(true),
             fg: rule.style.fg,
             bold: rule.style.bold,
@@ -157,12 +168,7 @@ impl SidebarTokenRule {
                 }
             }
             Condition::GreaterThan(threshold) | Condition::LessThan(threshold) => {
-                let parsed = numeric.get_or_insert_with(|| {
-                    value
-                        .parse::<f64>()
-                        .ok()
-                        .filter(|number| number.is_finite())
-                });
+                let parsed = numeric.get_or_insert_with(|| parse_number(value));
                 parsed.is_some_and(|number| match self.condition {
                     Condition::GreaterThan(_) => number > *threshold,
                     _ => number < *threshold,
@@ -172,14 +178,49 @@ impl SidebarTokenRule {
     }
 }
 
-pub(super) fn matching_style(
+// parse_number reads a full, finite number and nothing else: no unit, no padding (the upstream
+// contract numeric_conditions_require_full_finite_numbers_and_strict_comparison pins). A
+// percentage source therefore needs a numeric token, e.g. herdr-ccwait's `$ctx_num` (herdr-upm).
+fn parse_number(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+}
+
+// parse_source validates a rule `source`: a custom token reference, `$` plus 1-32 of
+// [A-Za-z0-9_-], the same shape parse_sidebar_token accepts. Stored without the `$`.
+fn parse_source(value: &str) -> Result<String, String> {
+    let name = value
+        .strip_prefix('$')
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        })
+        .ok_or_else(|| {
+            format!("sidebar rule source `{value}` must be a custom token like `$ctx`")
+        })?;
+    Ok(name.to_string())
+}
+
+// matching_style returns the style of the first rule that matches. A rule with a `source` reads
+// that custom token through `lookup`; when the token is absent the rule does not match.
+pub(super) fn matching_style<'v>(
     rules: &[SidebarTokenRule],
     base: SidebarTokenStyle,
     value: &str,
+    lookup: &dyn Fn(&str) -> Option<&'v str>,
 ) -> Option<SidebarTokenStyle> {
     let mut numeric = None;
     for rule in rules {
-        if rule.matches(value, &mut numeric) {
+        let matched = match &rule.source {
+            None => rule.matches(value, &mut numeric),
+            Some(name) => lookup(name).is_some_and(|other| rule.matches(other, &mut None)),
+        };
+        if matched {
             if rule.hide == Some(true) {
                 return None;
             }
@@ -238,5 +279,73 @@ mod tests {
                 assert!(!rule.matches(value, &mut None), "{condition}: {value}");
             }
         }
+    }
+
+    // herdr-upm: a rule with `source` reads another custom token of the pane.
+    #[test]
+    fn source_rules_read_another_token_and_never_the_own_value() {
+        let rules: Vec<SidebarTokenRule> = [
+            "source = '$ctx_num'\ngt = 80\nbold = true",
+            "source = '$ctx_num'\ngt = 50\ndim = true",
+        ]
+        .iter()
+        .map(|raw| toml::from_str(raw).unwrap())
+        .collect();
+        let base = SidebarTokenStyle::default();
+        let style = |ctx: Option<&str>| {
+            matching_style(&rules, base, "dcc", &|name| {
+                assert_eq!(name, "ctx_num");
+                ctx
+            })
+        };
+        assert_eq!(style(Some("85")).unwrap().bold, Some(true));
+        assert_eq!(style(Some("60")).unwrap().dim, Some(true));
+        assert_eq!(style(Some("60")).unwrap().bold, None);
+        assert_eq!(style(Some("10")).unwrap(), base);
+        // the upstream numeric contract holds for a sourced value too: a unit is not a number
+        assert_eq!(style(Some("85%")).unwrap(), base);
+        // an absent source token matches no rule, whatever the styled value is
+        assert_eq!(style(None).unwrap(), base);
+        // the styled value itself is never read by a sourced rule
+        assert_eq!(
+            matching_style(&rules, base, "99", &|_| Some("1")).unwrap(),
+            base
+        );
+        // nor is it a fallback for an absent source, even when it would match (herdr-a2y9)
+        assert_eq!(matching_style(&rules, base, "99", &|_| None).unwrap(), base);
+    }
+
+    // herdr-a2y9: a sourced and an unsourced numeric rule never share the parsed number, in
+    // either order, so each reads its own value.
+    #[test]
+    fn sourced_and_unsourced_rules_parse_their_own_values() {
+        let sourced: SidebarTokenRule =
+            toml::from_str("source = '$ctx_num'\ngt = 80\nbold = true").unwrap();
+        let own: SidebarTokenRule = toml::from_str("gt = 80\nhide = true").unwrap();
+        let base = SidebarTokenStyle::default();
+        // own value 90, source 10: the sourced rule misses, the unsourced one hides
+        assert_eq!(
+            matching_style(&[sourced.clone(), own.clone()], base, "90", &|_| Some("10")),
+            None
+        );
+        // own value 10, source 90: the unsourced rule misses, the sourced one styles
+        assert_eq!(
+            matching_style(&[own, sourced], base, "10", &|_| Some("90"))
+                .unwrap()
+                .bold,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn source_must_be_a_custom_token_and_round_trips() {
+        for bad in ["ctx", "$", "$bad name", "$ctx.x"] {
+            let raw = format!("source = '{bad}'\ngt = 1");
+            assert!(toml::from_str::<SidebarTokenRule>(&raw).is_err(), "{bad}");
+        }
+        let rule: SidebarTokenRule = toml::from_str("source = '$ctx_num'\ngt = 80").unwrap();
+        let back = toml::to_string(&rule).unwrap();
+        assert!(back.contains("source = \"$ctx_num\""), "{back}");
+        assert_eq!(toml::from_str::<SidebarTokenRule>(&back).unwrap(), rule);
     }
 }

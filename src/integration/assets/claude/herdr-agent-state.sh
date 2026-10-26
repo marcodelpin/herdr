@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=10
+# HERDR_INTEGRATION_VERSION=13
 
 set -eu
 
@@ -65,6 +65,21 @@ agent_session_path = transcript_path if isinstance(transcript_path, str) and tra
 session_start_source = hook_input.get("source") if hook_event_name == "SessionStart" else None
 if not isinstance(session_start_source, str) or not session_start_source:
     session_start_source = None
+agent_pid_raw = os.environ.get("CLAUDE_PID")
+agent_pid = None
+# herdr's agent_pid is a u32 pid: forward only plain decimal digits in
+# 1..=4294967295 and omit anything else, so the report itself still lands.
+# Zero padding is allowed; at most 10 significant digits reach int(), which
+# refuses very long digit strings.
+if agent_pid_raw and agent_pid_raw.isascii() and agent_pid_raw.isdigit():
+    significant_pid = agent_pid_raw.lstrip("0")
+    if 1 <= len(significant_pid) <= 10:
+        parsed_pid = int(significant_pid)
+        if parsed_pid <= 4294967295:
+            agent_pid = parsed_pid
+raw_cwd = hook_input.get("cwd")
+agent_session_cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
+
 if agent_session_id:
     params = {
         "pane_id": pane_id,
@@ -77,6 +92,10 @@ if agent_session_id:
         params["agent_session_path"] = agent_session_path
     if session_start_source:
         params["session_start_source"] = session_start_source
+    if agent_pid is not None:
+        params["agent_pid"] = agent_pid
+    if agent_session_cwd:
+        params["agent_session_cwd"] = agent_session_cwd
     request = {
         "id": request_id,
         "method": "pane.report_agent_session",

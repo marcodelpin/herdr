@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command};
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,10 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// A host restart or shutdown announced to the old server but not yet
+    /// committed. Absent from manifests written before this field existed.
+    #[serde(default)]
+    pub host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
 }
 
 #[cfg(unix)]
@@ -286,12 +290,54 @@ pub(crate) fn report_ready(stream: &mut UnixStream) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn wait_committed(stream: &mut UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
-    let committed = read_line_unbuffered(&mut *stream)?;
+    let committed = read_line_through_signals(stream, Instant::now() + READY_TIMEOUT)?;
     if committed.trim_end() != "committed" {
         return Err(io::Error::other("handoff source did not commit"));
     }
     Ok(())
+}
+
+/// Reads one line by `deadline`, through any signal that arrives meanwhile.
+/// A socket read with a timeout is never restarted after a signal handler
+/// (EINTR even under SA_RESTART), so a stop signal would otherwise abort the
+/// import's commitment wait; the import must wait it out instead, because the
+/// source may already have committed (herdr-ir4j).
+#[cfg(unix)]
+fn read_line_through_signals(stream: &mut UnixStream, deadline: Instant) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handoff stream read timed out",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "handoff stream closed while reading line",
+                ))
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+        }
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff line exceeded maximum size",
+            ));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -307,6 +353,7 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -317,6 +364,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        host_shutdown_intent,
     }
 }
 
@@ -549,9 +597,76 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
+    }
+
+    #[test]
+    fn a_handoff_carries_an_announced_host_shutdown() {
+        let intent: crate::platform::HostShutdownIntent =
+            serde_json::from_value(serde_json::json!({ "announced_at_ns": 42 }))
+                .expect("intent should deserialize");
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, Some(intent));
+        let encoded = serde_json::to_vec(&manifest).expect("manifest should serialize");
+        let decoded: HandoffManifest =
+            serde_json::from_slice(&encoded).expect("manifest should deserialize");
+
+        assert_eq!(decoded.host_shutdown_intent, Some(intent));
+    }
+
+    #[test]
+    fn a_manifest_written_before_the_host_shutdown_field_still_loads() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("host_shutdown_intent");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        assert!(older.host_shutdown_intent.is_none());
+    }
+
+    #[test]
+    fn an_older_server_imports_a_manifest_with_an_announced_host_shutdown() {
+        /// The manifest as servers before `host_shutdown_intent` decode it,
+        /// frozen here so the new field stays ignorable by them.
+        #[derive(Deserialize)]
+        #[allow(dead_code)] // Only decoding is under test.
+        struct PreHostShutdownManifest {
+            version: u32,
+            source_version: String,
+            source_protocol: u32,
+            expected_version: Option<String>,
+            expected_protocol: Option<u32>,
+            snapshot: crate::persist::SessionSnapshot,
+            panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+            #[serde(default)]
+            api_window_title: Option<String>,
+        }
+
+        let intent: crate::platform::HostShutdownIntent =
+            serde_json::from_value(serde_json::json!({ "announced_at_ns": 42 }))
+                .expect("intent should deserialize");
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            Some("deploying".to_string()),
+            Some(intent),
+        );
+        let encoded = serde_json::to_vec(&manifest).expect("manifest should serialize");
+
+        let older: PreHostShutdownManifest =
+            serde_json::from_slice(&encoded).expect("an older server should still load it");
+
+        assert_eq!(older.version, HANDOFF_VERSION);
+        assert_eq!(older.api_window_title.as_deref(), Some("deploying"));
     }
 
     #[test]
@@ -562,6 +677,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
         value

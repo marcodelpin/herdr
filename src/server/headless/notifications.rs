@@ -32,8 +32,8 @@ impl HeadlessServer {
             update.previous_state,
             update.state,
             update.previous_agent_label.as_deref(),
-            update.agent_label.as_deref(),
-            update.known_agent.or(update.previous_known_agent),
+            update.status_agent().0,
+            update.status_agent().1.or(update.previous_known_agent),
         )
     }
 
@@ -123,7 +123,7 @@ impl HeadlessServer {
         let suppress_active_tab_notifications =
             self.active_tab_suppresses_notifications(is_active_tab);
 
-        if !update.suppress_completion && self.app.state.sound.allows(update.known_agent) {
+        if !update.suppress_completion && self.app.state.sound.allows(update.status_agent().1) {
             if let Some(sound) = crate::app::actions::notification_sound_for_state_change(
                 suppress_active_tab_notifications,
                 update.previous_state,
@@ -149,7 +149,7 @@ impl HeadlessServer {
         let Some(ws) = self.app.state.workspaces.get(update.ws_idx) else {
             return;
         };
-        let Some(agent_label) = update.agent_label.as_deref() else {
+        let Some(agent_label) = update.status_agent().0 else {
             return;
         };
         let event_text = match kind {

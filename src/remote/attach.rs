@@ -537,8 +537,12 @@ fn posix_remote_output_command(command: &str) -> String {
 }
 
 fn windows_powershell_script_command(script: &str) -> String {
+    // `$ProgressPreference = 'SilentlyContinue'` stops PowerShell from
+    // serializing progress records (for example module auto-loading's
+    // "Preparing modules for first use.") into the stderr CLIXML stream that
+    // Herdr forwards to the terminal.
     let script = format!(
-        "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); {script}"
+        "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); $ProgressPreference = 'SilentlyContinue'; {script}"
     );
     let utf16 = script
         .encode_utf16()
@@ -4586,9 +4590,28 @@ mod tests {
             .stderr(Stdio::null());
         crate::platform::configure_background_command(&mut launcher);
         let mut launcher = launcher.spawn().expect("launch Windows bridge command");
+        let read_descendant = || {
+            fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        };
+        // A cold shared runner can need more than 10 s to start the nested
+        // powershell.exe, so wait for the descendant PID before timing the
+        // bridge exit. The application writes the PID before it exits, so a
+        // read after the launcher has exited is final.
+        let pid_deadline = Instant::now() + Duration::from_secs(60);
+        let mut status = None;
+        let descendant = loop {
+            let descendant = read_descendant();
+            if descendant.is_some() || status.is_some() || Instant::now() >= pid_deadline {
+                break descendant;
+            }
+            status = launcher.try_wait().expect("poll bridge launcher");
+            thread::sleep(Duration::from_millis(20));
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
-            let status = launcher.try_wait().expect("poll bridge launcher");
+            status = launcher.try_wait().expect("poll bridge launcher");
             if status.is_some() || Instant::now() >= deadline {
                 break status;
             }
@@ -4603,10 +4626,9 @@ mod tests {
         }
         let _ = launcher.wait();
         // Clean up the launcher before a missing PID can fail the test.
-        let descendant = fs::read_to_string(&pid_file);
-        let _ = fs::remove_file(pid_file);
+        let descendant = descendant.or_else(read_descendant);
+        let _ = fs::remove_file(&pid_file);
         let descendant = descendant.expect("descendant PID");
-        let descendant = descendant.trim().parse::<u32>().expect("numeric PID");
         let mut cleanup = Command::new("powershell.exe");
         cleanup
             .args(["-NoProfile", "-NonInteractive", "-Command"])
@@ -4729,7 +4751,7 @@ mod tests {
         ];
 
         let preamble = format!(
-            "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); "
+            "[Console]::Out.WriteLine(); [Console]::Out.WriteLine('{REMOTE_OUTPUT_READY_MARKER}'); [Console]::Out.Flush(); $ProgressPreference = 'SilentlyContinue'; "
         );
         for (label, command, expected) in commands {
             let script = decode_windows_command(&command);
@@ -4738,6 +4760,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label} lacks shared output marker: {script}"));
             assert_eq!(script, expected, "{label}");
         }
+    }
+
+    #[test]
+    fn windows_remote_commands_suppress_powershell_progress_records() {
+        // PowerShell serializes progress records (such as module auto-loading's
+        // "Preparing modules for first use.") to the stderr CLIXML stream when
+        // stderr is redirected under `-EncodedCommand`. Herdr forwards that
+        // stderr, so the shared preamble must silence progress.
+        let script = decode_windows_command(&windows_powershell_script_command("exit 0"));
+        let preference = "$ProgressPreference = 'SilentlyContinue'; ";
+        assert!(script.contains(preference), "{script}");
+        assert!(
+            script.find(preference).unwrap() < script.find("exit 0").unwrap(),
+            "{script}"
+        );
     }
 
     #[test]

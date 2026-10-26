@@ -77,29 +77,60 @@ impl App {
         let writer = self.session_writer.clone();
         match std::thread::Builder::new()
             .name("herdr-session-save".into())
-            .spawn(move || run_session_save_job(job, &writer))
-        {
+            .spawn(move || {
+                // Logged by the writer.
+                let _ = run_session_save_job(job, &writer);
+            }) {
             Ok(thread) => self.session_save_thread = Some(thread),
             Err(err) => {
                 tracing::warn!(err = %err, "failed to spawn session save thread; saving inline");
-                run_session_save_job(self.capture_session_save_job(), &self.session_writer);
+                let _ = run_session_save_job(self.capture_session_save_job(), &self.session_writer);
             }
         }
     }
 
     pub(crate) fn save_session_now(&mut self) {
+        // Logged by the writer.
+        let _ = self.try_save_session_now();
+    }
+
+    /// [`Self::save_session_now`], and whether the session reached the disk
+    /// (a failure is logged either way).
+    pub(crate) fn try_save_session_now(&mut self) -> std::io::Result<()> {
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }
 
         if !self.policy.persist_session {
             self.session_save_deadline = None;
-            return;
+            return Ok(());
         }
 
-        run_session_save_job(self.capture_session_save_job(), &self.session_writer);
+        let saved = run_session_save_job(self.capture_session_save_job(), &self.session_writer);
         self.pane_exit_checkpoint_pending = false;
         self.session_save_deadline = None;
+        saved
+    }
+
+    /// A live handoff transferred this session and the source no longer
+    /// saves it: until a write reaches the disk, it exists nowhere else.
+    #[cfg(unix)]
+    pub(crate) fn owe_transferred_session(&mut self) {
+        if !self.policy.persist_session {
+            return;
+        }
+        match self.session_writer.lock() {
+            Ok(mut writer) => writer.owe_transferred_session(),
+            Err(err) => err.into_inner().owe_transferred_session(),
+        }
+    }
+
+    /// Whether a session transferred by a live handoff is still not on disk.
+    pub(crate) fn transferred_session_unsaved(&self) -> bool {
+        match self.session_writer.lock() {
+            Ok(writer) => writer.owes_transferred_session(),
+            Err(err) => err.into_inner().owes_transferred_session(),
+        }
     }
 
     pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
@@ -132,16 +163,16 @@ impl App {
 fn run_session_save_job(
     job: SessionSaveJob,
     writer: &std::sync::Mutex<crate::persist::SessionWriter>,
-) {
+) -> std::io::Result<()> {
     let mut writer = match writer.lock() {
         Ok(writer) => writer,
         Err(err) => {
             tracing::warn!(err = %err, "session writer is poisoned; refusing to modify session");
-            return;
+            return Err(std::io::Error::other("session writer is poisoned"));
         }
     };
     match job {
-        SessionSaveJob::Clear => writer.clear(),
-        SessionSaveJob::Save { snapshot, history } => writer.save(&snapshot, history.as_ref()),
+        SessionSaveJob::Clear => writer.try_clear(),
+        SessionSaveJob::Save { snapshot, history } => writer.try_save(&snapshot, history.as_ref()),
     }
 }

@@ -13,9 +13,10 @@ pub(crate) struct HostShutdownMonitor {
 impl HostShutdownMonitor {
     pub(crate) fn start(
         requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        intent: HostShutdownIntentCell,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        let task = monitor_host_shutdown(requested, wake);
+        let task = monitor_host_shutdown(requested, intent, wake);
         Self { task }
     }
 }
@@ -28,9 +29,50 @@ impl Drop for HostShutdownMonitor {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// A restart or shutdown the host announced but has not committed to yet.
+///
+/// Live handoff carries it so a replacement server still recognizes the
+/// commit point. The value is captured when the old server builds its handoff
+/// manifest; announcements or cancellations that arrive after that and before
+/// the replacement starts its monitor reach only the old server. Each handoff
+/// phase may take up to 30 seconds, so that window can last tens of seconds.
+/// Only macOS reports an intent; the timestamp is in its boot-wide monotonic
+/// clock, which is shared by the old and new server processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HostShutdownIntent {
+    announced_at_ns: u64,
+}
+
+/// The pending host shutdown intent shared by the server and its monitor.
+// Windows has no live handoff and no announcement to record, so nothing reads it there.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HostShutdownIntentCell(
+    std::sync::Arc<std::sync::Mutex<Option<HostShutdownIntent>>>,
+);
+
+// Windows has no live handoff and no announcement to record, so nothing reads it there.
+#[cfg_attr(windows, allow(dead_code))]
+impl HostShutdownIntentCell {
+    pub(crate) fn get(&self) -> Option<HostShutdownIntent> {
+        *self.lock()
+    }
+
+    pub(crate) fn set(&self, intent: Option<HostShutdownIntent>) {
+        *self.lock() = intent;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<HostShutdownIntent>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn monitor_host_shutdown(
     _requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _intent: HostShutdownIntentCell,
     _wake: impl Fn() + Send + Sync + 'static,
 ) -> Option<tokio::task::JoinHandle<()>> {
     None
@@ -80,7 +122,7 @@ impl std::fmt::Display for ServerQuitSignal {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn spawn_server_signal_monitor(
     on_quit: impl Fn(ServerQuitSignal) + Send + Sync + 'static,
 ) {
@@ -382,6 +424,22 @@ mod remote_bridge;
 mod remote_bridge_tests;
 #[cfg(unix)]
 mod unix_common;
+/// Other Unix platforms keep their existing input admission policy.
+/// Their _PC_MAX_CANON values need not describe the actual queue capacity.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Default)]
+pub(crate) struct PtyInputGuard;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl PtyInputGuard {
+    pub(crate) fn new(_master: &std::sync::Arc<std::fs::File>) -> Self {
+        Self
+    }
+
+    pub(crate) fn validate(&self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 #[cfg(unix)]
 pub(crate) mod unix_image_files;
 #[cfg(unix)]
@@ -392,6 +450,12 @@ pub(crate) use unix_common::{
 
 mod client_state;
 pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
+
+/// Only Linux has a systemd --user manager to address.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn user_manager_runtime_dir() -> Option<std::path::PathBuf> {
+    None
+}
 
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}
@@ -721,6 +785,12 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     )
 }
 
+/// herdr-c1o5: one process read for the detector's classifier, Linux only.
+#[cfg(not(target_os = "linux"))]
+pub fn process_snapshot(_pid: u32) -> Option<ForegroundProcess> {
+    None
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None
@@ -803,6 +873,20 @@ fn child_exit_classification_only_checkpoints_interruptions() {
     #[cfg(unix)]
     assert!(ChildExitReason::Handoff.requires_session_checkpoint());
     assert!(!ChildExitReason::WaitFailed.requires_session_checkpoint());
+}
+
+/// herdr-c1o5 (ADR-0008 round 2, rule 8): one read of a process's job
+/// facts. Every field comes from the same read, so they describe one
+/// incarnation of the pid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessJobRead {
+    pub start_token: u64,
+    /// The process exited and is not yet reaped.
+    pub exited: bool,
+    pub process_group: u32,
+    pub session: u32,
+    /// The foreground process group of its controlling terminal.
+    pub foreground_group: Option<u32>,
 }
 
 #[cfg(all(test, unix))]
@@ -1193,6 +1277,80 @@ mod tests {
             pane_process_liveness(shell_pid, agent_pid, token),
             PaneProcessLiveness::Gone
         );
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_job_read_reads_one_incarnation() {
+        use std::os::unix::process::CommandExt;
+
+        let mut detached = std::process::Command::new("sleep");
+        detached.arg("30");
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            detached.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut detached = detached.spawn().expect("spawn detached");
+        let read = process_job_read(detached.id()).expect("a live process reads");
+        assert_eq!(Some(read.start_token), process_start_token(detached.id()));
+        assert_eq!(
+            read.session,
+            detached.id(),
+            "a session leader names its session"
+        );
+        assert_eq!(read.process_group, detached.id());
+        assert!(!read.exited);
+        let runner = process_job_read(std::process::id()).expect("the runner reads");
+        assert_ne!(runner.session, read.session, "another terminal session");
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let gone_pid = gone.id();
+        gone.wait().expect("reap");
+        assert_eq!(process_job_read(gone_pid), None, "a reaped process");
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_job_read_follows_the_process_not_its_job() {
+        use std::os::unix::process::CommandExt;
+
+        let mut wrapper = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+        let job = wrapper.id();
+        let mut agent = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(job as i32)
+            .spawn()
+            .expect("spawn agent");
+        let agent_pid = agent.id();
+        let group = |pid| process_job_read(pid).map(|read| (read.process_group, read.exited));
+        assert_eq!(group(agent_pid), Some((job, false)));
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGSTOP);
+        }
+        assert_eq!(group(agent_pid), Some((job, false)), "a stopped job counts");
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while group(agent_pid) == Some((job, false)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            group(agent_pid),
+            Some((job, true)),
+            "killed, not yet reaped"
+        );
+        let _ = agent.wait();
         let _ = wrapper.kill();
         let _ = wrapper.wait();
     }

@@ -1,0 +1,243 @@
+# Fork-only workflow for fix/waz6-bridge-starts-unit (not for upstream): the remote client bridge
+# (src/remote/host.rs ensure_remote_server_running) used to run `herdr server` itself when no server
+# was listening. On a host with the herdr.service systemd --user unit that server lived in the ssh
+# session's cgroup, outside the unit, and the unit's socket-holder wait then refused to start and
+# retried every ~16 s for ~50 h (dcc 2026-10-02..05, NRestarts 11,346). Now the bridge starts the
+# unit when it is installed (default session, no socket override), never falls back to an unmanaged
+# server when that start fails, and keeps the direct spawn only when no unit is installed.
+# Round hwaz6-r2 (codex hwaz6-r1 findings): the plan follows the EFFECTIVE sockets, so `--session
+# default` and HERDR_SOCKET_PATH naming the default socket also take the unit path; the unit is
+# found by asking the user manager for LoadState (masked refuses), with a scan of every systemd
+# --user search dir as the fallback; the saved-machine client shows the bridge's own error; the
+# tests drive the entry point and the systemctl wiring through seams.
+# Round 3, branch fix/waz6-unit-only-bridge (codex hwaz6-r2 found four more spellings of "the
+# unit's endpoint", all in the classifier): where the unit is installed the bridge never spawns,
+# whatever endpoint it targets. The unit's own endpoint starts the unit; any other endpoint, or a
+# masked unit, is refused; the direct spawn is only for hosts with no unit. A misread endpoint can
+# now cost a refusal, never an unmanaged server. The fallback unit scan also searches the vendor
+# data dirs whatever XDG_DATA_DIRS says, as systemd does.
+# The crate tests run here, the acceptance surface. Each mutant removes one guard and must turn the
+# named tests red. bd herdr-waz6.
+# 0.9.5 port (bd herdr-ih1r), branch fix/waz6-on-adopt-0.9.5 on d1f563df, the build dcc runs: the
+# same three commits, with is_server_listening now returning io::Result (an error is not "nobody
+# listening", so the bridge fails instead of starting a server) and the session tests' env lock
+# now being the shared config env lock. A 24th test and its mutant pin that error path (codex
+# hih1r-r1 noted it had no test).
+name: Fork waz6 bridge never spawns beside the unit
+
+on:
+  push:
+    branches: [fix/waz6-on-adopt-0.9.5, fix/adopt-0.9.5]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  crate-tests:
+    name: crate tests (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Run the crate tests
+        run: cargo nextest run --locked --bin herdr --status-level fail --final-status-level slow --failure-output final --success-output never
+
+      - name: Run the fork tests by name
+        run: |
+          filter='test(/^remote::host::tests::/) | test(/^client::endpoint::supervisor::tests::(bridge_failure|handshake_error_stands)/)'
+          cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
+          cat fork-tests.txt
+          count=$(grep -c . fork-tests.txt || true)
+          expected=24
+          [ "$count" = "$expected" ] || { echo "expected $expected fork tests, the filter matched $count"; exit 1; }
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
+
+  mutants:
+    name: mutant - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: unit never chosen
+            file: src/remote/host.rs
+            perl: 's/\(UnitState::Installed, EndpointTarget::Unit\) => Ok\(ServerStartPlan::SystemdUnit\)/(UnitState::Installed, EndpointTarget::Unit) => Ok(ServerStartPlan::DirectSpawn) \/* MUTANT *\//'
+            expect: "entry_starts_the_unit_for_the_default_endpoint_and_never_spawns plan_table"
+          - name: another session spawns beside the unit
+            file: src/remote/host.rs
+            perl: 's/\(UnitState::Installed, EndpointTarget::Other\) => Err\(/(UnitState::Installed, EndpointTarget::Other) => Ok(ServerStartPlan::DirectSpawn), \/* MUTANT *\/\n        #[allow(unreachable_patterns)]\n        (UnitState::Installed, EndpointTarget::Other) => Err(/'
+            expect: "entry_refuses_another_session_when_the_unit_is_installed plan_table"
+          - name: another session skips systemd
+            file: src/remote/host.rs
+            perl: 's/let plan = server_start_plan\(host.unit_state\(\), target\)\?;/let plan = server_start_plan(if target == EndpointTarget::Other { UnitState::Absent } else { host.unit_state() } \/* MUTANT *\/, target)?;/'
+            expect: "entry_refuses_another_session_when_the_unit_is_installed entry_refuses_another_session_when_the_unit_is_masked"
+          - name: mixed endpoint read as other
+            file: src/remote/host.rs
+            perl: 's/_ => EndpointTarget::Mixed,/_ => EndpointTarget::Other, \/* MUTANT *\//'
+            expect: "endpoint_target_classifies_other_and_mixed entry_refuses_a_mixed_endpoint_when_the_unit_is_installed cli_session_selection_decides_by_effective_sockets"
+          - name: endpoint compared by spelling
+            file: src/remote/host.rs
+            perl: 's/a == b \|\| normalized\(a\) == normalized\(b\)/a == b \/* MUTANT *\/ || normalized(a) == normalized(b) \&\& false/'
+            expect: "socket_override_naming_the_default_socket_targets_the_unit"
+          - name: masked unit spawns directly
+            file: src/remote/host.rs
+            perl: 's/\(UnitState::Absent, _\) =>/(UnitState::Absent | UnitState::Masked, _) => \/* MUTANT *\//'
+            expect: "entry_refuses_when_the_unit_is_masked entry_refuses_another_session_when_the_unit_is_masked plan_table"
+          - name: load state ignored
+            file: src/remote/host.rs
+            perl: 's/Ok\(output\) if output.success =>/Ok(output) if false \&\& output.success => \/* MUTANT *\//'
+            expect: "unit_state_follows_the_user_manager_load_state"
+          - name: masked load state read as absent
+            file: src/remote/host.rs
+            perl: 's/"masked" => UnitState::Masked,/"masked" => UnitState::Absent, \/* MUTANT *\//'
+            expect: "unit_state_follows_the_user_manager_load_state"
+          - name: data home search dir dropped
+            file: src/remote/host.rs
+            perl: 's/dirs.push\(data_home.join\("systemd\/user"\)\);/{ let _ = data_home; } \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: runtime search dir dropped
+            file: src/remote/host.rs
+            perl: 's/        dirs.push\(runtime.join\("systemd\/user"\)\);/        let _ = runtime; \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: vendor data dirs dropped
+            file: src/remote/host.rs
+            perl: 's/for vendor in \["\/usr\/local\/share\/systemd\/user", "\/usr\/share\/systemd\/user"\]/for vendor in [] as [\&str; 0] \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: home config default hidden by XDG_CONFIG_HOME
+            file: src/remote/host.rs
+            perl: 's/for default in \["\.config\/systemd\/user\.control", "\.config\/systemd\/user"\]/for default in [] as [\&str; 0] \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path redirected_xdg_dirs_still_find_the_home_unit_without_a_manager"
+          - name: home data default hidden by XDG_DATA_HOME
+            file: src/remote/host.rs
+            perl: 's/push_unique\(&mut dirs, home\.join\("\.local\/share\/systemd\/user"\)\);/let _ = home; \/* MUTANT *\//'
+            expect: "unit_dirs_cover_every_user_search_path"
+          - name: systemctl asked at the caller address
+            file: src/remote/host.rs
+            perl: 's/if let Some\(runtime\) = manager_runtime \{/if let Some(runtime) = None::<\&Path> { let _ = manager_runtime; \/* MUTANT *\//'
+            expect: "systemctl_is_addressed_at_the_user_manager_runtime_dir"
+          - name: caller dbus address kept
+            file: src/remote/host.rs
+            perl: 's/\n            \.env_remove\("DBUS_SESSION_BUS_ADDRESS"\);/; \/* MUTANT *\//'
+            expect: "systemctl_is_addressed_at_the_user_manager_runtime_dir"
+          - name: symlink mask not seen
+            file: src/remote/host.rs
+            perl: 's/let masked = metadata.file_type\(\).is_symlink\(\)/let masked = false \/* MUTANT *\/ \&\& metadata.file_type().is_symlink()/'
+            expect: "unit_state_scans_the_dirs_when_systemd_cannot_be_asked"
+          - name: start without --user
+            file: src/remote/host.rs
+            perl: 's/systemctl\(&\["--user", "start", HERDR_UNIT\]\)/systemctl(\&["start", HERDR_UNIT]) \/* MUTANT *\//'
+            expect: "start_unit_runs_systemctl_user_start_herdr_service"
+          - name: failed unit start falls back to direct spawn
+            file: src/remote/host.rs
+            perl: 's/start_unit\(\).map_err\(\|err\| \{/start_unit().or_else(|_| spawn_direct()).map_err(|err| { \/* MUTANT *\//'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns"
+          - name: socket wait failure falls back to direct spawn
+            file: src/remote/host.rs
+            perl: 's/wait_for_socket\(UNIT_START_WAIT\).map_err\(\|err\| \{/wait_for_socket(UNIT_START_WAIT).or_else(|_| spawn_direct()).map_err(|err| { \/* MUTANT *\//'
+            expect: "entry_unit_socket_wait_failure_is_unit_specific_without_fallback"
+          - name: unit error loses the remedy
+            file: src/remote/host.rs
+            perl: 's/if the unit hit its start limit, run `systemctl --user reset-failed herdr.service`/if the unit hit its start limit, reset it/'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns entry_unit_socket_wait_failure_is_unit_specific_without_fallback"
+          - name: unit start error loses its explanation
+            file: src/remote/host.rs
+            perl: 's/` failed: \{err\}; not starting an unmanaged server beside the unit/` failed/'
+            expect: "entry_unit_start_failure_names_the_remedy_and_never_spawns"
+          - name: no unit still starts the unit
+            file: src/remote/host.rs
+            perl: 's/ServerStartPlan::DirectSpawn => \{\n            spawn_direct\(\)\?;/ServerStartPlan::DirectSpawn => {\n            start_unit()?;\n            spawn_direct()?;/'
+            expect: "entry_spawns_directly_when_no_unit_is_installed"
+          - name: production host never asks the user manager
+            file: src/remote/host.rs
+            perl: 's/herdr_unit_state\(&self.systemctl, /herdr_unit_state(\&|_: \&[\&str]| -> io::Result<SystemctlOutput> { Err(io::Error::other("mutant")) }, \/* MUTANT *\/ /'
+            expect: "system_host_wires_unit_state_and_start_through_systemctl"
+          - name: production host start skips systemctl
+            file: src/remote/host.rs
+            perl: 's/systemctl_start_unit\(&self.systemctl\)/Ok(()) \/* MUTANT *\//'
+            expect: "system_host_wires_unit_state_and_start_through_systemctl"
+          - name: bridge failure dropped by the saved client
+            file: src/client/endpoint/supervisor.rs
+            perl: 's/    reported.unwrap_or\(handshake_error\)/    let _ = reported; \/* MUTANT *\/\n    handshake_error/'
+            expect: "bridge_failure_replaces_the_bare_handshake_error"
+          - name: listening probe error read as not listening
+            file: src/remote/host.rs
+            perl: 's/if host\.server_listening\(\)\? \{/if host.server_listening().unwrap_or(false) \/* MUTANT *\/ {/'
+            expect: "entry_listening_probe_error_refuses_and_starts_nothing"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Prefetch Zig packages (fetch retried; never a test)
+        uses: ./.github/actions/zig-fetch-retry
+
+      - name: Install Linux build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Apply the mutant and require its tests to fail
+        env:
+          FILTER: 'test(/^remote::host::tests::/) | test(/^client::endpoint::supervisor::tests::(bridge_failure|handshake_error_stands)/)'
+          PERL_EXPR: ${{ matrix.perl }}
+          EXPECT: ${{ matrix.expect }}
+          FILE: ${{ matrix.file }}
+        run: |
+          # The baseline must be green first: a red baseline would "kill" every mutant.
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E "$FILTER"
+          perl -0777 -pi -e "$PERL_EXPR" "$FILE"
+          git diff --stat -- "$FILE"
+          [ -n "$(git diff --name-only -- "$FILE")" ] || { echo "mutation did not land"; exit 1; }
+          rc=0
+          cargo nextest run --locked --bin herdr --no-fail-fast --status-level fail --success-output never -E "$FILTER" > mutant.log 2>&1 || rc=$?
+          cat mutant.log
+          [ "$rc" != 0 ] || { echo "MUTANT SURVIVED: every fork test passed"; exit 1; }
+          for test in $EXPECT; do
+            grep -q "FAIL.*$test" mutant.log || { echo "expected $test to FAIL, it did not"; exit 1; }
+          done
+          echo "mutant killed"

@@ -68,6 +68,7 @@ fn real_exit(app: &mut AppState, pane_id: PaneId, agent: Agent, at: Instant) {
 
 fn pi_report(app: &mut AppState, pane_id: PaneId, state: AgentState, seq: u64) {
     app.handle_app_event(AppEvent::HookStateReported {
+        named_agent: crate::terminal::NamedAgentVerdict::Unnamed,
         pane_id,
         source: "herdr:pi".into(),
         agent_label: "pi".into(),
@@ -91,6 +92,8 @@ fn pi_session_report(
         seq: Some(seq),
         session_ref: Some(pi_session()),
         session_start_source: session_start_source.map(str::to_string),
+        reporter_is_foreground: None,
+        agent_session_cwd: None,
     });
 }
 
@@ -102,6 +105,8 @@ fn claude_session_report(app: &mut AppState, pane_id: PaneId, seq: u64) {
         seq: Some(seq),
         session_ref: Some(claude_session()),
         session_start_source: Some("startup".into()),
+        reporter_is_foreground: None,
+        agent_session_cwd: None,
     });
 }
 

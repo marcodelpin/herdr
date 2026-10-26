@@ -1132,7 +1132,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 13);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1141,8 +1141,41 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(10));
+    assert_eq!(status.installed_version, Some(13));
     assert_eq!(status.state, IntegrationStatusKind::Current);
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn claude_v11_predecessor_integration_status_is_outdated() {
+    // Version 11 names two incomplete predecessors of the combined hook: the
+    // fork hook with reporter_is_foreground/agent_session_cwd but the old
+    // decoder, and upstream's UTF-8 decoding hook without the fork fields.
+    // Neither may read as current, or no reinstall is recommended.
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let claude_hooks_dir = home.join(".claude").join("hooks");
+    fs::create_dir_all(&claude_hooks_dir).unwrap();
+    let hook_path = claude_hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=11\n",
+    )
+    .unwrap();
+    std::env::set_var("HOME", &home);
+
+    let statuses = installed_integration_statuses();
+    let claude = statuses
+        .iter()
+        .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+        .unwrap();
+
+    assert_eq!(claude.path, hook_path);
+    assert_eq!(claude.installed_version, Some(11));
+    assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);
@@ -1171,10 +1204,136 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 10);
+    assert_eq!(claude.expected_version, 13);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn windows_hooks_decode_stdin_as_utf8() {
+    // Windows PowerShell decodes `[Console]::In` with the console input code
+    // page, which corrupts UTF-8 hook payloads on non-UTF-8 locales such as
+    // Korean Windows (CP949) and makes the hook silently drop the session.
+    // Every bundled PowerShell hook must read the raw stdin stream as UTF-8.
+    // See #5253.
+    for (name, asset) in [
+        (
+            "antigravity_cli",
+            include_str!("assets/antigravity_cli/herdr-agent-state.ps1"),
+        ),
+        (
+            "claude",
+            include_str!("assets/claude/herdr-agent-state.ps1"),
+        ),
+        ("codex", include_str!("assets/codex/herdr-agent-state.ps1")),
+        (
+            "copilot",
+            include_str!("assets/copilot/herdr-agent-state.ps1"),
+        ),
+        (
+            "cursor",
+            include_str!("assets/cursor/herdr-agent-state.ps1"),
+        ),
+        ("devin", include_str!("assets/devin/herdr-agent-state.ps1")),
+        ("droid", include_str!("assets/droid/herdr-agent-state.ps1")),
+        ("grok", include_str!("assets/grok/herdr-agent-state.ps1")),
+        ("kimi", include_str!("assets/kimi/herdr-agent-state.ps1")),
+        (
+            "letta",
+            include_str!("assets/letta/herdr-agent-session.ps1"),
+        ),
+        (
+            "mastracode",
+            include_str!("assets/mastracode/herdr-agent-state.ps1"),
+        ),
+        (
+            "qodercli",
+            include_str!("assets/qodercli/herdr-agent-state.ps1"),
+        ),
+        ("qwen", include_str!("assets/qwen/herdr-agent-session.ps1")),
+    ] {
+        assert!(
+            !asset.contains("[Console]::In.ReadToEnd()"),
+            "{name} hook must not decode stdin with the console input code page"
+        );
+        assert!(
+            asset.contains("[Console]::OpenStandardInput()")
+                && asset.contains("[System.Text.Encoding]::UTF8"),
+            "{name} hook must decode raw stdin as UTF-8"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_windows_hook_reports_utf8_session_path() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let installed = install_claude().unwrap();
+
+    let capture = base.join("args.txt");
+    let fake_herdr = base.join("herdr-capture.ps1");
+    fs::write(
+        &fake_herdr,
+        "$capture = $env:HERDR_TEST_CAPTURE\n[System.IO.File]::WriteAllText($capture, ($args -join \"`n\"), [System.Text.UTF8Encoding]::new($false))\n",
+    )
+    .unwrap();
+
+    // A Korean profile path: decoded with a non-UTF-8 console input code page
+    // (CP949 on Korean Windows) it garbles the JSON and the hook exits silently.
+    let transcript = "C:\\Users\\\u{d55c}\u{ae00}\\transcript.jsonl";
+    let payload = format!(
+        r#"{{"hook_event_name":"SessionStart","session_id":"claude-session","transcript_path":{}}}"#,
+        serde_json::to_string(transcript).unwrap()
+    );
+
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&installed.hook_path)
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .env("HERDR_TEST_CAPTURE", &capture)
+        .env_remove("CURSOR_VERSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args = fs::read_to_string(&capture).unwrap();
+    assert!(args.contains("report-agent-session"), "captured: {args}");
+    assert!(args.contains("--agent-session-id"), "captured: {args}");
+    assert!(args.contains("claude-session"), "captured: {args}");
+    assert!(args.contains(transcript), "captured: {args}");
+
+    if let Some(home) = previous_home {
+        std::env::set_var("HOME", home);
+    } else {
+        std::env::remove_var("HOME");
+    }
     let _ = fs::remove_dir_all(base);
 }
 
@@ -1304,7 +1463,7 @@ fn codex_v2_integration_status_is_outdated() {
 
     assert_eq!(codex.path, hook_path);
     assert_eq!(codex.installed_version, Some(2));
-    assert_eq!(codex.expected_version, 9);
+    assert_eq!(codex.expected_version, 10);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -1335,20 +1494,11 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
         .as_str()
         .unwrap()
         .contains(" session"));
-    assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" working"));
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
-    assert!(hooks["hooks"]["Interrupt"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap()
-        .contains(" idle"));
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert!(config.contains("model = \"gpt-5.4\""));
     assert!(config.contains("[features]"));
     assert!(config.contains("hooks = true"));
@@ -1399,14 +1549,11 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
     assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        hooks["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
-        1
-    );
+    assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
-    assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 1);
-    assert_eq!(hooks["hooks"]["Interrupt"].as_array().unwrap().len(), 1);
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
     assert_eq!(config.matches("hooks = true").count(), 1);
     assert!(!config.contains("codex_hooks"));
     assert!(config.contains("other = true"));
@@ -1435,6 +1582,49 @@ fn install_codex_only_migrates_top_level_feature_flags() {
 
     assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
     assert!(config.contains("[features]\nhooks = true\nother = true"));
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_removes_turn_status_hooks_from_previous_integration() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hook = |action| json!({"type": "command", "command": hook_command(&hook_path, Some(action)), "timeout": 10});
+    let hooks = json!({
+        "hooks": {
+            "SessionStart": [{"hooks": [hook("session")]}],
+            "UserPromptSubmit": [{"hooks": [
+                hook("working"),
+                {"type": "command", "command": "echo keep", "timeout": 10}
+            ]}],
+            "Stop": [{"hooks": [hook("idle")]}],
+            "Interrupt": [{"hooks": [hook("idle")]}]
+        }
+    });
+    fs::write(
+        codex_dir.join("hooks.json"),
+        serde_json::to_string(&hooks).unwrap(),
+    )
+    .unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_codex().unwrap();
+
+    let hooks: Value =
+        serde_json::from_str(&fs::read_to_string(codex_dir.join("hooks.json")).unwrap()).unwrap();
+    assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        hooks["hooks"]["UserPromptSubmit"][0]["hooks"],
+        json!([{"type": "command", "command": "echo keep", "timeout": 10}])
+    );
+    assert!(hooks["hooks"].get("Stop").is_none());
+    assert!(hooks["hooks"].get("Interrupt").is_none());
 
     std::env::remove_var("HOME");
     let _ = fs::remove_dir_all(base);
@@ -2927,6 +3117,283 @@ fn install_hermes_converts_inline_enabled_list_to_block_list() {
 }
 
 #[test]
+fn install_hermes_preserves_indentless_enabled_list() {
+    let input = "plugins:\n  enabled:\n  - example-plugin\n  disabled:\n  - other-plugin\n";
+    let actual = update_hermes_enabled_plugin(input, true);
+    assert_eq!(
+        actual,
+        "plugins:\n  enabled:\n  - herdr-agent-state\n  - example-plugin\n  disabled:\n  - other-plugin\n",
+        "new plugin must share the existing sequence indentation"
+    );
+}
+
+#[test]
+fn hermes_block_sequences_preserve_indentation_comments_and_siblings() {
+    for key_indent in [2, 4] {
+        for item_indent in [key_indent, key_indent + 2, key_indent + 4] {
+            let key_padding = " ".repeat(key_indent);
+            let item_padding = " ".repeat(item_indent);
+            let header = format!("plugins:\n{key_padding}enabled: # selected plugins\n");
+            let tail = format!(
+                "{item_padding}# existing plugin\n{item_padding}- 'example-plugin' # keep\n\n{key_padding}disabled:\n{key_padding}- herdr-agent-state\nmodel: example"
+            );
+            let input = format!("{header}{tail}");
+            let expected = format!("{header}{item_padding}- herdr-agent-state\n{tail}");
+            let installed = update_hermes_enabled_plugin(&input, true);
+            assert_eq!(installed, expected);
+            assert_eq!(update_hermes_enabled_plugin(&installed, true), installed);
+            assert_eq!(update_hermes_enabled_plugin(&installed, false), input);
+            assert_eq!(update_hermes_enabled_plugin(&input, false), input);
+        }
+    }
+    for indent in [0, 2, 4] {
+        let padding = " ".repeat(indent);
+        let input = format!(
+            "plugins: # selected\n# keep comment\n{padding}- other-plugin\nmodel: example\n"
+        );
+        let installed = update_hermes_enabled_plugin(&input, true);
+        assert_eq!(installed, format!("plugins: # selected\n{padding}- herdr-agent-state\n# keep comment\n{padding}- other-plugin\nmodel: example\n"));
+        assert_eq!(update_hermes_enabled_plugin(&installed, true), installed);
+        assert_eq!(update_hermes_enabled_plugin(&installed, false), input);
+    }
+}
+
+#[test]
+fn hermes_sequence_membership_is_scoped_to_direct_enabled_items() {
+    for input in [
+        "plugins:\n  disabled:\n  - herdr-agent-state\n  enabled:\n  - other\n",
+        "plugins:\n  enabled:\n    - options:\n        - herdr-agent-state\n",
+    ] {
+        let expected = input.replacen(
+            "  enabled:\n",
+            if input.contains("options:") {
+                "  enabled:\n    - herdr-agent-state\n"
+            } else {
+                "  enabled:\n  - herdr-agent-state\n"
+            },
+            1,
+        );
+        let installed = update_hermes_enabled_plugin(input, true);
+        assert_eq!(installed, expected);
+        assert_eq!(update_hermes_enabled_plugin(&installed, false), input);
+        assert_eq!(update_hermes_enabled_plugin(input, false), input);
+    }
+}
+
+#[test]
+fn install_hermes_does_not_treat_disabled_as_a_flat_plugin_list() {
+    let input = "plugins:\n    disabled:\n    - herdr-agent-state\nmodel: example\n";
+    let installed = update_hermes_enabled_plugin(input, true);
+    assert_eq!(installed, "plugins:\n    enabled:\n      - herdr-agent-state\n    disabled:\n    - herdr-agent-state\nmodel: example\n");
+    assert_eq!(update_hermes_enabled_plugin(&installed, true), installed);
+    let uninstalled = update_hermes_enabled_plugin(&installed, false);
+    assert_eq!(
+        uninstalled,
+        "plugins:\n    enabled: []\n    disabled:\n    - herdr-agent-state\nmodel: example\n"
+    );
+    assert_eq!(
+        update_hermes_enabled_plugin(&uninstalled, false),
+        uninstalled
+    );
+}
+
+#[test]
+fn uninstall_hermes_keeps_empty_sequences_and_removes_duplicate_direct_items() {
+    for (input, expected) in [
+        ("plugins:\n  enabled: # keep\n  - 'herdr-agent-state'\n  - herdr-agent-state # duplicate\n  disabled: []\n", "plugins:\n  enabled: [] # keep\n  disabled: []\n"),
+        ("plugins: # keep\n- herdr-agent-state\n", "plugins: [] # keep\n"),
+        ("plugins:\n    enabled: [herdr-agent-state, herdr-agent-state] # keep\n", "plugins:\n    enabled: [] # keep\n"),
+    ] {
+        let uninstalled = update_hermes_enabled_plugin(input, false);
+        assert_eq!(uninstalled, expected);
+        assert_eq!(update_hermes_enabled_plugin(&uninstalled, false), uninstalled);
+    }
+}
+
+#[test]
+fn uninstall_hermes_preserves_bare_sequence_items() {
+    for (header, indent) in [
+        ("plugins:\n", ""),
+        ("plugins:\n", "  "),
+        ("plugins:\n  enabled:\n", "  "),
+        ("plugins:\n  enabled:\n", "    "),
+    ] {
+        for indicator in ["-", "-   ", "- # keep"] {
+            let remaining = format!("{indent}{indicator}\n{indent}  other-plugin\n");
+            for plugin_first in [true, false] {
+                let plugin = format!("{indent}- herdr-agent-state\n");
+                let input = if plugin_first {
+                    format!("{header}{plugin}{remaining}model: example\n")
+                } else {
+                    format!("{header}{remaining}{plugin}model: example\n")
+                };
+                let expected = format!("{header}{remaining}model: example\n");
+                let uninstalled = update_hermes_enabled_plugin(&input, false);
+                assert_eq!(uninstalled, expected, "input: {input}");
+                assert_eq!(update_hermes_enabled_plugin(&uninstalled, false), expected);
+                let installed = update_hermes_enabled_plugin(&uninstalled, true);
+                assert_eq!(
+                    installed,
+                    format!("{header}{plugin}{remaining}model: example\n")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn uninstall_hermes_preserves_bare_item_in_config_file() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    fs::create_dir_all(&base).unwrap();
+    std::env::set_var(HERMES_HOME_ENV_VAR, &base);
+    let config_path = base.join("config.yaml");
+    let remaining =
+        "plugins:\n  enabled:\n  -\n    other-plugin\n  disabled:\n  - disabled-plugin\n";
+    fs::write(&config_path, remaining).unwrap();
+    install_hermes().unwrap();
+
+    let result = uninstall_hermes().unwrap();
+    assert!(result.removed_plugin_dir);
+    assert!(result.updated_config);
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), remaining);
+    assert!(!uninstall_hermes().unwrap().updated_config);
+
+    std::env::remove_var(HERMES_HOME_ENV_VAR);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn uninstall_hermes_preserves_empty_sequence_node_properties() {
+    for properties in [
+        "&selected",
+        "!!seq &selected",
+        "&selected !!seq",
+        "!<tag:yaml.org,2002:seq> &selected",
+    ] {
+        for (header, indent, alias) in [
+            ("plugins:", "  ", "other: *selected\n"),
+            ("plugins:\n  enabled:", "    ", "  disabled: *selected\n"),
+        ] {
+            let input =
+                format!("{header} {properties} # keep\n{indent}- herdr-agent-state\n{alias}");
+            let expected = format!("{header} {properties} [] # keep\n{alias}");
+            let uninstalled = update_hermes_enabled_plugin(&input, false);
+            assert_eq!(uninstalled, expected);
+            assert_eq!(update_hermes_enabled_plugin(&uninstalled, false), expected);
+            assert_eq!(update_hermes_enabled_plugin(&uninstalled, true), input);
+
+            let flow =
+                format!("{header} {properties} [herdr-agent-state, other-plugin] # keep\n{alias}");
+            assert_eq!(
+                update_hermes_enabled_plugin(&flow, false),
+                format!("{header} {properties} # keep\n{indent}- other-plugin\n{alias}")
+            );
+        }
+    }
+}
+
+#[test]
+fn hermes_bare_plugin_items_use_the_continued_scalar() {
+    for (header, indent) in [
+        ("plugins:\n", ""),
+        ("plugins:\n", "  "),
+        ("plugins:\n  enabled:\n", "  "),
+        ("plugins:\n  enabled:\n", "    "),
+    ] {
+        for indicator in ["-", "-   ", "- # plugin"] {
+            for value in [
+                "herdr-agent-state",
+                "'herdr-agent-state'",
+                "\"herdr-agent-state\" # installed",
+            ] {
+                let plugin = format!("{indent}{indicator}\n{indent}  {value}\n");
+                let other = format!("{indent}-\n{indent}  other-plugin\n");
+                for plugin_first in [true, false] {
+                    let items = if plugin_first {
+                        format!("{plugin}{other}")
+                    } else {
+                        format!("{other}{plugin}")
+                    };
+                    let input = format!("{header}{items}model: example\n");
+                    assert_eq!(update_hermes_enabled_plugin(&input, true), input);
+                    let expected = format!("{header}{other}model: example\n");
+                    assert_eq!(update_hermes_enabled_plugin(&input, false), expected);
+                    assert_eq!(update_hermes_enabled_plugin(&expected, false), expected);
+                }
+            }
+        }
+    }
+    let input = "plugins:\n  enabled:\n  - # plugin\n    # keep comment\n\n    herdr-agent-state\n  - herdr-agent-state # duplicate\n  # keep trailing comment\n  disabled: []\n";
+    assert_eq!(
+        update_hermes_enabled_plugin(input, false),
+        "plugins:\n  enabled: []\n    # keep comment\n\n  # keep trailing comment\n  disabled: []\n"
+    );
+}
+
+#[test]
+fn hermes_does_not_match_scalar_prefixes_or_nested_continuations() {
+    for item in [
+        "  - herdr-agent-state\n    other\n",
+        "  -\n    herdr-agent-state\n    other\n",
+        "  -\n    - herdr-agent-state\n",
+    ] {
+        let input = format!("plugins:\n  enabled:\n{item}  disabled: []\n");
+        assert_eq!(update_hermes_enabled_plugin(&input, false), input);
+        let installed = update_hermes_enabled_plugin(&input, true);
+        assert_eq!(
+            installed,
+            format!("plugins:\n  enabled:\n  - herdr-agent-state\n{item}  disabled: []\n")
+        );
+        assert_eq!(update_hermes_enabled_plugin(&installed, false), input);
+    }
+}
+
+#[test]
+fn hermes_flow_sequence_edits_keep_following_comments() {
+    for (input, expected) in [
+        ("plugins: [other] # selected\n# keep following comment\nmodel: example\n", "plugins: # selected\n  - herdr-agent-state\n  - other\n# keep following comment\nmodel: example\n"),
+        ("plugins:\n    enabled: [other] # selected\n    # keep following comment\n    disabled: []\n", "plugins:\n    enabled: # selected\n      - herdr-agent-state\n      - other\n    # keep following comment\n    disabled: []\n"),
+    ] {
+        assert_eq!(update_hermes_enabled_plugin(input, true), expected);
+        assert_eq!(update_hermes_enabled_plugin(expected, true), expected);
+    }
+}
+
+#[test]
+fn hermes_install_and_uninstall_are_idempotent_with_indentless_config() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    fs::create_dir_all(&base).unwrap();
+    std::env::set_var(HERMES_HOME_ENV_VAR, &base);
+    let input = "plugins:\n  enabled:\n  - example-plugin\n  disabled:\n  - other-plugin\n";
+    let config_path = base.join("config.yaml");
+    fs::write(&config_path, input).unwrap();
+
+    let installed = install_hermes().unwrap();
+    let first = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(first, "plugins:\n  enabled:\n  - herdr-agent-state\n  - example-plugin\n  disabled:\n  - other-plugin\n");
+    assert!(installed
+        .plugin_dir
+        .join(HERMES_PLUGIN_INIT_INSTALL_NAME)
+        .is_file());
+    install_hermes().unwrap();
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), first);
+
+    let uninstalled = uninstall_hermes().unwrap();
+    assert!(uninstalled.removed_plugin_dir);
+    assert!(uninstalled.updated_config);
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), input);
+    let again = uninstall_hermes().unwrap();
+    assert!(!again.removed_plugin_dir);
+    assert!(!again.updated_config);
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), input);
+
+    std::env::remove_var(HERMES_HOME_ENV_VAR);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn install_hermes_preserves_quoted_inline_enabled_items() {
     let config =
         update_hermes_enabled_plugin("plugins:\n  enabled: [\"null\", 'foo: bar']\n", true);
@@ -3208,6 +3675,35 @@ fn bundled_integration_asset_versions_match_expected_versions() {
             "{name} asset version must match its integration version constant"
         );
     }
+}
+
+// ADR-0002 (herdr-3ir, herdr-ct9): a regression guard against "the version
+// marker bumped but the field was never actually added" - cheap
+// string-presence checks, not a behavioral test of the hook. CLAUDE_HOOK_ASSET
+// is the `.sh` asset on Unix and the `.ps1` asset on Windows (`cfg!(windows)`
+// in `mod.rs`); the `.sh` builds a JSON params dict directly (`agent_pid`,
+// `agent_session_cwd`), while the `.ps1` shells out to the CLI with hyphenated
+// flags (`--agent-pid`, `--agent-session-cwd`) - either spelling satisfies the
+// check, since CI runs this on both `ubuntu-latest` and `windows-latest`.
+#[test]
+fn agent_restore_3ir_claude_hook_asset_reports_agent_pid() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("CLAUDE_PID"),
+        "the claude hook should read the reporter's own pid from $CLAUDE_PID"
+    );
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_pid") || CLAUDE_HOOK_ASSET.contains("agent-pid"),
+        "the claude hook should report the reporter's pid to pane.report_agent_session"
+    );
+}
+
+#[test]
+fn agent_restore_ct9_claude_hook_asset_reports_session_cwd() {
+    assert!(
+        CLAUDE_HOOK_ASSET.contains("agent_session_cwd")
+            || CLAUDE_HOOK_ASSET.contains("agent-session-cwd"),
+        "the claude hook should report the agent's own cwd to pane.report_agent_session"
+    );
 }
 
 #[test]
@@ -3565,7 +4061,7 @@ fn install_qwen_writes_session_hook_and_preserves_settings() {
     assert!(settings.get("permissions").is_some());
     let hook_asset = fs::read_to_string(&installed.hook_path).unwrap();
     assert!(hook_asset.contains("HERDR_INTEGRATION_ID=qwen"));
-    assert!(hook_asset.contains("HERDR_INTEGRATION_VERSION=1"));
+    assert!(hook_asset.contains("HERDR_INTEGRATION_VERSION=2"));
     assert!(hook_asset.contains("herdr:qwen"));
 
     install_qwen().unwrap();
@@ -3943,7 +4439,7 @@ fn install_cursor_uses_cursor_config_dir_env() {
 }
 
 #[test]
-fn cursor_v1_integration_status_is_current() {
+fn cursor_v1_integration_status_is_outdated() {
     let _lock = integration_env_lock();
     let base = unique_base();
     let cursor_dir = base.join(".cursor");
@@ -3961,8 +4457,9 @@ fn cursor_v1_integration_status_is_current() {
         .iter()
         .find(|status| status.target == crate::api::schema::IntegrationTarget::Cursor)
         .expect("cursor integration status");
-    assert_eq!(cursor.state, IntegrationStatusKind::Current);
-    assert_eq!(cursor.installed_version, Some(CURSOR_INTEGRATION_VERSION));
+    assert_eq!(cursor.installed_version, Some(1));
+    assert_eq!(cursor.expected_version, CURSOR_INTEGRATION_VERSION);
+    assert_eq!(cursor.state, IntegrationStatusKind::Outdated);
 
     clear_integration_path_env();
     let _ = fs::remove_dir_all(base);
@@ -4454,7 +4951,7 @@ fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
 }
 
 #[test]
-fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
+fn antigravity_cli_v3_install_is_outdated_until_reinstalled() {
     let _lock = integration_env_lock();
     let base = unique_base();
     let agy_dir = base.join(".gemini").join("config");
@@ -4463,7 +4960,7 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
     fs::write(
         hook_dir.join(ANTIGRAVITY_CLI_HOOK_INSTALL_NAME),
         ANTIGRAVITY_CLI_HOOK_ASSET
-            .replace("HERDR_INTEGRATION_VERSION=3", "HERDR_INTEGRATION_VERSION=2"),
+            .replace("HERDR_INTEGRATION_VERSION=4", "HERDR_INTEGRATION_VERSION=3"),
     )
     .unwrap();
     std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
@@ -4476,8 +4973,8 @@ fn antigravity_cli_v2_install_is_outdated_until_reinstalled() {
     };
     let outdated = status();
     assert_eq!(outdated.state, IntegrationStatusKind::Outdated);
-    assert_eq!(outdated.installed_version, Some(2));
-    assert_eq!(outdated.expected_version, 3);
+    assert_eq!(outdated.installed_version, Some(3));
+    assert_eq!(outdated.expected_version, 4);
 
     install_antigravity_cli().unwrap();
     assert_eq!(status().state, IntegrationStatusKind::Current);
@@ -4754,5 +5251,298 @@ fn grok_dir_honors_grok_home_after_config_dir_seam() {
 
     std::env::remove_var(GROK_HOME_ENV_VAR);
     clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+// herdr-d98u: the server field is u32, so the claude hook forwards CLAUDE_PID
+// only as a decimal pid in 1..=4294967295 and otherwise omits agent_pid; the
+// report itself must still land either way.
+#[cfg(unix)]
+fn run_claude_sh_hook_with_claude_pid(claude_pid: Option<&str>) -> Option<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // a short fixed prefix: temp_dir() on macOS can push a socket path past sun_path
+    let socket_path = PathBuf::from(format!(
+        "/tmp/herdr-d98u-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(CLAUDE_HOOK_ASSET)
+        .arg("herdr-agent-state.sh")
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p2")
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env_remove("CURSOR_VERSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match claude_pid {
+        Some(pid) => command.env("CLAUDE_PID", pid),
+        None => command.env_remove("CLAUDE_PID"),
+    };
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"SessionStart","session_id":"claude-session","source":"startup"}"#)
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut request = None;
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let _ = stream.write_all(b"{}\n");
+                request = Some(serde_json::from_str::<Value>(&line).unwrap());
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if child.try_wait().unwrap().is_some() {
+                    // the hook exited: one last accept for a connection that raced the exit
+                    if let Ok((stream, _)) = listener.accept() {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut line = String::new();
+                        BufReader::new(&stream).read_line(&mut line).unwrap();
+                        request = serde_json::from_str::<Value>(&line).ok();
+                    }
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("accept failed: {err}"),
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = fs::remove_file(&socket_path);
+    assert!(
+        output.status.success(),
+        "hook failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    request.map(|request| request["params"].clone())
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_sh_hook_bounds_claude_pid_to_u32_and_still_reports() {
+    assert!(
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success()),
+        "the claude hook needs python3; without it this test would prove nothing"
+    );
+    // herdr-d98u r2: python's int() refuses more than 4300 digits, so a long
+    // value must be bounded before conversion; zero padding stays a valid pid.
+    let long_pid = "1".repeat(4301);
+    let padded_long_pid = format!("{}7", "0".repeat(4400));
+    for (claude_pid, expected) in [
+        (Some("4242"), Some(4242_u64)),
+        (Some("1"), Some(1)),
+        (Some("4294967295"), Some(4_294_967_295)),
+        (Some("00000000001"), Some(1)),
+        (Some("04294967295"), Some(4_294_967_295)),
+        (Some(padded_long_pid.as_str()), Some(7)),
+        (Some("4294967296"), None),
+        (Some("04294967296"), None),
+        (Some("99999999999999999999"), None),
+        (Some(long_pid.as_str()), None),
+        (Some("0"), None),
+        (Some("00000000000"), None),
+        (Some("-5"), None),
+        (Some("+7"), None),
+        (Some(" 7"), None),
+        (Some("7x"), None),
+        (Some(""), None),
+        (None, None),
+    ] {
+        let params = run_claude_sh_hook_with_claude_pid(claude_pid)
+            .unwrap_or_else(|| panic!("CLAUDE_PID={claude_pid:?}: no report reached the socket"));
+        assert_eq!(
+            params["agent_session_id"], "claude-session",
+            "CLAUDE_PID={claude_pid:?}: {params}"
+        );
+        assert_eq!(
+            params.get("agent_pid").and_then(Value::as_u64),
+            expected,
+            "CLAUDE_PID={claude_pid:?}: {params}"
+        );
+        if expected.is_none() {
+            assert!(
+                params.get("agent_pid").is_none(),
+                "CLAUDE_PID={claude_pid:?}: {params}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_windows_hook_bounds_claude_pid_to_u32_and_still_reports() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let previous_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let installed = install_claude().unwrap();
+
+    let fake_herdr = base.join("herdr-capture.ps1");
+    fs::write(
+        &fake_herdr,
+        "$capture = $env:HERDR_TEST_CAPTURE\n[System.IO.File]::WriteAllText($capture, ($args -join \"`n\"), [System.Text.UTF8Encoding]::new($false))\n",
+    )
+    .unwrap();
+
+    // herdr-d98u r2: zero padding is a valid decimal pid, as on Linux; only
+    // the significant digits are bounded, so any input length is safe.
+    let long_pid = "1".repeat(4301);
+    let padded_long_pid = format!("{}7", "0".repeat(4400));
+    for (index, (claude_pid, expected)) in [
+        ("4242", Some("4242")),
+        ("4294967295", Some("4294967295")),
+        ("00000000001", Some("1")),
+        ("04294967295", Some("4294967295")),
+        (padded_long_pid.as_str(), Some("7")),
+        ("4294967296", None),
+        ("04294967296", None),
+        (long_pid.as_str(), None),
+        ("0", None),
+        ("00000000000", None),
+        ("-5", None),
+        ("+7", None),
+        (" 7", None),
+        ("7x", None),
+        ("abc", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let capture = base.join(format!("args-{index}.txt"));
+        let mut child = Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&installed.hook_path)
+            .arg("session")
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w1:p2")
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .env("HERDR_TEST_CAPTURE", &capture)
+            .env("CLAUDE_PID", claude_pid)
+            .env_remove("CURSOR_VERSION")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "CLAUDE_PID={claude_pid:?}: hook failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args: Vec<String> = fs::read_to_string(&capture)
+            .unwrap_or_else(|err| panic!("CLAUDE_PID={claude_pid:?}: no report: {err}"))
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == "report-agent-session"),
+            "CLAUDE_PID={claude_pid:?}: {args:?}"
+        );
+        let forwarded = args
+            .iter()
+            .position(|arg| arg == "--agent-pid")
+            .map(|index| args[index + 1].as_str());
+        assert_eq!(forwarded, expected, "CLAUDE_PID={claude_pid:?}: {args:?}");
+    }
+
+    if let Some(home) = previous_home {
+        std::env::set_var("HOME", home);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+// herdr-wf1f: version 11 once named two different claude hooks (the fork's
+// and upstream's), and a number-only check read both as current. At the
+// expected version the installed text must also be the bundled asset.
+#[test]
+fn claude_hook_with_expected_version_but_other_content_is_outdated() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let hook_path = base.join(CLAUDE_HOOK_INSTALL_NAME);
+    fs::create_dir_all(&base).unwrap();
+    let status = |content: &str| {
+        fs::write(&hook_path, content).unwrap();
+        integration_status_at(
+            crate::api::schema::IntegrationTarget::Claude,
+            hook_path.clone(),
+            CLAUDE_INTEGRATION_VERSION,
+        )
+    };
+
+    let current = status(CLAUDE_HOOK_ASSET);
+    assert_eq!(current.installed_version, Some(CLAUDE_INTEGRATION_VERSION));
+    assert_eq!(current.state, IntegrationStatusKind::Current);
+
+    // another hook carrying the same version number
+    let other = format!(
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION={CLAUDE_INTEGRATION_VERSION}\n"
+    );
+    let collided = status(&other);
+    assert_eq!(collided.installed_version, Some(CLAUDE_INTEGRATION_VERSION));
+    assert_eq!(collided.state, IntegrationStatusKind::Outdated);
+
+    // the bundled asset with one line changed is a different hook too
+    let edited = CLAUDE_HOOK_ASSET.replacen("CLAUDE_PID", "CLAUDE_PID_X", 1);
+    assert_ne!(edited, CLAUDE_HOOK_ASSET);
+    assert_eq!(status(&edited).state, IntegrationStatusKind::Outdated);
+
+    // a same-length edit that disables reporting is a different hook as well,
+    // so a length-only comparison cannot pass (herdr-wf1f r2)
+    let same_length = CLAUDE_HOOK_ASSET.replacen("SessionStart", "SessionStort", 1);
+    assert_ne!(same_length, CLAUDE_HOOK_ASSET);
+    assert_eq!(same_length.len(), CLAUDE_HOOK_ASSET.len());
+    assert_eq!(status(&same_length).state, IntegrationStatusKind::Outdated);
+
+    // line endings alone do not make a different hook
+    let crlf = CLAUDE_HOOK_ASSET
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_eq!(status(&crlf).state, IntegrationStatusKind::Current);
+
+    // a hook from a newer herdr is not compared with this build's asset
+    let newer = format!(
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION={}\n",
+        CLAUDE_INTEGRATION_VERSION + 1
+    );
+    assert_eq!(status(&newer).state, IntegrationStatusKind::Current);
+
     let _ = fs::remove_dir_all(base);
 }

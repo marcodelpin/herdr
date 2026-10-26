@@ -150,7 +150,7 @@ pub(super) fn render_collapsed(
                     )),
                 );
             }
-            let stale = endpoint.status != ClientEndpointStatus::Online;
+            let stale = endpoint.is_stale();
             let number = format!(" {}", workspace.number);
             let number_width = super::render::display_width(&number).min(rect.width);
             let dim = if stale {
@@ -172,20 +172,28 @@ pub(super) fn render_collapsed(
                     })
                     .add_modifier(dim),
             );
-            put_text(
+            let display = super::sidebar::workspace_display_state(
+                snapshot,
+                &[workspace],
+                workspace.agent_status,
+                config,
+            );
+            let (icon, clock) = lookup_display_icon(display, config, stale);
+            let written = put_text(
                 buffer,
                 rect.x.saturating_add(number_width),
                 rect.y,
                 rect.width.saturating_sub(number_width),
-                status_icon(workspace.agent_status, config.status_indicators),
+                icon,
                 Style::default()
                     .fg(if stale {
                         palette.overlay0
                     } else {
-                        status_color(workspace.agent_status, palette)
+                        display_state_color(display, palette)
                     })
-                    .add_modifier(dim),
+                    .add_modifier(dim | display_state_modifier(display)),
             );
+            config.mark_spinner_drawn_if(clock, icon_reached_frame(written, 0, icon));
             hits.workspaces.push(WorkspaceHit {
                 rect,
                 endpoint_id: endpoint.endpoint_id.clone(),
@@ -468,20 +476,26 @@ pub(super) fn render_expanded(
                 let selected = state.selected_workspace_id.is_some_and(|target| {
                     target.matches(&endpoint.endpoint_id, &workspace.workspace_id)
                 });
+                let stale = endpoint.is_stale();
                 super::sidebar::render_workspace_rows(
                     buffer,
                     nested,
-                    status,
-                    config.status_indicators,
+                    super::sidebar::displayed_workspace_display_state(
+                        snapshot,
+                        workspace,
+                        collapsed_groups,
+                        config,
+                    ),
+                    stale,
                     entry,
                     tokens,
                     endpoint_active && workspace.focused,
                     selected,
                     state.selected_workspace_id.is_some(),
                     false,
-                    palette,
+                    config,
                 );
-                if endpoint.status != ClientEndpointStatus::Online {
+                if stale {
                     buffer.set_style(
                         rect,
                         Style::default()

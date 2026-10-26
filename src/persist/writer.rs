@@ -9,6 +9,9 @@ use super::{SessionHistorySnapshot, SessionSnapshot};
 pub(crate) struct SessionWriter {
     path: PathBuf,
     protect_unloaded: bool,
+    /// A live handoff transferred a session that no write has reached the
+    /// disk with yet (ADR-0014 invariant I6).
+    owes_transferred_session: bool,
 }
 
 impl SessionWriter {
@@ -16,7 +19,20 @@ impl SessionWriter {
         Self {
             path: super::io::session_path(),
             protect_unloaded,
+            owes_transferred_session: false,
         }
+    }
+
+    /// From now on until a write reaches the disk, the session holds a
+    /// transferred one that exists nowhere else. Live handoff is Unix-only.
+    #[cfg(any(unix, test))]
+    pub(crate) fn owe_transferred_session(&mut self) {
+        self.owes_transferred_session = true;
+    }
+
+    /// Whether a transferred session is still not on disk.
+    pub(crate) fn owes_transferred_session(&self) -> bool {
+        self.owes_transferred_session
     }
 
     fn preserve_unloaded(&mut self) -> io::Result<()> {
@@ -35,43 +51,67 @@ impl SessionWriter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &mut self,
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
+        // Logged by try_save; tests check the file instead.
+        let _ = self.try_save(snapshot, history);
+    }
+
+    /// Writes the session, and says whether it reached the disk. A failure
+    /// of the optional history file does not count.
+    pub(crate) fn try_save(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::save_to_path(&self.path, snapshot)
         });
         if let Err(err) = result {
             crate::logging::session_save_failed(&self.path, &err.to_string());
-            return;
+            return Err(err);
         }
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
+        self.owes_transferred_session = false;
         self.preserve_snapshot_history();
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::save_history_to_path(&history_path, history) {
             crate::logging::session_save_failed(&history_path, &err.to_string());
         }
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
+        // Logged by try_clear; tests check the file instead.
+        let _ = self.try_clear();
+    }
+
+    /// Clears the session file, and says whether it was cleared.
+    pub(crate) fn try_clear(&mut self) -> io::Result<()> {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
             super::io::clear_path(&self.path)
         });
         if let Err(err) = result {
             crate::logging::session_clear_failed(&self.path, &err.to_string());
-            return;
+            return Err(err);
         }
+        // No workspace is left to lose.
+        self.owes_transferred_session = false;
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::clear_path(&history_path) {
             crate::logging::session_clear_failed(&history_path, &err.to_string());
         }
         crate::logging::session_cleared(&self.path);
+        Ok(())
     }
 }
 
@@ -285,6 +325,7 @@ mod tests {
         SessionWriter {
             path: directory.join("session.json"),
             protect_unloaded,
+            owes_transferred_session: false,
         }
     }
 
@@ -316,6 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn a_transferred_session_is_owed_until_a_write_reaches_the_disk() {
+        let mut writer = writer(false);
+        writer.owe_transferred_session();
+        let blocker = writer.path.with_file_name("session.json.tmp");
+        std::fs::create_dir_all(blocker.join("blocker")).unwrap();
+        assert!(writer.try_save(&snapshot(), None).is_err());
+        assert!(
+            writer.owes_transferred_session(),
+            "a failed write must not discharge the transferred session"
+        );
+        std::fs::remove_dir_all(&blocker).unwrap();
+        writer.try_save(&snapshot(), None).unwrap();
+        assert!(!writer.owes_transferred_session());
+
+        writer.owe_transferred_session();
+        writer.try_clear().unwrap();
+        assert!(
+            !writer.owes_transferred_session(),
+            "a cleared session leaves no workspace to lose"
+        );
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn snapshot_survives_exit_bursts_clears_and_writer_restarts() {
         let mut writer = writer(false);
         let original = snapshot();
@@ -330,6 +395,7 @@ mod tests {
             writer = SessionWriter {
                 path: writer.path.clone(),
                 protect_unloaded: false,
+                owes_transferred_session: false,
             };
         }
         writer.clear();
@@ -413,6 +479,7 @@ mod tests {
         writer = SessionWriter {
             path: writer.path.clone(),
             protect_unloaded: false,
+            owes_transferred_session: false,
         };
         changed.workspaces[0].custom_name = Some("after restart".into());
         writer.save(&changed, None);

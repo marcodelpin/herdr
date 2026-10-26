@@ -168,6 +168,11 @@ jobs:
         shell: bash
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
+      - name: Prefetch Zig packages (fetch retried; never a build)
+        uses: ./.github/actions/zig-fetch-retry
+        with:
+          rust-target: ${{ matrix.target }}
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 

@@ -12,6 +12,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 ];
 
 mod agent_resume;
+mod agent_session_registry;
 mod agent_view_eval;
 mod api;
 mod app;
@@ -337,8 +338,18 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # agent_panel_sort = "spaces"
 
 # Agent status indicators: "dots" preserves the compact color marks; "symbols" uses
-# distinct static glyphs for blocked, working, done, idle, and unknown states.
+# distinct glyphs for blocked, working, done, idle, and unknown states.
 # status_indicators = "dots"
+
+# Animate the working state icon as a spinner (braille frames for "dots", rotating
+# quarter circles for "symbols"). The waiting hourglass below turns over once a
+# second while this is on; every other state stays static. Set false for static icons.
+# animate_working = true
+
+# Show an hourglass instead of the idle icon while an idle or done pane reports the
+# "wait" metadata token, and a bold red one while it reports "stale". Set false to
+# keep the idle icon and read those tokens as text only.
+# waiting_indicator = true
 
 # Accent color for highlights, borders, and navigation UI.
 # Accepts: hex (#89b4fa), named colors (cyan, blue, magenta), or rgb(r,g,b)
@@ -400,6 +411,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+
+# Per-agent launcher override for native agent session restore, keyed by agent
+# id (for example "claude"). The value is typed verbatim as a command prefix,
+# written in the pane's own shell syntax, followed by a space and the stock
+# resume arguments, so a restored pane runs through an account or flag
+# wrapper instead of the bare agent binary. Missing, empty, or containing a
+# control character means no override. A bash launcher:
+# [session.agent_launchers]
+# claude = "cas"
+# or, for a pane whose shell is PowerShell:
+# claude = "& 'C:\\Agent Tools\\cas.ps1'"
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

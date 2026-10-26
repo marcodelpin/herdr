@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use interprocess::local_socket::traits::Stream as _;
 
-use super::EndpointTransport;
+use super::{EndpointTransport, TransmitReceipt};
 use crate::ipc::LocalStream;
 use crate::protocol::ClientMessage;
 
@@ -17,8 +17,15 @@ const IO_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
 struct FrameBatch {
-    frames: Vec<Vec<u8>>,
+    frames: Vec<QueuedFrame>,
     bytes: usize,
+}
+
+struct QueuedFrame {
+    bytes: Vec<u8>,
+    /// `receipt`, when the caller asked for one, is resolved with the instant the peer accepted
+    /// the frame's last byte.
+    receipt: Option<TransmitReceipt>,
 }
 
 enum WriterCommand {
@@ -85,22 +92,22 @@ impl NativeEndpointTransport {
         })
     }
 
-    fn enqueue_frame(&mut self, frame: Vec<u8>) -> io::Result<()> {
+    fn enqueue_frame(&mut self, frame: QueuedFrame) -> io::Result<()> {
         if let Some(batch) = &self.pending_batch {
             let mut batch = batch
                 .lock()
                 .map_err(|_| io::Error::other("endpoint batch lock poisoned"))?;
             // An empty batch has already been claimed by the worker. Never append to it.
             if !batch.frames.is_empty()
-                && frame.len() <= MAX_BATCH_BYTES.saturating_sub(batch.bytes)
+                && frame.bytes.len() <= MAX_BATCH_BYTES.saturating_sub(batch.bytes)
             {
-                batch.bytes += frame.len();
+                batch.bytes += frame.bytes.len();
                 batch.frames.push(frame);
                 return Ok(());
             }
         }
         let batch = Arc::new(Mutex::new(FrameBatch {
-            bytes: frame.len(),
+            bytes: frame.bytes.len(),
             frames: vec![frame],
         }));
         self.sender
@@ -118,10 +125,12 @@ impl NativeEndpointTransport {
     pub(crate) fn stop_handle(&self) -> Arc<AtomicBool> {
         self.stopped.clone()
     }
-}
 
-impl EndpointTransport for NativeEndpointTransport {
-    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+    fn enqueue(
+        &mut self,
+        message: &ClientMessage,
+        receipt: Option<TransmitReceipt>,
+    ) -> io::Result<()> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -143,9 +152,31 @@ impl EndpointTransport for NativeEndpointTransport {
         {
             return Err(queue_full());
         }
-        self.enqueue_frame(frame).inspect_err(|_| {
+        self.enqueue_frame(QueuedFrame {
+            bytes: frame,
+            receipt,
+        })
+        .inspect_err(|_| {
             self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
         })
+    }
+}
+
+impl EndpointTransport for NativeEndpointTransport {
+    fn send(&mut self, message: &ClientMessage) -> io::Result<()> {
+        self.enqueue(message, None)
+    }
+
+    fn send_tracked(
+        &mut self,
+        message: &ClientMessage,
+        _sent_at: Instant,
+    ) -> io::Result<TransmitReceipt> {
+        // The worker owns the wire, so the frame is only queued here; the receipt carries the
+        // instant it is actually written.
+        let receipt = TransmitReceipt::pending();
+        self.enqueue(message, Some(receipt.clone()))?;
+        Ok(receipt)
     }
 
     fn disconnect(&mut self) {
@@ -207,9 +238,16 @@ fn write_batch(
         if stopped.load(Ordering::Acquire) {
             break;
         }
-        let result = write_frame(writer, &frame, stopped);
-        queued_bytes.fetch_sub(frame.len(), Ordering::AcqRel);
+        let result = write_frame(writer, &frame.bytes, stopped);
+        queued_bytes.fetch_sub(frame.bytes.len(), Ordering::AcqRel);
         result?;
+        // write_frame also returns Ok when a stop cancelled it mid-frame, which leaves the rest
+        // of the frame unwritten: only an uncancelled write has reached the peer.
+        if let Some(receipt) = frame.receipt {
+            if !stopped.load(Ordering::Acquire) {
+                receipt.complete(Instant::now());
+            }
+        }
     }
     Ok(())
 }
@@ -272,6 +310,138 @@ mod tests {
         let accepting = std::thread::spawn(move || listener.accept().unwrap());
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         (client, accepting.join().unwrap(), path)
+    }
+
+    #[test]
+    fn a_tracked_frame_resolves_only_once_the_peer_has_taken_all_of_it() {
+        // bd herdr-7ak: the health probe timer runs from the instant the writer accepted the
+        // ping's last byte. A frame no peer is reading is larger than any socket or pipe buffer
+        // here, so its receipt must stay pending until the peer drains it.
+        let (stream, mut peer, path) = streams();
+        // The peer polls: a blocking read would never return to the deadline checks below if
+        // the writer stalled before its first byte while keeping the connection open.
+        crate::ipc::set_local_stream_polling(&mut peer, true).unwrap();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        // Larger than any buffer between the two ends (a Unix socket takes about 208 KiB
+        // unread; a Windows pipe takes 512 bytes at a time), small enough that draining it one
+        // piece per poll stays well inside the deadline below on a Windows runner, where a short
+        // sleep rounds up to about 16 ms.
+        let paste = ClientMessage::Input {
+            data: vec![b'p'; 512 * 1024],
+        };
+        let mut expected = Vec::new();
+        crate::protocol::write_message(&mut expected, &paste).unwrap();
+        let expected_len = expected.len();
+        let queued_at = Instant::now();
+        let receipt = transport.send_tracked(&paste, queued_at).unwrap();
+        // bd herdr-pkp: wait for evidence that the worker has started writing (the peer sees the
+        // first bytes) instead of sleeping and hoping it was scheduled. One piece is taken here
+        // and counted below; the rest of the frame is far larger than what the peer then leaves
+        // buffered, so the writer is still blocked mid-frame.
+        let mut bytes = Vec::new();
+        let started = Instant::now() + Duration::from_secs(30);
+        while bytes.is_empty() {
+            assert!(
+                Instant::now() < started,
+                "the writer never put a byte of the frame on the wire"
+            );
+            let mut first = [0_u8; 1024];
+            match crate::ipc::poll_local_stream_read_count(&mut peer, &mut first).unwrap() {
+                crate::ipc::LocalStreamReadCount::Data(count) => {
+                    bytes.extend_from_slice(&first[..count]);
+                }
+                crate::ipc::LocalStreamReadCount::Pending => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                crate::ipc::LocalStreamReadCount::Closed => {
+                    panic!("the peer saw the stream close before any byte of the frame")
+                }
+            }
+        }
+        assert!(
+            receipt.transmitted_at().is_none(),
+            "a frame no peer has read reported itself transmitted"
+        );
+        // A worker that stamps the receipt when it dequeues the frame, before write_frame ever
+        // blocks on the peer, would still satisfy `>= queued_at` below: that instant is only
+        // milliseconds after `queued_at`. Anchor on the end of the deliberately blocked phase
+        // instead, so a pre-write timestamp fails this assertion.
+        let blocked_phase_end = Instant::now();
+
+        let (done, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut buffer = [0_u8; 16 * 1024];
+            while bytes.len() < expected_len && Instant::now() < deadline {
+                match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
+                    crate::ipc::LocalStreamReadCount::Data(count) => {
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    crate::ipc::LocalStreamReadCount::Pending => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    crate::ipc::LocalStreamReadCount::Closed => break,
+                }
+            }
+            done.send(bytes.len()).unwrap();
+        });
+        let read = received.recv_timeout(Duration::from_secs(150)).unwrap();
+        reader.join().unwrap();
+        assert_eq!(read, expected_len);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while receipt.transmitted_at().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let transmitted = receipt
+            .transmitted_at()
+            .expect("the writer accepted every byte, so the receipt must report an instant");
+        assert!(transmitted >= queued_at);
+        assert!(
+            transmitted >= blocked_phase_end,
+            "receipt reported an instant from before the peer drained the frame, \
+             not the instant the writer accepted its last byte"
+        );
+        drop(transport);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_stalled_frame_never_reports_itself_transmitted() {
+        // The stall timeout from herdr-8qd still cuts a frame that stops moving, and the health
+        // probe queued behind it must never read as sent: the receipt stays pending and the
+        // writer surfaces its own timeout.
+        let (stream, peer, path) = streams();
+        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
+        let receipt = transport
+            .send_tracked(
+                &ClientMessage::Input {
+                    data: vec![b's'; 512 * 1024],
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + WRITE_TIMEOUT + Duration::from_secs(15);
+        let mut failure = None;
+        while failure.is_none() && Instant::now() < deadline {
+            failure = transport.take_error();
+            if failure.is_none() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        assert_eq!(
+            failure
+                .expect("a peer that never reads must trip the writer stall timeout")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(
+            receipt.transmitted_at().is_none(),
+            "a frame the peer never took reported itself transmitted"
+        );
+        drop(transport);
+        drop(peer);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

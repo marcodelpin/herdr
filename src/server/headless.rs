@@ -64,8 +64,9 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
-    apply_terminal_attach_scroll, terminal_attach_mouse_position,
+    apply_client_pane_input_events, apply_client_popup_input_events,
+    apply_client_terminal_input_events, apply_terminal_attach_input, apply_terminal_attach_scroll,
+    terminal_attach_mouse_position,
 };
 use crate::server::shutdown::{ServerStop, ShutdownReason};
 use crate::server::socket_paths::{
@@ -81,6 +82,7 @@ mod native_graphics;
 mod notifications;
 mod render;
 mod retained_surface;
+mod startup_stop;
 mod surface_interest;
 
 // Producers can refill even a bounded channel while it is being drained.
@@ -92,6 +94,7 @@ pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
 #[cfg(unix)]
 use lifecycle::wait_for_old_public_sockets_to_close;
+pub(crate) use startup_stop::StartupStop;
 
 use crate::protocol::MAX_GRAPHICS_FRAME_SIZE;
 
@@ -165,6 +168,10 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+// Split shell redraws need several early updates; sustained output still coalesces.
+const INTERACTIVE_RENDER_BUDGET: u8 = 16;
+const INTERACTIVE_RENDER_WINDOW: Duration = Duration::from_millis(32);
+
 // ---------------------------------------------------------------------------
 // Headless server
 // ---------------------------------------------------------------------------
@@ -197,6 +204,8 @@ pub struct HeadlessServer {
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
     native_graphics: native_graphics::NativeGraphics,
+    interactive_input_deadlines: HashMap<crate::layout::PaneId, Instant>,
+    interactive_render_budget: Option<(Instant, u8)>,
     #[cfg(unix)]
     next_client_id: u64,
     /// The client currently driving session-wide host presentation and side effects.
@@ -245,6 +254,8 @@ pub struct HeadlessServer {
     should_quit: Arc<AtomicBool>,
     server_stop: ServerStop,
     host_shutdown_requested: Arc<AtomicBool>,
+    /// An announced, still cancellable host shutdown; carried across live handoff.
+    host_shutdown_intent: crate::platform::HostShutdownIntentCell,
     #[cfg(test)]
     host_shutdown_probe: fn() -> bool,
     /// Channel for receiving server events from client connection threads.
@@ -301,27 +312,45 @@ fn spawn_windows_client_accept_thread(
     })
 }
 
-impl HeadlessServer {
-    /// Creates and starts the headless server.
-    ///
-    /// This:
-    /// 1. Prepares the client socket path (cleans up stale sockets)
-    /// 2. Binds the client socket listener
-    /// 3. Returns the server ready to run
-    pub fn new(
-        app: app::App,
-        config_diagnostics: &[String],
-        api_tx: Option<api::ApiRequestSender>,
-        api_server: Option<api::ServerHandle>,
-        server_stop: ServerStop,
-    ) -> io::Result<Self> {
-        let should_quit = server_stop.flag().clone();
+/// Routes SIGINT and SIGTERM (a console control event on Windows) to
+/// `server_stop` and `startup_stop` from now on, once per process. Call it
+/// inside the server's Tokio runtime, after `startup_stop` started its
+/// thread and before anything of startup can accept a connection: until the
+/// event loop runs, `startup_stop` acts on the signal (herdr-ir4j, ADR-0014).
+/// If the handler cannot be installed the default disposition stays, and a
+/// signal ends the process as it did before.
+pub(crate) fn install_server_signal_handling(server_stop: &ServerStop, startup_stop: &StartupStop) {
+    let server_stop = server_stop.clone();
+    let startup_stop = startup_stop.clone();
+    crate::platform::spawn_server_signal_monitor(move |signal| {
+        server_stop.request(ShutdownReason::Signal(signal));
+        startup_stop.signalled();
+    });
+}
+
+/// The client protocol socket, bound and listening, with the channel its
+/// connections report on. Bound apart from the server so that a failure here
+/// leaves the App with the caller, which must drain the API server before it
+/// destroys the App (herdr-ir4j, ADR-0014 rule 3).
+pub(crate) struct ClientSocket {
+    #[cfg(unix)]
+    listener: LocalListener,
+    path: PathBuf,
+    identity: SocketFileIdentity,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+    server_event_rx: mpsc::Receiver<ServerEvent>,
+}
+
+impl ClientSocket {
+    /// Prepares the client socket path (cleans up stale sockets) and binds
+    /// the listener.
+    pub(crate) fn bind(server_stop: &ServerStop) -> io::Result<Self> {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
         let listener = bind_local_listener(&client_path)?;
         restrict_socket_permissions(&client_path)?;
-        let client_socket_identity = socket_file_identity(&client_path)?;
+        let identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
 
         // Set non-blocking on Unix so we can poll it from the event loop.
@@ -331,7 +360,44 @@ impl HeadlessServer {
         // Channel for server events from client threads.
         let (server_event_tx, server_event_rx) = mpsc::channel(64);
         #[cfg(windows)]
-        spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone())?;
+        spawn_windows_client_accept_thread(
+            listener,
+            server_stop.flag().clone(),
+            server_event_tx.clone(),
+        )?;
+        #[cfg(not(windows))]
+        let _ = server_stop;
+        Ok(Self {
+            #[cfg(unix)]
+            listener,
+            path: client_path,
+            identity,
+            server_event_tx,
+            server_event_rx,
+        })
+    }
+}
+
+impl HeadlessServer {
+    /// Creates the headless server on a client socket already bound, ready to
+    /// run.
+    pub(crate) fn new(
+        app: app::App,
+        config_diagnostics: &[String],
+        api_tx: Option<api::ApiRequestSender>,
+        api_server: Option<api::ServerHandle>,
+        server_stop: ServerStop,
+        client_socket: ClientSocket,
+    ) -> Self {
+        let should_quit = server_stop.flag().clone();
+        let ClientSocket {
+            #[cfg(unix)]
+            listener,
+            path: client_path,
+            identity: client_socket_identity,
+            server_event_tx,
+            server_event_rx,
+        } = client_socket;
 
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
@@ -339,7 +405,7 @@ impl HeadlessServer {
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
         let _ = api_tx;
-        Ok(Self {
+        Self {
             app,
             #[cfg(unix)]
             api_tx,
@@ -350,6 +416,8 @@ impl HeadlessServer {
             client_socket_identity,
             clients: HashMap::new(),
             native_graphics: Default::default(),
+            interactive_input_deadlines: HashMap::new(),
+            interactive_render_budget: None,
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
@@ -376,6 +444,7 @@ impl HeadlessServer {
             effective_size: headless_size,
             shutting_down: false,
             host_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            host_shutdown_intent: Default::default(),
             #[cfg(test)]
             host_shutdown_probe: crate::platform::host_shutdown_in_progress,
             handoff_in_progress: false,
@@ -385,7 +454,7 @@ impl HeadlessServer {
             server_stop,
             server_event_rx,
             server_event_tx,
-        })
+        }
     }
 
     /// Runs the headless server event loop until shutdown.
@@ -400,15 +469,13 @@ impl HeadlessServer {
     pub async fn run(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
-        let server_stop = self.server_stop.clone();
-        let quit_notify = self.server_event_tx.clone();
-        crate::platform::spawn_server_signal_monitor(move |signal| {
-            server_stop.request(ShutdownReason::Signal(signal));
-            let _ = quit_notify.try_send(ServerEvent::QuitSignal);
-        });
+        // Stop signals are routed here by bootstrap, which installed their
+        // handler at process start and hands the stop over to this loop
+        // before calling it (ADR-0014).
         let quit_notify = self.server_event_tx.clone();
         let _host_shutdown = crate::platform::HostShutdownMonitor::start(
             self.host_shutdown_requested.clone(),
+            self.host_shutdown_intent.clone(),
             move || {
                 let _ = quit_notify.try_send(ServerEvent::QuitSignal);
             },
@@ -531,14 +598,13 @@ impl HeadlessServer {
             // bounded classification cadence without delaying presentation work
             // that joins the same coalesced request.
             let render_cadence_due = self.app.can_render_now(now);
-            if needs_render
-                && (render_cadence_due
-                    || (self.app.can_present_now(now)
-                        && self.has_pending_presentation_work(
-                            needs_full_render,
-                            needs_graphics_render,
-                        )))
-            {
+            let presentation_due = self.app.can_present_now(now)
+                && self.has_pending_presentation_work(needs_full_render, needs_graphics_render);
+            let interactive_due = needs_render
+                && !render_cadence_due
+                && !presentation_due
+                && self.can_render_interactive(now);
+            if needs_render && (render_cadence_due || presentation_due || interactive_due) {
                 crate::render_prof::event("render.attempt");
                 let render_request = self.app.render_dirty.take();
                 let pty_dirty = !render_request.pty_sources.is_empty();
@@ -585,6 +651,9 @@ impl HeadlessServer {
                     self.render_and_stream();
                 }
                 self.app.record_render_attempt(now, !hidden_only);
+                if interactive_due {
+                    self.record_interactive_render(now);
+                }
                 needs_render = false;
                 needs_full_render = false;
                 needs_graphics_render = false;
@@ -681,6 +750,16 @@ impl HeadlessServer {
         // Save session on exit.
         if self.app.policy.persist_session {
             self.app.save_session_on_shutdown();
+        }
+        // A live handoff's session that no write has reached the disk with
+        // exists nowhere else: never a success (ADR-0014 invariant I6).
+        if self.app.transferred_session_unsaved() {
+            tracing::error!(
+                "server stopped and the transferred session was not written; exiting with an error, the handed-over session is lost"
+            );
+            return Err(io::Error::other(
+                "the session transferred by the live handoff was not written",
+            ));
         }
 
         info!("headless server exiting");
@@ -2424,10 +2503,21 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_pane_input_events(runtime, &events) {
+                let mut keyboard_forwarded = false;
+                let input_result = apply_client_terminal_input_events(
+                    runtime,
+                    &events,
+                    true,
+                    &mut keyboard_forwarded,
+                );
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if keyboard_forwarded {
+                    self.note_interactive_input(runtime_pane_id, Instant::now());
+                }
+                if let Err(err) = input_result {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,
@@ -2446,12 +2536,12 @@ impl HeadlessServer {
                     client.pixel_mouse && client.host_sgr_pixels_active == Some(true)
                 });
                 let mut events = events;
-                let Some(popup_terminal_id) = self
+                let Some((popup_terminal_id, popup_pane_id)) = self
                     .app
                     .state
                     .popup_pane
                     .as_ref()
-                    .map(|popup| popup.terminal_id.clone())
+                    .map(|popup| (popup.terminal_id.clone(), popup.pane_id))
                 else {
                     return false;
                 };
@@ -2502,10 +2592,21 @@ impl HeadlessServer {
                     return foreground_changed | geometry_changed;
                 };
                 let scroll_before = runtime.scroll_metrics();
-                if let Err(err) = apply_client_popup_input_events(runtime, &events) {
+                let mut keyboard_forwarded = false;
+                let input_result = apply_client_terminal_input_events(
+                    runtime,
+                    &events,
+                    false,
+                    &mut keyboard_forwarded,
+                );
+                let scroll_changed = runtime.scroll_metrics() != scroll_before;
+                if keyboard_forwarded {
+                    self.note_interactive_input(popup_pane_id, Instant::now());
+                }
+                if let Err(err) = input_result {
                     warn!(client_id, terminal_id, err = %err, "targeted client popup input failed");
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                foreground_changed | geometry_changed || scroll_changed
             }
             ServerEvent::ClientShellEndpointRequestError {
                 client_id,

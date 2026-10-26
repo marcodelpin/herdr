@@ -1,4 +1,5 @@
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Parse raw terminal input bytes into a list of `RawInputEvent`s.
@@ -38,7 +39,6 @@ use crate::terminal_theme::{
 };
 
 const ESC: u8 = 0x1b;
-#[cfg(any(unix, test))]
 pub(crate) const RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS: i32 = 10;
 #[cfg(any(unix, test))]
 pub(crate) const MOUSE_ACTIVE_ESCAPE_SEQUENCE_FLUSH_TIMEOUT_MS: i32 = 150;
@@ -50,7 +50,6 @@ pub(crate) const MOUSE_ACTIVE_CSI_INTRODUCER_FLUSH_TIMEOUT_MS: i32 = 50;
 const DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS: i32 = 500;
 /// Bytes already inside a sequence cannot be a key, so wait long enough for a
 /// split read over a slow link before giving up on them.
-#[cfg(any(unix, test))]
 pub(crate) const INCOMPLETE_SEQUENCE_FLUSH_TIMEOUT_MS: i32 = 500;
 pub(crate) const GHOSTTY_COLOR_SCHEME_DARK_REPORT: &[u8] = b"\x1b[?997;1n";
 pub(crate) const GHOSTTY_COLOR_SCHEME_LIGHT_REPORT: &[u8] = b"\x1b[?997;2n";
@@ -100,74 +99,130 @@ pub enum RawInputEvent {
     Unsupported,
 }
 
-/// Byte framer plus event decoding, for the Windows input pump.
+/// Byte framer plus event decoding, for the Windows input pump. Its byte
+/// framer runs the pump policy (ADR-0013 D2, D4).
 #[cfg(any(windows, test))]
-#[derive(Default)]
 pub(crate) struct RawInputFramer {
     byte_framer: RawInputByteFramer,
+    /// Bytes the byte framer released as chunks, for the property test's
+    /// I5 check on the production pump (ADR-0013 D2).
+    #[cfg(test)]
+    released: usize,
+}
+
+#[cfg(any(windows, test))]
+impl Default for RawInputFramer {
+    fn default() -> Self {
+        Self::with_byte_framer(RawInputByteFramer::default())
+    }
 }
 
 #[cfg(any(windows, test))]
 impl RawInputFramer {
     pub(crate) fn for_host_input() -> Self {
+        Self::with_byte_framer(RawInputByteFramer::for_host_input())
+    }
+
+    fn with_byte_framer(mut byte_framer: RawInputByteFramer) -> Self {
+        byte_framer.set_pump_policy();
         Self {
-            byte_framer: RawInputByteFramer::for_host_input(),
+            byte_framer,
+            #[cfg(test)]
+            released: 0,
         }
     }
 
-    #[cfg(windows)]
+    fn events(&mut self, chunks: Vec<Vec<u8>>) -> Vec<RawInputEvent> {
+        #[cfg(test)]
+        {
+            self.released += chunks.iter().map(Vec::len).sum::<usize>();
+        }
+        events_from_framed_chunks(chunks)
+    }
+
+    /// Moves this framer's clock `by` into the future, as the pump's console
+    /// wait does between idle ticks (test translator only).
+    #[cfg(test)]
+    pub(crate) fn advance_test_clock(&mut self, by: Duration) {
+        self.byte_framer.test_clock_skew += by;
+    }
+
+    /// One pump idle tick: the console wait passed with no record, then the
+    /// pump flushes (ADR-0013 D2).
+    #[cfg(test)]
+    pub(crate) fn idle_tick(&mut self) -> Vec<RawInputEvent> {
+        self.advance_test_clock(PUMP_IDLE_QUIET);
+        self.flush_timeout()
+    }
+
+    #[cfg(any(windows, test))]
     pub(crate) fn host_default_color_query_sent(&mut self, escape_grace: Duration) {
         self.byte_framer.host_default_color_query_sent(escape_grace);
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<RawInputEvent> {
-        events_from_framed_chunks(self.byte_framer.push(data))
+        let chunks = self.byte_framer.push(data);
+        self.events(chunks)
     }
 
-    #[cfg(windows)]
+    /// Pushes one key record the pump staged for an X10 frame, as one
+    /// record whatever its repeat count (ADR-0013 amendment 2, D4).
+    pub(crate) fn push_staged_record(&mut self, data: &[u8]) -> Vec<RawInputEvent> {
+        let chunks = self.byte_framer.push_staged_record(data);
+        self.events(chunks)
+    }
+
+    /// The pump's X10 candidate ended: it accepted the report or replayed
+    /// its staged records.
+    pub(crate) fn end_staged_records(&mut self) {
+        self.byte_framer.end_staged_records();
+    }
+
+    #[cfg(any(windows, test))]
     pub(crate) fn holds_host_default_color_escape(&self) -> bool {
         self.byte_framer.buffer.as_slice() == [ESC]
             && self.byte_framer.host_color_replies_awaited > 0
             && self
                 .byte_framer
                 .host_default_color_query_deadline
-                .is_some_and(|deadline| Instant::now() < deadline)
-    }
-
-    #[cfg(all(test, not(windows)))]
-    pub(crate) fn holds_host_default_color_escape(&self) -> bool {
-        false
+                .is_some_and(|deadline| self.byte_framer.now() < deadline)
     }
 
     pub(crate) fn has_pending_bracketed_paste(&self) -> bool {
         self.byte_framer.has_pending_bracketed_paste()
     }
 
+    /// An X10 mouse report is in progress: `ESC [ M` and fewer than three
+    /// report bytes are pending, or the context of a released `ESC` / `ESC [`
+    /// holds the rest of one (ADR-0013 D4). The framer's context answers,
+    /// not the buffer's shape alone.
     pub(crate) fn has_pending_default_mouse_sequence(&self) -> bool {
         starts_with_incomplete_default_mouse_sequence(&self.byte_framer.buffer)
+            || self.byte_framer.holds_x10_tail()
     }
 
     pub(crate) fn flush_timeout(&mut self) -> Vec<RawInputEvent> {
-        events_from_framed_chunks(self.byte_framer.flush_timeout())
+        let chunks = self.byte_framer.flush_timeout();
+        self.events(chunks)
     }
 
     pub(crate) fn flush_keyboard_escape(&mut self) -> Vec<RawInputEvent> {
         if self.byte_framer.buffer.as_slice() == [ESC] {
-            self.byte_framer.lone_escape_recently_flushed = true;
-            events_from_framed_chunks(vec![std::mem::take(&mut self.byte_framer.buffer)])
+            let escape = std::mem::take(&mut self.byte_framer.buffer);
+            self.byte_framer
+                .open_tail_hold(HoldAfter::Escape { color_reply: false });
+            self.events(vec![escape])
         } else {
             self.flush_timeout()
         }
     }
 
-    /// Semantic input ends mouse recovery, unlike another idle interval.
+    /// Semantic input ends every report and key hold, unlike another idle
+    /// interval: what was held is input and goes first. A host reply prefix
+    /// inside its reply window stays (ADR-0013 D1).
     pub(crate) fn flush_interrupted(&mut self) -> Vec<RawInputEvent> {
-        #[cfg(windows)]
-        self.byte_framer.flush_lone_escape_on_interruption();
-        let mut chunks = self.byte_framer.flush_timeout();
-        self.byte_framer.timed_out_mouse_prefix = None;
-        chunks.extend(self.byte_framer.drain_available_chunks());
-        events_from_framed_chunks(chunks)
+        let chunks = self.byte_framer.flush_interrupted();
+        self.events(chunks)
     }
 }
 
@@ -198,20 +253,41 @@ fn events_from_framed_chunks(chunks: Vec<Vec<u8>>) -> Vec<RawInputEvent> {
 
 #[derive(Default)]
 pub(crate) struct RawInputByteFramer {
+    /// Every byte neither emitted nor dropped yet, and only those (ADR-0010).
+    /// They are always the last `buffer.len()` bytes pushed (ADR-0012).
     buffer: Vec<u8>,
+    /// Bytes pushed so far.
+    pushed: u64,
+    /// When each read arrived: (end offset in the pushed stream, time), for
+    /// the reads that may still have bytes in `buffer`.
+    arrivals: VecDeque<(u64, Instant)>,
     discard_until: Option<ControlStringFamily>,
     discarded_tail_bytes: usize,
-    // Keep the discarded prefix separate from continuation bytes awaiting validation.
-    timed_out_mouse_prefix: Option<Vec<u8>>,
-    lone_escape_recently_flushed: bool,
+    /// The one context over `buffer`: what was disposed of before it, so
+    /// what the bytes after it may still complete.
+    tail_hold: Option<TailHold>,
+    #[cfg(test)]
+    test_clock: Option<Instant>,
+    /// Added to the clock, fixed or real (test translator idle ticks).
+    #[cfg(test)]
+    test_clock_skew: Duration,
+    /// The Windows pump drives this framer (ADR-0013 D2, D4).
+    #[cfg(any(windows, test))]
+    pump_policy: bool,
+    /// The key records the pump staged for an X10 frame and will replay if
+    /// the frame is no report: (start, end) offsets in the pushed stream,
+    /// each one record with every repeat. Their bytes leave the framer only
+    /// inside a mouse report, never typed (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    staged_records: VecDeque<(u64, u64)>,
     host_color_replies_awaited: u16,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_default_color_query_issued: bool,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_default_color_query_deadline: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_color_tail_deadline: Option<Instant>,
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     host_color_tail_split_st: bool,
     host_cell_size_replies_awaited: u16,
     host_appearance_reply_awaited: bool,
@@ -226,8 +302,358 @@ pub(crate) struct RawInputByteFramer {
     split_coalesced_escape: bool,
     #[cfg(unix)]
     host_escape_disambiguation_active: bool,
+}
+
+/// Bytes disposed of just before `buffer` without their tail, or (Unix) a
+/// prefix still in `buffer` that waits for one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HoldAfter {
+    /// A lone ESC was released as Escape. `[...` after it can be the rest of
+    /// a mouse report or a CSI key (herdr-nxa8); with a colour query
+    /// outstanding, `]10;` / `]11;` / `]4;` through BEL or ST is the rest of
+    /// that reply.
+    Escape { color_reply: bool },
+    /// `ESC [` was released as Alt+[; what follows can be the rest of a mouse
+    /// report (#5251) or a CSI key (herdr-nxa8).
+    CsiIntroducer,
+    /// An incomplete `ESC [ <` report or `ESC [` key sequence was dropped at
+    /// its idle timeout.
+    DroppedPrefix(Vec<u8>),
+    /// An incomplete OSC string was dropped at its idle timeout; colour reply
+    /// payload through BEL or ST is its tail. `split_st` when the dropped
+    /// bytes ended in the ESC of an ST, so a lone `\` completes it. `header`
+    /// is what was dropped (at most the report budget), so an interruption
+    /// can tell a colour reply from text (ADR-0013 D1).
+    OscHeader { split_st: bool, header: Vec<u8> },
+    /// A confirmed host sends Escape as `CSI 27u`, so the `ESC` / `ESC [` the
+    /// first `len` buffered bytes hold may still get a delayed mouse tail (#3480).
     #[cfg(unix)]
-    awaiting_mouse_tail_after: Option<usize>,
+    DisambiguatedPrefix { len: usize },
+}
+
+#[derive(Debug)]
+struct TailHold {
+    after: HoldAfter,
+    /// When the context opened. Its deadline is derived, never stored: see
+    /// `tail_hold_deadline`.
+    opened_at: Instant,
+    /// A semantic key came while it held a colour reply's tail: from then on
+    /// its reply-shaped bytes complete the reply or are dropped, never typed
+    /// after that key (ADR-0013 D1, I4').
+    interrupted: bool,
+}
+
+/// How a release treats bytes that could still wait (ADR-0013 D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    /// A reader waited idle: bytes may stay held, each within its named bound.
+    Idle,
+    /// The pump says it is idle; that is not evidence the newest byte is
+    /// quiet. As `Idle`, but a lossy disposal waits until the newest
+    /// pending byte is `PUMP_IDLE_QUIET` old (ADR-0013 D2).
+    PumpIdle,
+    /// Semantic input: report and key holds end. A host reply prefix inside
+    /// its reply window is not input and stays.
+    Interrupt,
+    /// A byte past its last bound: nothing stays held.
+    Backstop,
+}
+
+impl Release {
+    fn idle(self) -> bool {
+        matches!(self, Release::Idle | Release::PumpIdle)
+    }
+
+    fn interrupt(self) -> bool {
+        !self.idle()
+    }
+}
+
+/// What the bytes in `buffer` are, given what was disposed of before them.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// They cannot complete it: frame them as ordinary input.
+    Emit,
+    /// The first `n` complete the disposed report: drop them.
+    Drop(usize),
+    /// The first `n` complete a reply (or, on the pump, an X10 report) whose
+    /// prefix was released: put the prefix back so the whole parses as one.
+    Rejoin(usize),
+    /// The ESC dropped as the possible start of an ST is not one: the first
+    /// byte disproved the ST, so put the ESC back to start the next token.
+    Restore,
+    /// They can still complete it: wait, until the deadline.
+    Hold,
+}
+
+impl HoldAfter {
+    /// How many leading bytes of `tail` still spell a colour reply after
+    /// what this context dropped or released (0 for key and report contexts).
+    /// An ESC counts as the start of the reply's ST only while the byte after
+    /// it can still be `\`: a byte that disproves the ST leaves the ESC to
+    /// start the next token, unless that byte is a new ESC, which brings its
+    /// own (ADR-0013 amendment 1, D1).
+    fn reply_shaped_len(&self, tail: &[u8]) -> usize {
+        let before: &[u8] = match self {
+            HoldAfter::OscHeader { header, .. } => header,
+            HoldAfter::Escape { color_reply: true } => &[ESC],
+            _ => return 0,
+        };
+        let mut reply = before.to_vec();
+        let mut len = 0;
+        for byte in tail.iter().take(MAX_DISCARDED_CONTROL_TAIL_BYTES) {
+            reply.push(*byte);
+            if !is_color_reply_shape_prefix(&reply) {
+                break;
+            }
+            len += 1;
+        }
+        if len > 0
+            && tail[len - 1] == ESC
+            && tail
+                .get(len)
+                .is_some_and(|next| !matches!(*next, b'\\' | ESC))
+        {
+            len -= 1;
+        }
+        len
+    }
+
+    /// How many leading bytes of `tail` to drop as the unfinished rest of a
+    /// colour reply when this context ends: the reply-shaped part after an
+    /// interruption, since what was held cannot be typed after the record;
+    /// otherwise only once what was dropped before it and that part spell the
+    /// reply through its `rgb:` marker, which typing does not (ADR-0013
+    /// amendment 1, D1).
+    fn reply_tail_len(&self, tail: &[u8], interrupted: bool) -> usize {
+        let len = self.reply_shaped_len(tail);
+        if interrupted || len == 0 {
+            return len;
+        }
+        let before: &[u8] = match self {
+            HoldAfter::OscHeader { header, .. } => header,
+            _ => &[ESC],
+        };
+        let reply = [before, &tail[..len]].concat();
+        if reply.windows(4).any(|window| window == b"rgb:") {
+            len
+        } else {
+            0
+        }
+    }
+
+    /// The bytes a released context sent to the pane as a key.
+    fn released_prefix(&self) -> &'static [u8] {
+        match self {
+            HoldAfter::CsiIntroducer => b"\x1b[",
+            _ => &[ESC],
+        }
+    }
+
+    /// The length of an incomplete X10 report tail `tail` starts with after
+    /// this released context (`[M..` after ESC, `M..` after `ESC [`).
+    fn incomplete_x10_tail_len(&self, tail: &[u8]) -> Option<usize> {
+        let marker: &[u8] = match self {
+            HoldAfter::Escape { .. } => b"[M",
+            HoldAfter::CsiIntroducer => b"M",
+            _ => return None,
+        };
+        let report = tail.strip_prefix(marker)?;
+        (report.len() < 3 && !report.iter().copied().any(disproves_x10_payload))
+            .then_some(tail.len())
+    }
+}
+
+/// Whether `byte` cannot be X10 payload: every report byte is 32 plus a
+/// value. NUL can be, as xterm sends it for a coordinate past its limit
+/// (ADR-0013 amendment 1, D4).
+fn disproves_x10_payload(byte: u8) -> bool {
+    matches!(byte, 0x01..=0x1f)
+}
+
+/// How much of an `ESC [ M` frame at the front of `buffer` to drop when a
+/// byte X10 payload cannot carry ends it before its six bytes: the frame
+/// before that byte. The byte is no part of the frame: a raw byte starts the
+/// next token, and the bytes of a key record the pump staged go with that
+/// record (`drop_staged_record_at_front`), whatever their class (ADR-0013
+/// amendment 2, D4).
+fn disproved_x10_frame_len(buffer: &[u8]) -> Option<usize> {
+    let payload = buffer.strip_prefix(b"\x1b[M")?;
+    let index = payload
+        .iter()
+        .take(3)
+        .position(|byte| disproves_x10_payload(*byte))?;
+    Some(3 + index)
+}
+
+impl HoldAfter {
+    fn limit(&self) -> Duration {
+        match self {
+            HoldAfter::Escape { color_reply: true } | HoldAfter::OscHeader { .. } => {
+                COLOR_REPLY_TAIL_LIMIT
+            }
+            HoldAfter::Escape { color_reply: false }
+            | HoldAfter::CsiIntroducer
+            | HoldAfter::DroppedPrefix(_) => REPORT_TAIL_LIMIT,
+            #[cfg(unix)]
+            HoldAfter::DisambiguatedPrefix { .. } => DISAMBIGUATED_MOUSE_TAIL_LIMIT,
+        }
+    }
+}
+
+/// Classifies the pending bytes `tail` against what was disposed of before
+/// them. `burst` says every pending byte arrived within `ORPHAN_TAIL_BURST`
+/// of the first; `pump` that the Windows pump drives the framer (ADR-0013
+/// D4). Pure: the deadline is checked by the caller first.
+fn classify_held_tail(after: &HoldAfter, tail: &[u8], burst: bool, pump: bool) -> Verdict {
+    match after {
+        HoldAfter::Escape { .. } if tail.first() == Some(&b'[') => {
+            classify_report_continuation(&[ESC], tail, true, burst, pump)
+        }
+        HoldAfter::Escape { color_reply: true } if tail.first() == Some(&b']') => {
+            match orphaned_color_reply_tail(tail) {
+                OrphanedColorReply::Prefix => Verdict::Hold,
+                OrphanedColorReply::Unrelated => Verdict::Emit,
+                OrphanedColorReply::Header(header) => {
+                    match classify_discarded_osc_tail(&tail[header..]) {
+                        DiscardedOscTail::Pending => Verdict::Hold,
+                        DiscardedOscTail::Terminated(len) => Verdict::Rejoin(header + len),
+                        DiscardedOscTail::Foreign => Verdict::Emit,
+                    }
+                }
+            }
+        }
+        HoldAfter::Escape { .. } => Verdict::Emit,
+        HoldAfter::CsiIntroducer => classify_report_continuation(b"\x1b[", tail, true, burst, pump),
+        HoldAfter::DroppedPrefix(prefix) => {
+            classify_report_continuation(prefix, tail, false, burst, pump)
+        }
+        HoldAfter::OscHeader { split_st: true, .. } if tail.first() == Some(&b'\\') => {
+            Verdict::Drop(1)
+        }
+        // Any other byte disproves the ST: the ESC dropped with the header
+        // starts the next token, unless that byte is a new ESC, which brings
+        // its own (ADR-0013 amendment 1, D1).
+        HoldAfter::OscHeader { split_st: true, .. } if tail.first() != Some(&ESC) => {
+            Verdict::Restore
+        }
+        HoldAfter::OscHeader { .. } => match classify_discarded_osc_tail(tail) {
+            DiscardedOscTail::Pending => Verdict::Hold,
+            DiscardedOscTail::Terminated(len) => Verdict::Drop(len),
+            DiscardedOscTail::Foreign => Verdict::Emit,
+        },
+        // Pushes end this hold before classification; see `push_extended`.
+        #[cfg(unix)]
+        HoldAfter::DisambiguatedPrefix { .. } => Verdict::Hold,
+    }
+}
+
+/// Classifies `tail` as the rest of a report or key whose `prefix` (`ESC`,
+/// `ESC [`, or more) was disposed of (ADR-0012 D3). `released` when that
+/// prefix reached the pane as a key: a key or X10 tail after it is dropped
+/// only when it arrived as one `burst`, since typing can spell one. An SGR
+/// mouse tail cannot be typed by accident and is dropped however it came.
+/// On the Windows `pump`, typed keys never reach the framer as bytes, so an
+/// X10 tail after a released prefix is the report at any spread: it is put
+/// back together, so the pump accepts the key records it staged for it
+/// (ADR-0013 D4).
+fn classify_report_continuation(
+    prefix: &[u8],
+    tail: &[u8],
+    released: bool,
+    burst: bool,
+    pump: bool,
+) -> Verdict {
+    let mut report = prefix.to_vec();
+    report.extend_from_slice(&tail[..tail.len().min(MAX_DISCARDED_CONTROL_TAIL_BYTES)]);
+    if report.len() < 3 {
+        return if b"\x1b[".starts_with(&report) {
+            Verdict::Hold
+        } else {
+            Verdict::Emit
+        };
+    }
+    if !report.starts_with(b"\x1b[") {
+        return Verdict::Emit;
+    }
+    let complete = |len: usize| {
+        if !released || burst {
+            Verdict::Drop(len - prefix.len())
+        } else {
+            Verdict::Emit
+        }
+    };
+    match report[2] {
+        b'<' => match classify_sgr_mouse_continuation(prefix, tail) {
+            SgrMouseContinuation::Incomplete => Verdict::Hold,
+            SgrMouseContinuation::Complete(len) => Verdict::Drop(len),
+            SgrMouseContinuation::Invalid => Verdict::Emit,
+        },
+        b'M' => {
+            const X10_LEN: usize = 6;
+            let payload = &report[3..report.len().min(X10_LEN)];
+            let disproved = payload.iter().position(|byte| disproves_x10_payload(*byte));
+            if released && pump {
+                // The frame is the report's or the key records the pump
+                // staged for it. A byte that disproves it ends the frame and
+                // is no part of it: a raw byte starts the next token, and a
+                // staged record's bytes are dropped by record, so the pump
+                // replays that record once and the framer never also types
+                // it (ADR-0013 amendment 2, D4).
+                if let Some(index) = disproved {
+                    return Verdict::Drop(3 + index - prefix.len());
+                }
+                return if report.len() < X10_LEN {
+                    Verdict::Hold
+                } else if parse_default_mouse(&report[..X10_LEN]).is_some() {
+                    Verdict::Rejoin(X10_LEN - prefix.len())
+                } else {
+                    Verdict::Drop(X10_LEN - prefix.len())
+                };
+            }
+            if disproved.is_some() {
+                Verdict::Emit
+            } else if report.len() < X10_LEN {
+                Verdict::Hold
+            } else if parse_default_mouse(&report[..X10_LEN]).is_some() {
+                complete(X10_LEN)
+            } else {
+                Verdict::Emit
+            }
+        }
+        _ => {
+            // CSI: parameter and intermediate bytes, then one final byte.
+            let Some(final_index) = report[2..]
+                .iter()
+                .position(|byte| !matches!(byte, 0x20..=0x3f))
+                .map(|index| index + 2)
+            else {
+                return if report.len() >= MAX_DISCARDED_CONTROL_TAIL_BYTES {
+                    Verdict::Emit
+                } else {
+                    Verdict::Hold
+                };
+            };
+            if !matches!(report[final_index], 0x40..=0x7e) {
+                return Verdict::Emit;
+            }
+            let len = final_index + 1;
+            let is_key = matches!(
+                extract_one_event(&report[..len]),
+                Some((
+                    RawInputEvent::Key(_)
+                        | RawInputEvent::OuterFocusGained
+                        | RawInputEvent::OuterFocusLost,
+                    consumed
+                )) if consumed == len
+            );
+            if is_key {
+                complete(len)
+            } else {
+                Verdict::Emit
+            }
+        }
+    }
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -242,7 +668,156 @@ const HOST_REPLY_QUIET_WINDOW: Duration = Duration::from_secs(1);
 const HOST_COLOR_REPLY_IDLE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(any(unix, test))]
 const HOST_CELL_SIZE_QUERY_REPLIES: u16 = 1;
-const MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES: usize = 32;
+/// Bound of a report tail hold (after a released ESC or `ESC [`, or a dropped
+/// `ESC [` prefix): the split-read wait for any incomplete sequence. It
+/// bounds how late the tail may start, and how long a held byte waits from
+/// its arrival.
+const REPORT_TAIL_LIMIT: Duration =
+    Duration::from_millis(INCOMPLETE_SEQUENCE_FLUSH_TIMEOUT_MS as u64);
+/// Bound of a colour reply tail hold (after an ESC released while a colour
+/// query was outstanding, or a dropped OSC header): the unfinished-reply limit.
+const COLOR_REPLY_TAIL_LIMIT: Duration = HOST_COLOR_REPLY_IDLE_LIMIT;
+/// Bound of the confirmed-disambiguation hold of `ESC` / `ESC [` (#3480).
+#[cfg(unix)]
+const DISAMBIGUATED_MOUSE_TAIL_LIMIT: Duration =
+    Duration::from_millis(DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS as u64);
+/// A key or X10 tail after a released prefix counts as the terminal's own
+/// split write only when all of it arrived within this of its first byte:
+/// the idle flush interval, which is what one read means to the reader.
+/// Typing the same bytes takes one keystroke each, tens of ms apart.
+const ORPHAN_TAIL_BURST: Duration = Duration::from_millis(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS as u64);
+/// A pump idle is evidence that a sequence ended only once its newest byte
+/// is this old: one idle flush interval (ADR-0013 D2).
+const PUMP_IDLE_QUIET: Duration = Duration::from_millis(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS as u64);
+/// Backstop for every pending byte except an unterminated bracketed paste:
+/// past this age it is released as on an interruption (ADR-0012 D2). The
+/// longest named hold plus one split-read wait, so no named hold reaches it.
+const PENDING_INPUT_AGE_LIMIT: Duration = Duration::from_millis(
+    COLOR_REPLY_TAIL_LIMIT.as_millis() as u64 + INCOMPLETE_SEQUENCE_FLUSH_TIMEOUT_MS as u64,
+);
+
+/// The one wait of the Unix stdin reader before it blocks in `read()`
+/// (ADR-0012 D4): the earliest of the framer's release time
+/// (`held_input_release_ms`) and, while the direct-graphics filter keeps
+/// bytes, its idle poll. Returns the wait and whether the framer is due when
+/// the wait ends idle; `None` means only input can change anything.
+#[cfg(any(unix, test))]
+pub(crate) fn reader_idle_wait(
+    framer_release_ms: Option<i32>,
+    direct_pending: bool,
+) -> Option<(i32, bool)> {
+    match (framer_release_ms, direct_pending) {
+        (Some(framer), true) => Some((
+            framer.min(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS),
+            framer <= RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS,
+        )),
+        (Some(framer), false) => Some((framer, true)),
+        (None, true) => Some((RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS, false)),
+        (None, false) => None,
+    }
+}
+
+/// The framer side of the Unix stdin reader loop, one turn at a time
+/// (ADR-0013 D3). The reader and the property harness both run it, so an
+/// empty filtered read takes the production path in tests too.
+#[cfg(any(unix, test))]
+#[derive(Debug, Default)]
+pub(crate) struct ReaderSchedule {
+    /// When the bytes the framer last received get their idle flush, or,
+    /// after a flush that kept bytes, when the framer is next due.
+    idle_flush_at: Option<Instant>,
+}
+
+#[cfg(any(unix, test))]
+impl ReaderSchedule {
+    /// The one wait before `read()`, rounded up to whole milliseconds, and
+    /// whether the framer is due when it ends idle (ADR-0012 D4).
+    pub(crate) fn wait(
+        &self,
+        framer: &RawInputByteFramer,
+        direct_pending: bool,
+    ) -> Option<(i32, bool)> {
+        let now = framer.now();
+        let idle = self
+            .idle_flush_at
+            .filter(|_| framer.has_pending_input())
+            .map(|at| ceil_ms(at.saturating_duration_since(now)));
+        let framer_wait = match (idle, framer.held_input_release_ms()) {
+            (Some(idle), Some(release)) => Some(idle.min(release)),
+            (idle, release) => idle.or(release),
+        };
+        reader_idle_wait(framer_wait, direct_pending)
+    }
+
+    /// A read woke the reader; `filtered` is what the direct-graphics filter
+    /// let through, possibly nothing. Every wake runs the framer's due
+    /// releases first. Only bytes the framer receives restart its idle
+    /// interval; a wake that brought it none flushes it when that interval
+    /// (or its release time) has passed (ADR-0013 D3).
+    pub(crate) fn on_read(
+        &mut self,
+        framer: &mut RawInputByteFramer,
+        filtered: Vec<Vec<u8>>,
+        mouse_capture: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut chunks = framer.release_due();
+        let mut received = false;
+        for chunk in filtered.into_iter().filter(|chunk| !chunk.is_empty()) {
+            received = true;
+            chunks.extend(framer.push(&chunk));
+        }
+        let now = framer.now();
+        if received {
+            self.arm_idle_flush(framer, mouse_capture);
+        } else if framer.has_pending_input() && self.idle_flush_at.is_some_and(|at| now >= at) {
+            chunks.extend(self.flush(framer));
+        }
+        chunks
+    }
+
+    /// The wait ended with no input. `released` is what the graphics filter
+    /// let go because no response is awaited any more.
+    pub(crate) fn on_idle(
+        &mut self,
+        framer: &mut RawInputByteFramer,
+        released: Option<Vec<u8>>,
+        framer_due: bool,
+        mouse_capture: bool,
+    ) -> Vec<Vec<u8>> {
+        if let Some(data) = released {
+            let chunks = framer.push(&data);
+            self.arm_idle_flush(framer, mouse_capture);
+            chunks
+        } else if framer_due {
+            self.flush(framer)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn arm_idle_flush(&mut self, framer: &RawInputByteFramer, mouse_capture: bool) {
+        self.idle_flush_at = Some(
+            framer.now()
+                + Duration::from_millis(framer.idle_flush_timeout_ms(mouse_capture) as u64),
+        );
+    }
+
+    fn flush(&mut self, framer: &mut RawInputByteFramer) -> Vec<Vec<u8>> {
+        let chunks = framer.flush_timeout();
+        let now = framer.now();
+        self.idle_flush_at = framer
+            .held_input_release_ms()
+            .map(|ms| now + Duration::from_millis(ms.max(0) as u64));
+        chunks
+    }
+}
+
+/// `duration` in whole milliseconds, rounded up, so a wait of it ends at or
+/// after the instant it was measured to.
+#[cfg(any(unix, test))]
+fn ceil_ms(duration: Duration) -> i32 {
+    i32::try_from(duration.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX)
+}
 
 impl RawInputByteFramer {
     pub(crate) fn for_host_input() -> Self {
@@ -259,29 +834,312 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.push_bytes(data, false)
+    }
+
+    /// Pushes the bytes of one key record the pump staged for an X10 frame,
+    /// every repeat of it: they decide the frame as bytes, and leave the
+    /// framer by record (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    pub(crate) fn push_staged_record(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.push_bytes(data, true)
+    }
+
+    fn push_bytes(&mut self, data: &[u8], staged_record: bool) -> Vec<Vec<u8>> {
+        // Bounds are checked before the new bytes can be classified with the
+        // old ones (ADR-0012 D2).
+        let mut chunks = self.release_due();
         if data.is_empty() {
-            return self.push_extended();
+            chunks.extend(self.push_extended());
+            return chunks;
         }
         // Bytes after the idle limit are never part of the abandoned reply.
         self.drop_abandoned_host_color_reply();
         self.buffer.extend_from_slice(data);
-        let chunks = self.push_extended();
+        self.record_arrival(data.len());
+        #[cfg(any(windows, test))]
+        if staged_record {
+            let end = self.pushed;
+            self.staged_records
+                .push_back((end - data.len() as u64, end));
+        }
+        #[cfg(not(any(windows, test)))]
+        let _ = staged_record;
+        chunks.extend(self.push_extended());
+        let now = self.now();
         self.partial_host_color_reply_read_at =
-            starts_with_incomplete_default_color_response(&self.buffer).then(Instant::now);
+            starts_with_incomplete_default_color_response(&self.buffer).then_some(now);
         chunks
     }
 
     fn push_extended(&mut self) -> Vec<Vec<u8>> {
         #[cfg(unix)]
-        if let Some(prefix_len) = self.awaiting_mouse_tail_after.take() {
+        if let Some(HoldAfter::DisambiguatedPrefix { len }) =
+            self.tail_hold.as_ref().map(|hold| hold.after.clone())
+        {
+            self.tail_hold = None;
             if !continues_escape_sequence(&self.buffer) {
                 // The prefix already outlived keyboard timing; it was a key.
-                let mut chunks = vec![self.buffer.drain(..prefix_len).collect()];
+                let mut chunks = vec![self.buffer.drain(..len).collect()];
+                if len == 1 {
+                    // A released ESC: what follows it is classified as its
+                    // possible orphan tail (ADR-0012 D3). `ESC [` keeps the
+                    // binding policy of #4751: the next key is typed.
+                    self.open_tail_hold(HoldAfter::Escape { color_reply: false });
+                }
                 chunks.extend(self.drain_available_chunks());
                 return chunks;
             }
         }
         self.drain_available_chunks()
+    }
+
+    /// Runs every release that time alone has made due: a byte past the
+    /// backstop is released as past its last bound, an expired hold as if the
+    /// reader had flushed at its deadline. `push` and every reader wake run
+    /// it, whatever else they do (ADR-0013 D3).
+    pub(crate) fn release_due(&mut self) -> Vec<Vec<u8>> {
+        if self.pending_input_expired() {
+            self.release_everything(Release::Backstop)
+        } else if self.tail_hold_expired() {
+            self.flush_timeout()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_clock {
+            return now + self.test_clock_skew;
+        }
+        #[cfg(test)]
+        return Instant::now() + self.test_clock_skew;
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    #[cfg(any(windows, test))]
+    fn set_pump_policy(&mut self) {
+        self.pump_policy = true;
+    }
+
+    fn pump_policy(&self) -> bool {
+        #[cfg(any(windows, test))]
+        return self.pump_policy;
+        #[cfg(not(any(windows, test)))]
+        false
+    }
+
+    /// Whether the newest pending byte arrived at least `PUMP_IDLE_QUIET`
+    /// ago: only then is a pump idle evidence that no more of it is coming.
+    fn newest_pending_quiet(&self) -> bool {
+        let now = self.now();
+        self.buffer.is_empty()
+            || self
+                .arrivals
+                .back()
+                .is_none_or(|(_, at)| now.saturating_duration_since(*at) >= PUMP_IDLE_QUIET)
+    }
+
+    /// The pump's X10 candidate ended (accepted or replayed): no byte pushed
+    /// so far is a staged record any more (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    pub(crate) fn end_staged_records(&mut self) {
+        self.staged_records.clear();
+    }
+
+    /// A staged key record at the front of `buffer` was no part of a
+    /// pending frame: the frame before it was decided (dropped, or taken as
+    /// a mouse report that ended inside the record). The pump replays the
+    /// record, or took it as the report's, so its bytes, every repeat, are
+    /// dropped here whole and never typed. A byte is judged by the record it
+    /// came in, not by its class (ADR-0013 amendment 2, D4).
+    #[cfg(any(windows, test))]
+    fn drop_staged_record_at_front(&mut self) -> bool {
+        let front = self.pushed.saturating_sub(self.buffer.len() as u64);
+        while self
+            .staged_records
+            .front()
+            .is_some_and(|(_, end)| *end <= front)
+        {
+            self.staged_records.pop_front();
+        }
+        let Some(&(start, end)) = self.staged_records.front() else {
+            return false;
+        };
+        if self.buffer.is_empty() || start > front {
+            return false;
+        }
+        let len = ((end - front) as usize).min(self.buffer.len());
+        tracing::debug!(len, "dropping a staged key record the pump replays");
+        self.buffer.drain(..len);
+        self.staged_records.pop_front();
+        true
+    }
+
+    /// The open context of a released `ESC` / `ESC [` holds an incomplete X10
+    /// report tail (ADR-0013 D4).
+    #[cfg(any(windows, test))]
+    fn holds_x10_tail(&self) -> bool {
+        self.tail_hold
+            .as_ref()
+            .is_some_and(|hold| hold.after.incomplete_x10_tail_len(&self.buffer).is_some())
+            && !self.tail_hold_expired()
+    }
+
+    /// Bytes an interruption leaves pending: a colour reply prefix while its
+    /// reply is still awaited (the Windows default-colour window, or the
+    /// host reply window of a colour query). They can only complete the
+    /// reply or be dropped under its own bound, never reach the pane as
+    /// input (ADR-0013 D1).
+    fn interruption_keeps_pending(&self) -> bool {
+        if self.buffer.len() > MAX_DISCARDED_CONTROL_TAIL_BYTES {
+            return false;
+        }
+        if self.interruption_keeps_tail_hold() {
+            return true;
+        }
+        #[cfg(any(windows, test))]
+        if self.host_default_color_query_issued
+            && self
+                .host_default_color_query_deadline
+                .is_some_and(|deadline| self.now() < deadline)
+            && is_incomplete_host_default_color_prefix(&self.buffer)
+        {
+            return true;
+        }
+        self.host_color_replies_awaited > 0
+            && self.awaiting_host_reply()
+            && is_color_reply_shape_prefix(&self.buffer)
+            && !(starts_with_incomplete_default_color_response(&self.buffer)
+                && self.host_color_reply_abandoned())
+    }
+
+    /// An open colour reply tail context an interruption leaves open: the
+    /// header of an OSC reply was dropped, or the ESC of an awaited colour
+    /// reply went out as Escape, and what is held can still complete that
+    /// reply. A semantic key is the user's, not the host's: it does not end
+    /// what the host is sending, so the tail is still dropped if it completes
+    /// the reply, and framed as input only at its deadline or when it cannot
+    /// (ADR-0013 D1). Key and report contexts still end (#4048).
+    fn interruption_keeps_tail_hold(&self) -> bool {
+        let Some(hold) = &self.tail_hold else {
+            return false;
+        };
+        // The bytes decide: what was dropped or released before the held
+        // tail, and the tail, must still spell the start of a colour reply.
+        let reply_so_far = match &hold.after {
+            // Only the `\` of its ST is missing.
+            HoldAfter::OscHeader { split_st: true, .. } if self.buffer.is_empty() => {
+                return !self.tail_hold_expired();
+            }
+            HoldAfter::OscHeader { header, .. } => [header.as_slice(), &self.buffer].concat(),
+            HoldAfter::Escape { color_reply: true } if self.buffer.first() == Some(&b']') => {
+                [&[ESC][..], &self.buffer].concat()
+            }
+            _ => return false,
+        };
+        is_color_reply_shape_prefix(&reply_so_far)
+            && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
+            && !self.tail_hold_expired()
+            && (self.buffer.is_empty()
+                || classify_held_tail(&hold.after, &self.buffer, false, self.pump_policy())
+                    == Verdict::Hold)
+    }
+
+    /// Freezes this framer's clock at `now`, for deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, now: Instant) {
+        self.test_clock = Some(now);
+    }
+
+    /// Logs when the `len` bytes just appended to `buffer` arrived.
+    fn record_arrival(&mut self, len: usize) {
+        let now = self.now();
+        self.pushed += len as u64;
+        // Reads with no byte left in `buffer` are never looked up again.
+        let oldest = self.pushed.saturating_sub(self.buffer.len() as u64);
+        while self.arrivals.front().is_some_and(|(end, _)| *end <= oldest) {
+            self.arrivals.pop_front();
+        }
+        self.arrivals.push_back((self.pushed, now));
+    }
+
+    /// When the oldest pending byte arrived. Pending bytes are the last
+    /// `buffer.len()` bytes pushed, so this is a lookup in `arrivals`.
+    fn pending_arrival(&self) -> Option<Instant> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let oldest = self.pushed.saturating_sub(self.buffer.len() as u64);
+        self.arrivals
+            .iter()
+            .find(|(end, _)| *end > oldest)
+            .map(|(_, at)| *at)
+    }
+
+    /// An unterminated bracketed paste, the one pending input without a
+    /// time bound (ADR-0012 Residuals).
+    fn waiting_for_paste_terminator(&self) -> bool {
+        self.buffer.starts_with(BRACKETED_PASTE_START)
+            && find_subsequence(&self.buffer, BRACKETED_PASTE_END).is_none()
+    }
+
+    /// When the backstop releases the oldest pending byte.
+    fn pending_input_deadline(&self) -> Option<Instant> {
+        if self.waiting_for_paste_terminator() {
+            return None;
+        }
+        self.pending_arrival()
+            .map(|at| at + PENDING_INPUT_AGE_LIMIT)
+    }
+
+    fn pending_input_expired(&self) -> bool {
+        let now = self.now();
+        self.pending_input_deadline()
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// The hold's deadline, derived from arrivals (ADR-0012 D2): the oldest
+    /// held byte's arrival plus the context's limit, or, while nothing is
+    /// held yet, the context's opening plus that limit (how late the tail may
+    /// start).
+    fn tail_hold_deadline(&self) -> Option<Instant> {
+        let hold = self.tail_hold.as_ref()?;
+        let limit = hold.after.limit();
+        #[cfg(unix)]
+        if matches!(hold.after, HoldAfter::DisambiguatedPrefix { .. }) {
+            // Its bytes are the prefix itself; the wait starts at the flush.
+            return Some(hold.opened_at + limit);
+        }
+        let from = self
+            .pending_arrival()
+            .map_or(hold.opened_at, |at| at.max(hold.opened_at));
+        Some(from + limit)
+    }
+
+    fn tail_hold_expired(&self) -> bool {
+        let now = self.now();
+        self.tail_hold_deadline()
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Opens the hold for the tail of what was just disposed of.
+    fn open_tail_hold(&mut self, after: HoldAfter) {
+        self.tail_hold = Some(TailHold {
+            after,
+            opened_at: self.now(),
+            interrupted: false,
+        });
+    }
+
+    /// Opens the hold only on an idle release: an interruption leaves no
+    /// context behind (ADR-0012 D1).
+    fn open_tail_hold_on(&mut self, mode: Release, after: HoldAfter) {
+        if mode.idle() {
+            self.open_tail_hold(after);
+        }
     }
 
     /// Hold a lone trailing ESC for one idle flush so an OSC 10/11 reply split
@@ -291,31 +1149,38 @@ impl RawInputByteFramer {
         self.host_color_query_sent_with_replies(HOST_COLOR_QUERY_REPLIES);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn host_default_color_query_sent(&mut self, reply_window: Duration) {
         self.host_color_query_sent_with_replies(2);
         self.host_default_color_query_issued = true;
-        self.host_default_color_query_deadline = Some(Instant::now() + reply_window);
+        self.host_default_color_query_deadline = Some(self.now() + reply_window);
     }
 
     fn host_color_query_sent_with_replies(&mut self, replies: u16) {
         self.host_color_replies_awaited = self.host_color_replies_awaited.saturating_add(replies);
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     /// Whether a buffered unfinished OSC 10/11 reply has waited past its idle
     /// limit or grown past any real reply, so it can no longer hold input.
     fn host_color_reply_abandoned(&self) -> bool {
         // The Windows default color query keeps its own reply deadline.
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_deadline.is_some() {
             return false;
         }
+        // A reply that came to the front of `buffer` only after the bytes
+        // before it in its read were dropped (an orphan UTF-8 continuation)
+        // has no read time of its own: its newest byte's arrival is that time
+        // (ADR-0013 D1).
+        let now = self.now();
+        let last_read = self
+            .partial_host_color_reply_read_at
+            .or_else(|| self.arrivals.back().map(|(_, at)| *at));
         self.buffer.len() >= MAX_DISCARDED_CONTROL_TAIL_BYTES
-            || self
-                .partial_host_color_reply_read_at
-                .is_none_or(|at| at.elapsed() >= HOST_COLOR_REPLY_IDLE_LIMIT)
+            || last_read
+                .is_none_or(|at| now.saturating_duration_since(at) >= HOST_COLOR_REPLY_IDLE_LIMIT)
     }
 
     fn drop_abandoned_host_color_reply(&mut self) {
@@ -333,18 +1198,10 @@ impl RawInputByteFramer {
         self.partial_host_color_reply_read_at = None;
     }
 
-    #[cfg(windows)]
-    fn flush_lone_escape_on_interruption(&mut self) {
-        if self.buffer.as_slice() == [ESC] {
-            self.held_pending_host_reply_esc = true;
-            self.host_default_color_query_deadline = None;
-        }
-    }
-
     fn host_appearance_query_sent(&mut self) {
         self.host_appearance_reply_awaited = true;
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     /// Same hold window as `host_color_query_sent`, for the XTWINOPS cell size
@@ -353,16 +1210,17 @@ impl RawInputByteFramer {
     pub(crate) fn host_cell_size_query_sent(&mut self) {
         self.host_cell_size_replies_awaited = HOST_CELL_SIZE_QUERY_REPLIES;
         self.held_pending_host_reply_esc = false;
-        self.host_reply_activity_at = Some(Instant::now());
+        self.host_reply_activity_at = Some(self.now());
     }
 
     fn awaiting_host_reply(&self) -> bool {
+        let now = self.now();
         (self.host_color_replies_awaited > 0
             || self.host_cell_size_replies_awaited > 0
             || self.host_appearance_reply_awaited)
             && self
                 .host_reply_activity_at
-                .is_some_and(|at| at.elapsed() < HOST_REPLY_QUIET_WINDOW)
+                .is_some_and(|at| now.saturating_duration_since(at) < HOST_REPLY_QUIET_WINDOW)
     }
 
     /// Stop expecting replies the host never sent, so their reply handling no
@@ -372,7 +1230,7 @@ impl RawInputByteFramer {
             return;
         }
         // The Windows default color query keeps its own reply deadline.
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_deadline.is_some() {
             return;
         }
@@ -388,6 +1246,18 @@ impl RawInputByteFramer {
         self.partial_host_color_reply_read_at = self
             .partial_host_color_reply_read_at
             .and_then(|at| at.checked_sub(by));
+    }
+
+    /// Moves every time-bounded hold `by` into the past: the hold's opening
+    /// and the arrival of every pending byte.
+    #[cfg(test)]
+    fn age_held_input(&mut self, by: Duration) {
+        if let Some(hold) = &mut self.tail_hold {
+            hold.opened_at = hold.opened_at.checked_sub(by).unwrap_or(hold.opened_at);
+        }
+        for (_, at) in &mut self.arrivals {
+            *at = at.checked_sub(by).unwrap_or(*at);
+        }
     }
 
     #[cfg(test)]
@@ -409,9 +1279,47 @@ impl RawInputByteFramer {
         self.host_appearance_query_on_focus = true;
     }
 
+    /// Every held byte is in `buffer`, so this is all the input not yet
+    /// emitted or dropped.
     #[cfg(any(unix, test))]
     pub(crate) fn has_pending_input(&self) -> bool {
         !self.buffer.is_empty()
+    }
+
+    /// Milliseconds until `flush_timeout` must run even if no further input
+    /// arrives: the hold's deadline while it holds bytes, or one idle interval
+    /// while a lone ESC (or `ESC [`) is held one flush for a host reply. `None`
+    /// means only more input can change what is pending.
+    #[cfg(any(unix, test))]
+    pub(crate) fn held_input_release_ms(&self) -> Option<i32> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let now = self.now();
+        let until = |deadline: Instant| {
+            // Round up so the deadline has passed when the wait ends.
+            i32::try_from(deadline.saturating_duration_since(now).as_millis())
+                .unwrap_or(i32::MAX)
+                .saturating_add(1)
+        };
+        [
+            self.tail_hold_deadline().map(until),
+            self.holds_reply_prefix_one_flush()
+                .then_some(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS),
+            self.pending_input_deadline().map(until),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// A lone ESC or `ESC [` held for exactly one more flush while a host
+    /// reply is awaited (see `flush_timeout`).
+    #[cfg(any(unix, test))]
+    fn holds_reply_prefix_one_flush(&self) -> bool {
+        self.held_pending_host_reply_esc
+            && (matches!(self.buffer.as_slice(), [ESC] | [ESC, b'['])
+                || starts_with_incomplete_host_color_scheme_report(&self.buffer))
     }
 
     #[cfg(unix)]
@@ -460,49 +1368,183 @@ impl RawInputByteFramer {
     /// How long to keep holding input after a first idle flush held it.
     #[cfg(unix)]
     pub(crate) fn held_input_flush_timeout_ms(&self) -> i32 {
-        if self.awaiting_mouse_tail_after.is_some() {
-            DISAMBIGUATED_MOUSE_TAIL_FLUSH_TIMEOUT_MS
-        } else {
-            RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS
+        self.held_input_release_ms()
+            .unwrap_or(RAW_INPUT_IDLE_FLUSH_TIMEOUT_MS)
+    }
+
+    /// Ends every report and key hold at once, for semantic input (Windows
+    /// key, focus and mouse records): what was held is input and is emitted,
+    /// in order, before the caller emits that event. A host reply prefix
+    /// inside its reply window is not input and stays (ADR-0013 D1, I4').
+    #[cfg(any(windows, test))]
+    pub(crate) fn flush_interrupted(&mut self) -> Vec<Vec<u8>> {
+        self.release_everything(Release::Interrupt)
+    }
+
+    /// Repeats an interrupting release until nothing is pending but an
+    /// unterminated bracketed paste or, on an interruption, a reply prefix
+    /// inside its window. Opens no context.
+    fn release_everything(&mut self, mode: Release) -> Vec<Vec<u8>> {
+        debug_assert!(mode.interrupt());
+        let mut chunks = Vec::new();
+        // Each pass emits or drops at least the front of `buffer`; the bound
+        // only guards against a rule that would not.
+        for _ in 0..=MAX_DISCARDED_CONTROL_TAIL_BYTES {
+            chunks.extend(self.release(mode));
+            if self.buffer.is_empty()
+                || self.waiting_for_paste_terminator()
+                || (mode == Release::Interrupt && self.interruption_keeps_pending())
+            {
+                break;
+            }
         }
+        chunks
     }
 
     #[cfg(any(windows, test))]
     pub(crate) fn has_pending_bracketed_paste(&self) -> bool {
-        self.buffer.starts_with(BRACKETED_PASTE_START)
-            && find_subsequence(&self.buffer, BRACKETED_PASTE_END).is_none()
+        self.waiting_for_paste_terminator()
     }
 
+    /// The idle release: the reader saw no input for its idle wait (on the
+    /// pump: the pump says so, see `Release::PumpIdle`). A byte older than
+    /// the backstop is released as past its last bound first.
     pub(crate) fn flush_timeout(&mut self) -> Vec<Vec<u8>> {
+        if self.pending_input_expired() {
+            tracing::debug!(
+                len = self.buffer.len(),
+                "releasing pending input past its age limit"
+            );
+            return self.release_everything(Release::Backstop);
+        }
+        self.release(if self.pump_policy() {
+            Release::PumpIdle
+        } else {
+            Release::Idle
+        })
+    }
+
+    fn release(&mut self, mode: Release) -> Vec<Vec<u8>> {
+        let interrupt = mode.interrupt();
+        // A pump idle right after a push is no evidence the sequence ended:
+        // what would drop bytes waits for one quiet interval (ADR-0013 D2).
+        let defer_loss = mode == Release::PumpIdle && !self.newest_pending_quiet();
+        // The deadline is checked before anything is classified. An expired
+        // hold's bytes are then framed as ordinary input, in order. An
+        // interruption ends the hold whatever its deadline.
+        let expired_hold =
+            if (interrupt && !self.interruption_keeps_tail_hold()) || self.tail_hold_expired() {
+                self.tail_hold.take()
+            } else {
+                None
+            };
+        // A colour reply's tail context survives an interruption (ADR-0013 D1).
+        let kept_hold = interrupt && self.tail_hold.is_some();
+        if let Some(hold) = self.tail_hold.as_mut().filter(|_| kept_hold) {
+            hold.interrupted = true;
+        }
+        // On the pump an X10 report tail whose prefix went out as a key is
+        // the report, and the pump replays the key records it staged for it:
+        // unfinished, it is dropped like an unfinished `ESC [ M` (ADR-0013 D4).
+        if let Some(len) = expired_hold
+            .as_ref()
+            .filter(|_| self.pump_policy())
+            .and_then(|hold| hold.after.incomplete_x10_tail_len(&self.buffer))
+        {
+            tracing::debug!(len, "dropping unfinished X10 report tail");
+            self.buffer.drain(..len);
+        }
+        // What a colour reply context held is not input once it spells the
+        // reply, or after an interruption (ADR-0013 D1).
+        if let Some(hold) = &expired_hold {
+            let len = hold.after.reply_tail_len(&self.buffer, hold.interrupted);
+            if len > 0 {
+                tracing::debug!(len, "dropping unfinished colour reply tail at its deadline");
+                self.buffer.drain(..len);
+            }
+        }
+        if let Some(hold) = &expired_hold {
+            tracing::debug!(
+                after = ?hold.after,
+                len = self.buffer.len(),
+                "releasing held input at its deadline"
+            );
+        }
+        // A finished mouse wait also counts as this prefix's one-flush host
+        // reply hold, so the two holds never stack.
+        // An interruption serves every one-flush hold as well.
+        #[cfg(unix)]
+        let mouse_wait_served = interrupt
+            || matches!(
+                expired_hold.map(|hold| hold.after),
+                Some(HoldAfter::DisambiguatedPrefix { .. })
+            );
+        #[cfg(not(unix))]
+        let mouse_wait_served = {
+            let _ = expired_hold;
+            interrupt
+        };
+        // Colour-tail recovery that holds bytes ends as if its grace had
+        // passed: they are framed as input. Recovery that holds nothing
+        // survives, so a reply tail after the semantic event is still dropped.
+        #[cfg(any(windows, test))]
+        if interrupt && self.host_color_tail_deadline.is_some() && !self.buffer.is_empty() {
+            self.end_host_color_tail_recovery();
+        }
         let mut chunks = self.drain_available_chunks();
+        if interrupt && !kept_hold {
+            // A hold opened while draining belongs to bytes already framed.
+            self.tail_hold = None;
+        }
         self.expire_unanswered_host_queries();
 
-        #[cfg(windows)]
+        #[cfg(any(windows, test))]
         let host_color_query_expired = self
             .host_default_color_query_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        #[cfg(windows)]
+            .is_some_and(|deadline| self.now() >= deadline)
+            || (interrupt && self.buffer.as_slice() == [ESC]);
+        #[cfg(any(windows, test))]
         if host_color_query_expired {
             self.host_default_color_query_deadline = None;
             self.host_color_replies_awaited = 0;
         }
 
-        // Idle is not evidence that a mouse report has ended. The continuation
-        // stays bounded and is released if it cannot complete a valid report.
-        if self.timed_out_mouse_prefix.is_some() {
+        // Idle is not evidence that a held tail has ended: it waits for the
+        // deadline, or for a byte that decides it.
+        if self.tail_hold.is_some() {
+            return chunks;
+        }
+        // A reply still arriving is not input: an interruption leaves it to
+        // its own bound (ADR-0013 D1).
+        if mode == Release::Interrupt && self.interruption_keeps_pending() {
             return chunks;
         }
 
         if let Some(family) = self.discard_until {
+            // An interruption drops what a discard still holds and ends it;
+            // a discard holding nothing is kept for the reply tail to come.
+            if interrupt && !self.buffer.is_empty() {
+                tracing::debug!(
+                    len = self.buffer.len(),
+                    "dropping discarded reply bytes on interruption"
+                );
+                self.buffer.clear();
+                self.discard_until = None;
+                self.discarded_tail_bytes = 0;
+                return chunks;
+            }
             if family == ControlStringFamily::HostReplyCsi {
                 return chunks;
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             if self.host_color_tail_deadline.is_some() {
                 return chunks;
             }
+            if defer_loss {
+                return chunks;
+            }
             let keep_split_st = self.buffer.last() == Some(&ESC);
-            let keep_discarding = plausible_control_string_tail(family, &self.buffer);
+            let keep_discarding = keep_split_st;
             self.discarded_tail_bytes = self.discarded_tail_bytes.saturating_add(self.buffer.len());
             self.buffer.clear();
             if keep_discarding && self.discarded_tail_bytes <= MAX_DISCARDED_CONTROL_TAIL_BYTES {
@@ -522,44 +1564,36 @@ impl RawInputByteFramer {
 
         // A confirmed host sends Escape as `CSI 27u`, so a mouse report prefix
         // that outlives keyboard timing may still get a delayed tail (#3480).
-        // Keep it briefly; `push` releases it if other input follows.
-        // A finished mouse wait also counts as this prefix's one-flush host
-        // reply hold, so the two holds never stack.
-        #[cfg(unix)]
-        let mouse_wait_served = self.awaiting_mouse_tail_after.take().is_some();
-        #[cfg(not(unix))]
-        let mouse_wait_served = false;
-        #[cfg(unix)]
+        // Keep it until its deadline; `push` releases it if other input follows.
         // Prefixes already inside a sequence waited the long window; only the
         // ambiguous ESC / ESC[ prefixes need this extra mouse-tail hold.
+        #[cfg(unix)]
         if !mouse_wait_served
             && self.host_escape_disambiguation_active
             && self.pending_could_be_escape_key()
             && could_continue_as_mouse_report(&self.buffer)
         {
-            self.awaiting_mouse_tail_after = Some(self.buffer.len());
-            return chunks;
-        }
-
-        if self.lone_escape_recently_flushed && self.buffer.starts_with(b"[<") {
-            tracing::debug!(
-                len = self.buffer.len(),
-                "discarding incomplete orphaned SGR mouse tail after input timeout"
-            );
-            let mut prefix = vec![ESC];
-            prefix.append(&mut self.buffer);
-            self.retain_timed_out_mouse_prefix(prefix);
-            self.lone_escape_recently_flushed = false;
+            let len = self.buffer.len();
+            self.open_tail_hold(HoldAfter::DisambiguatedPrefix { len });
             return chunks;
         }
 
         if starts_with_incomplete_sgr_mouse_sequence(&self.buffer) {
+            if defer_loss {
+                return chunks;
+            }
+            // `CSI <` starts no key: these bytes are a mouse report fragment.
+            // They are dropped, and what follows them is held as its tail.
             tracing::debug!(
                 bytes = ?self.buffer,
                 "discarding incomplete SGR mouse sequence after input timeout"
             );
             let prefix = std::mem::take(&mut self.buffer);
-            self.retain_timed_out_mouse_prefix(prefix);
+            if prefix.len() < MAX_DISCARDED_CONTROL_TAIL_BYTES
+                && plausible_sgr_mouse_prefix(&prefix)
+            {
+                self.open_tail_hold_on(mode, HoldAfter::DroppedPrefix(prefix));
+            }
             return chunks;
         }
 
@@ -573,21 +1607,32 @@ impl RawInputByteFramer {
             return chunks;
         }
 
-        #[cfg(windows)]
+        // Past the reply window and its recovery, a reply prefix takes the
+        // generic paths below, which hold its tail (#5251).
+        #[cfg(any(windows, test))]
         if self.host_default_color_query_issued
+            && (self.host_default_color_query_deadline.is_some() || host_color_query_expired)
             && is_incomplete_host_default_color_prefix(&self.buffer)
         {
-            if self.host_default_color_query_deadline.is_some()
+            // Inside its window an interruption keeps it too: it can only
+            // complete the reply or be dropped (ADR-0013 D1).
+            if mode != Release::Backstop
+                && self.host_default_color_query_deadline.is_some()
                 && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
             {
                 return chunks;
             }
-            if host_color_query_expired && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES {
+            if defer_loss {
+                return chunks;
+            }
+            if !interrupt
+                && host_color_query_expired
+                && self.buffer.len() <= MAX_DISCARDED_CONTROL_TAIL_BYTES
+            {
                 self.discard_until = Some(ControlStringFamily::Osc);
                 let split_st = self.buffer.last() == Some(&ESC);
                 self.discarded_tail_bytes = self.buffer.len() - usize::from(split_st);
-                self.host_color_tail_deadline =
-                    Some(Instant::now() + HOST_COLOR_TAIL_RECOVERY_GRACE);
+                self.host_color_tail_deadline = Some(self.now() + HOST_COLOR_TAIL_RECOVERY_GRACE);
                 self.host_color_tail_split_st = split_st;
                 self.buffer.clear();
                 if split_st {
@@ -600,7 +1645,10 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_default_color_response(&self.buffer) {
-            if self.host_color_reply_abandoned() {
+            if defer_loss {
+                return chunks;
+            }
+            if interrupt || self.host_color_reply_abandoned() {
                 // The host went quiet mid-reply; never let it hold input (#5052).
                 tracing::debug!(
                     len = self.buffer.len(),
@@ -633,25 +1681,34 @@ impl RawInputByteFramer {
         if self.host_cell_size_replies_awaited > 0
             && starts_with_incomplete_host_cell_size_report(&self.buffer)
         {
+            if defer_loss {
+                return chunks;
+            }
             tracing::debug!(
                 len = self.buffer.len(),
                 "discarding incomplete host cell size report after input timeout"
             );
             self.host_cell_size_replies_awaited = 0;
             self.held_pending_host_reply_esc = false;
-            self.discard_until = Some(ControlStringFamily::HostReplyCsi);
+            if !interrupt {
+                self.discard_until = Some(ControlStringFamily::HostReplyCsi);
+            }
             self.discarded_tail_bytes = 0;
             self.buffer.clear();
             return chunks;
         }
 
         if starts_with_incomplete_host_color_scheme_report(&self.buffer) {
-            if self.host_appearance_reply_awaited && !self.held_pending_host_reply_esc {
+            if !interrupt && self.host_appearance_reply_awaited && !self.held_pending_host_reply_esc
+            {
                 self.held_pending_host_reply_esc = true;
                 tracing::trace!(
                     len = self.buffer.len(),
                     "holding incomplete host color scheme report one flush"
                 );
+                return chunks;
+            }
+            if defer_loss {
                 return chunks;
             }
             tracing::debug!(
@@ -660,7 +1717,9 @@ impl RawInputByteFramer {
             );
             self.host_appearance_reply_awaited = false;
             self.held_pending_host_reply_esc = false;
-            self.discard_until = Some(ControlStringFamily::HostReplyCsi);
+            if !interrupt {
+                self.discard_until = Some(ControlStringFamily::HostReplyCsi);
+            }
             self.discarded_tail_bytes = 0;
             self.buffer.clear();
             return chunks;
@@ -671,26 +1730,46 @@ impl RawInputByteFramer {
         // (OSC, DCS, APC, PM, SOS) also start host replies, so they keep the
         // control-string path and are never forwarded as Alt keys (#344).
         if is_alt_key_introducer(&self.buffer) && !self.awaiting_host_reply() {
+            let csi = self.buffer.as_slice() == b"\x1b[";
             chunks.push(std::mem::take(&mut self.buffer));
+            if csi {
+                // The rest of a split mouse report can still follow.
+                self.open_tail_hold_on(mode, HoldAfter::CsiIntroducer);
+            }
             return chunks;
         }
 
         if let Some(ControlString::Incomplete { family }) = control_string(&self.buffer) {
+            if defer_loss {
+                return chunks;
+            }
             tracing::debug!(
                 len = self.buffer.len(),
                 "discarding incomplete host control string after input timeout"
             );
+            let split_st = self.buffer.last() == Some(&ESC);
+            let mut header = std::mem::take(&mut self.buffer);
+            header.truncate(MAX_DISCARDED_CONTROL_TAIL_BYTES + 1);
+            if interrupt {
+                return chunks;
+            }
+            if family == ControlStringFamily::Osc {
+                // Its tail is held under a deadline and dropped only if it
+                // completes a reply; anything else is input (#5251).
+                self.open_tail_hold(HoldAfter::OscHeader { split_st, header });
+                return chunks;
+            }
             // This intentionally gives host control replies precedence over legacy
             // Alt forms like Alt+] after timeout, so later reply tails cannot leak.
             self.discard_until = Some(family);
             self.discarded_tail_bytes = 0;
-            self.buffer.clear();
             return chunks;
         }
 
         if self.buffer.as_slice() == [ESC] {
-            #[cfg(windows)]
-            if self.host_color_replies_awaited > 0
+            #[cfg(any(windows, test))]
+            if !interrupt
+                && self.host_color_replies_awaited > 0
                 && self.host_default_color_query_deadline.is_some()
             {
                 // Native console reply fragments can arrive across several idle polls.
@@ -702,9 +1781,11 @@ impl RawInputByteFramer {
                 tracing::trace!("holding lone escape one flush while awaiting host reply");
                 return chunks;
             }
+            // The reply can still follow without its ESC; see `classify_held_tail`.
+            let color_reply = self.host_color_replies_awaited > 0 && self.awaiting_host_reply();
             // No continuation arrived; give up the window so Escape is not delayed again.
             self.host_color_replies_awaited = 0;
-            #[cfg(windows)]
+            #[cfg(any(windows, test))]
             {
                 self.host_default_color_query_deadline = None;
             }
@@ -715,75 +1796,149 @@ impl RawInputByteFramer {
                 bytes = ?self.buffer,
                 "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
             );
-            self.lone_escape_recently_flushed = true;
             chunks.push(std::mem::take(&mut self.buffer));
+            self.open_tail_hold_on(mode, HoldAfter::Escape { color_reply });
             return chunks;
         }
 
         if let Ok(text) = std::str::from_utf8(&self.buffer) {
             if parse_terminal_key_sequence(text).is_some() {
+                // While a reply is awaited, `ESC [` is released here rather
+                // than as an Alt introducer above; its tail is held the same.
+                let csi = self.buffer.as_slice() == b"\x1b[";
                 chunks.push(std::mem::take(&mut self.buffer));
+                if csi {
+                    self.open_tail_hold_on(mode, HoldAfter::CsiIntroducer);
+                }
                 return chunks;
             }
         }
 
-        if starts_with_incomplete_utf8_char(&self.buffer) {
+        if !interrupt && starts_with_incomplete_utf8_char(&self.buffer) {
             tracing::trace!(bytes = ?self.buffer, "waiting for UTF-8 continuation bytes");
             return chunks;
         }
 
-        if self.buffer.first() == Some(&ESC) && starts_with_incomplete_utf8_char(&self.buffer[1..])
+        if !interrupt
+            && self.buffer.first() == Some(&ESC)
+            && starts_with_incomplete_utf8_char(&self.buffer[1..])
         {
             tracing::trace!(bytes = ?self.buffer, "waiting for escaped UTF-8 continuation bytes");
             return chunks;
         }
 
+        // A byte that starts no UTF-8 character (a continuation whose lead
+        // byte was dropped) is not input; it goes alone, not with the input
+        // after it.
+        if self.buffer.first() != Some(&ESC) {
+            if let Err(err) = std::str::from_utf8(&self.buffer) {
+                if err.valid_up_to() == 0 {
+                    let invalid = err.error_len().unwrap_or(self.buffer.len());
+                    tracing::debug!(len = invalid, "dropping invalid UTF-8 input");
+                    self.buffer.drain(..invalid);
+                    chunks.extend(self.drain_available_chunks());
+                    if !self.buffer.is_empty() {
+                        chunks.extend(self.release(mode));
+                    }
+                    return chunks;
+                }
+            }
+        }
+
+        // An incomplete sequence that cannot be a key, waited out or
+        // interrupted: never input. Its CSI prefix may still get a tail.
+        if defer_loss {
+            return chunks;
+        }
         tracing::debug!(bytes = ?self.buffer, "dropping incomplete raw input buffer after timeout");
-        self.lone_escape_recently_flushed = false;
-        self.buffer.clear();
+        let prefix = std::mem::take(&mut self.buffer);
+        if is_dropped_csi_key_prefix(&prefix) {
+            self.open_tail_hold_on(mode, HoldAfter::DroppedPrefix(prefix));
+        }
         chunks
     }
 
-    fn retain_timed_out_mouse_prefix(&mut self, prefix: Vec<u8>) {
-        self.timed_out_mouse_prefix = (prefix.len() < MAX_DISCARDED_CONTROL_TAIL_BYTES
-            && plausible_sgr_mouse_prefix(&prefix))
-        .then_some(prefix);
+    /// Applies the open tail hold to the front of `buffer`. Returns false
+    /// when the bytes must stay held.
+    fn resolve_tail_hold(&mut self) -> bool {
+        let Some(hold) = &self.tail_hold else {
+            return true;
+        };
+        #[cfg(unix)]
+        if matches!(hold.after, HoldAfter::DisambiguatedPrefix { .. }) {
+            return false;
+        }
+        if self.buffer.is_empty() {
+            return false;
+        }
+        // One read, as the reader sees it: every held byte arrived within
+        // the idle flush interval of the first (ADR-0012 D3).
+        let burst = match (self.pending_arrival(), self.arrivals.back()) {
+            (Some(first), Some((_, last))) => {
+                last.saturating_duration_since(first) <= ORPHAN_TAIL_BURST
+            }
+            _ => false,
+        };
+        let prefix = hold.after.released_prefix();
+        let reply_shaped = hold.after.reply_tail_len(&self.buffer, hold.interrupted);
+        match classify_held_tail(&hold.after, &self.buffer, burst, self.pump_policy()) {
+            // The deadline follows from the held bytes' arrival.
+            Verdict::Hold => false,
+            Verdict::Drop(len) => {
+                tracing::debug!(len, "discarding report tail after its timed-out prefix");
+                self.buffer.drain(..len);
+                self.tail_hold = None;
+                true
+            }
+            Verdict::Rejoin(_) => {
+                // Put the released prefix back: the reply (or pump X10
+                // report) is complete, so it parses as one and never as input.
+                self.buffer.splice(0..0, prefix.iter().copied());
+                self.tail_hold = None;
+                true
+            }
+            Verdict::Restore => {
+                self.buffer.insert(0, ESC);
+                self.tail_hold = None;
+                true
+            }
+            Verdict::Emit => {
+                // The reply-shaped bytes before the byte that ended the reply
+                // are not typed (ADR-0013 D1).
+                self.buffer.drain(..reply_shaped);
+                self.tail_hold = None;
+                true
+            }
+        }
     }
 
     fn drain_available_chunks(&mut self) -> Vec<Vec<u8>> {
         let mut chunks = Vec::new();
 
         loop {
-            if let Some(prefix) = &self.timed_out_mouse_prefix {
-                match classify_sgr_mouse_continuation(prefix, &self.buffer) {
-                    SgrMouseContinuation::Incomplete => break,
-                    SgrMouseContinuation::Complete(len) => {
-                        self.buffer.drain(..len);
-                    }
-                    SgrMouseContinuation::Invalid => {}
-                }
-                self.timed_out_mouse_prefix = None;
+            if !self.resolve_tail_hold() {
+                break;
             }
-
-            if self.lone_escape_recently_flushed {
-                if starts_with_incomplete_orphaned_sgr_mouse_tail(&self.buffer) {
-                    break;
-                }
-                if discard_complete_orphaned_sgr_mouse_tail(&mut self.buffer) {
-                    self.lone_escape_recently_flushed = false;
-                    continue;
-                }
-                self.lone_escape_recently_flushed = false;
+            #[cfg(any(windows, test))]
+            if self.drop_staged_record_at_front() {
+                continue;
             }
 
             if let Some(family) = self.discard_until {
-                #[cfg(windows)]
+                #[cfg(any(windows, test))]
                 if let Some(deadline) = self.host_color_tail_deadline {
+                    // The held ESC was the possible start of the ST; a byte
+                    // other than `\` disproves that. A new ESC brings its own
+                    // token, so the held one only ended a reply cut short;
+                    // any other byte follows the held ESC, which starts the
+                    // next token (ADR-0013 amendment 1, D1).
                     if self.host_color_tail_split_st
                         && self.buffer.len() > 1
                         && self.buffer[1] != b'\\'
                     {
-                        self.buffer.drain(..1);
+                        if self.buffer[1] == ESC {
+                            self.buffer.drain(..1);
+                        }
                         self.end_host_color_tail_recovery();
                         continue;
                     }
@@ -819,7 +1974,7 @@ impl RawInputByteFramer {
                             continue;
                         }
                     }
-                    if Instant::now() >= deadline
+                    if self.now() >= deadline
                         || self.discarded_tail_bytes + self.buffer.len()
                             >= MAX_DISCARDED_CONTROL_TAIL_BYTES
                     {
@@ -838,7 +1993,7 @@ impl RawInputByteFramer {
                     break;
                 }
                 let Some(terminator_len) =
-                    control_string_terminator_for_family(&self.buffer, family)
+                    control_string_terminator_for_family(&self.buffer, 0, family)
                 else {
                     break;
                 };
@@ -857,6 +2012,16 @@ impl RawInputByteFramer {
             {
                 chunks.push(vec![ESC]);
                 self.buffer.drain(..1);
+                continue;
+            }
+
+            // A byte X10 payload cannot carry ends an `ESC [ M` frame: it is
+            // dropped as an incomplete report, and the byte starts the next
+            // token, or goes with its staged record (ADR-0013 amendment 2,
+            // D4).
+            if let Some(len) = disproved_x10_frame_len(&self.buffer) {
+                tracing::debug!(len, "dropping X10 frame a control byte ended");
+                self.buffer.drain(..len);
                 continue;
             }
 
@@ -883,7 +2048,7 @@ impl RawInputByteFramer {
             }
             if is_host_reply_event(&event) && self.host_reply_activity_at.is_some() {
                 // Long reply bursts (256 palette entries) stay protected.
-                self.host_reply_activity_at = Some(Instant::now());
+                self.host_reply_activity_at = Some(self.now());
             }
             self.held_pending_host_reply_esc = false;
             chunks.push(self.buffer[..consumed].to_vec());
@@ -893,7 +2058,7 @@ impl RawInputByteFramer {
         chunks
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn end_host_color_tail_recovery(&mut self) {
         self.discard_until = None;
         self.discarded_tail_bytes = 0;
@@ -919,11 +2084,16 @@ fn starts_with_kitty_key_report(bytes: &[u8]) -> bool {
     rest.first().is_some_and(u8::is_ascii_digit) && rest.get(params) == Some(&b'u')
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const HOST_COLOR_TAIL_RECOVERY_GRACE: Duration = Duration::from_millis(100);
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn plausible_host_color_tail_byte(byte: u8) -> bool {
+    plausible_color_reply_payload_byte(byte) || byte == ESC
+}
+
+/// Bytes an OSC 4/10/11 color reply carries between its header and terminator.
+fn plausible_color_reply_payload_byte(byte: u8) -> bool {
     byte.is_ascii_hexdigit()
         || matches!(
             byte,
@@ -941,35 +2111,57 @@ fn plausible_host_color_tail_byte(byte: u8) -> bool {
                 | b'R'
                 | b'G'
                 | b'B'
-                | ESC
         )
 }
 
-fn plausible_control_string_tail(family: ControlStringFamily, buffer: &[u8]) -> bool {
-    match family {
-        ControlStringFamily::Osc => buffer.iter().all(|byte| {
-            byte.is_ascii_digit()
-                || matches!(
-                    *byte,
-                    b';' | b':'
-                        | b'/'
-                        | b'#'
-                        | b'?'
-                        | b'.'
-                        | b'_'
-                        | b'-'
-                        | b'+'
-                        | b'r'
-                        | b'g'
-                        | b'b'
-                        | b'R'
-                        | b'G'
-                        | b'B'
-                        | ESC
-                )
-        }),
-        ControlStringFamily::StTerminated => buffer.last() == Some(&ESC),
-        ControlStringFamily::HostReplyCsi => false,
+enum DiscardedOscTail {
+    /// Could still be a color reply tail; wait for more bytes.
+    Pending,
+    /// A color reply tail through its BEL or ST terminator.
+    Terminated(usize),
+    /// Holds a byte no color reply tail can carry, so it is all input.
+    Foreign,
+}
+
+fn classify_discarded_osc_tail(tail: &[u8]) -> DiscardedOscTail {
+    for (index, byte) in tail.iter().enumerate() {
+        if index >= MAX_DISCARDED_CONTROL_TAIL_BYTES {
+            return DiscardedOscTail::Foreign;
+        }
+        match *byte {
+            0x07 => return DiscardedOscTail::Terminated(index + 1),
+            ESC => {
+                return match tail.get(index + 1) {
+                    None => DiscardedOscTail::Pending,
+                    Some(b'\\') => DiscardedOscTail::Terminated(index + 2),
+                    Some(_) => DiscardedOscTail::Foreign,
+                }
+            }
+            byte if plausible_color_reply_payload_byte(byte) => {}
+            _ => return DiscardedOscTail::Foreign,
+        }
+    }
+    DiscardedOscTail::Pending
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OrphanedColorReply {
+    /// Starts with a full color reply header of this many bytes.
+    Header(usize),
+    /// Could still grow into one.
+    Prefix,
+    Unrelated,
+}
+
+/// Classifies bytes that followed a lone ESC already released as a key.
+fn orphaned_color_reply_tail(buffer: &[u8]) -> OrphanedColorReply {
+    const HEADERS: [&[u8]; 3] = [b"]10;", b"]11;", b"]4;"];
+    if let Some(header) = HEADERS.iter().find(|header| buffer.starts_with(header)) {
+        OrphanedColorReply::Header(header.len())
+    } else if !buffer.is_empty() && HEADERS.iter().any(|header| header.starts_with(buffer)) {
+        OrphanedColorReply::Prefix
+    } else {
+        OrphanedColorReply::Unrelated
     }
 }
 
@@ -1039,6 +2231,13 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
                 },
                 seq_len,
             ));
+        }
+
+        // A string introducer starts no key: a control string an ESC aborted
+        // is dropped, never forwarded as an Alt key (#344).
+        if control_string(seq.as_bytes()).is_some() {
+            tracing::debug!(len = seq_len, "dropping unsupported control string");
+            return Some((RawInputEvent::Unsupported, seq_len));
         }
 
         match seq {
@@ -1138,7 +2337,7 @@ fn starts_with_incomplete_default_color_response(buffer: &[u8]) -> bool {
         )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn is_incomplete_host_default_color_prefix(buffer: &[u8]) -> bool {
     buffer.starts_with(b"\x1b]")
         && matches!(
@@ -1150,6 +2349,59 @@ fn is_incomplete_host_default_color_prefix(buffer: &[u8]) -> bool {
         && [b"\x1b]10;".as_slice(), b"\x1b]11;".as_slice()]
             .iter()
             .any(|prefix| prefix.starts_with(buffer) || buffer.starts_with(prefix))
+}
+
+/// An unfinished OSC 10, 11 or 4 colour reply, or a prefix of one (`ESC ]`,
+/// `ESC ] 1`, ...).
+/// Whether `bytes` is the start of a colour reply, `ESC ] 10 ;`, `ESC ] 11 ;`
+/// or `ESC ] 4 ; <index> ;`, then `rgb:` and up to three groups of one to
+/// four hex digits, possibly up to the ESC of its ST, and nothing past it:
+/// text such as `ESC ] 4 ; 50 ; a` is not one (ADR-0013 D1).
+fn is_color_reply_shape_prefix(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(b"\x1b]") else {
+        return false;
+    };
+    let headers: [&[u8]; 3] = [b"10;", b"11;", b"4;"];
+    if headers.iter().any(|header| header.starts_with(rest)) {
+        return true;
+    }
+    let body = if let Some(body) = rest.strip_prefix(b"10;").or(rest.strip_prefix(b"11;")) {
+        body
+    } else if let Some(index) = rest.strip_prefix(b"4;") {
+        let digits = index
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if !(1..=3).contains(&digits) {
+            return false;
+        }
+        match index.get(digits) {
+            None => return true,
+            Some(b';') => &index[digits + 1..],
+            Some(_) => return false,
+        }
+    } else {
+        return false;
+    };
+    if b"rgb:".starts_with(body) {
+        return true;
+    }
+    let Some(groups) = body.strip_prefix(b"rgb:") else {
+        return false;
+    };
+    let (groups, split_st) = match groups.strip_suffix(&[ESC]) {
+        Some(groups) => (groups, true),
+        None => (groups, false),
+    };
+    let groups: Vec<&[u8]> = groups.split(|byte| *byte == b'/').collect();
+    let last = groups.len() - 1;
+    groups.len() <= 3
+        && groups.iter().enumerate().all(|(index, group)| {
+            group.iter().all(u8::is_ascii_hexdigit)
+                && group.len() <= 4
+                && (index == last && !split_st || !group.is_empty())
+        })
+        && (!split_st || groups.len() == 3)
 }
 
 fn starts_with_incomplete_host_color_scheme_report(buffer: &[u8]) -> bool {
@@ -1214,7 +2466,9 @@ fn control_string(buffer: &[u8]) -> Option<ControlString> {
         _ => return None,
     };
 
-    Some(match control_string_terminator_for_family(buffer, family) {
+    // The terminator search starts after the two-byte introducer.
+    let end = control_string_terminator_for_family(buffer, 2, family);
+    Some(match end {
         Some(len) => ControlString::Complete { len, family },
         None => ControlString::Incomplete { family },
     })
@@ -1266,15 +2520,23 @@ fn complete_escape_sequence_len(buffer: &[u8]) -> Option<usize> {
         }
     }
 
-    if buffer.len() >= 7
-        && buffer.starts_with(b"\x1b\x1b[M")
-        && parse_default_mouse(&buffer[1..7]).is_some()
+    // ESC before an X10 report, or before a frame a control byte ends, is
+    // its own key (ADR-0013 amendment 1, D4).
+    if buffer.starts_with(b"\x1b\x1b[M")
+        && ((buffer.len() >= 7 && parse_default_mouse(&buffer[1..7]).is_some())
+            || disproved_x10_frame_len(&buffer[1..]).is_some())
     {
         return Some(1);
     }
 
     if buffer.starts_with(b"\x1b\x1b") {
         return complete_escape_sequence_len(&buffer[1..]).map(|len| len + 1);
+    }
+
+    // No sequence carries ESC right after its CSI or SS3 introducer: the
+    // introducer was a legacy Alt+[ / Alt+O and a new sequence starts.
+    if matches!(buffer, [ESC, b'[' | b'O', ESC, ..]) {
+        return Some(2);
     }
 
     if buffer.starts_with(b"\x1b[") {
@@ -1342,41 +2604,6 @@ fn starts_with_incomplete_default_mouse_sequence(buffer: &[u8]) -> bool {
     buffer.starts_with(b"\x1b[M") && buffer.len() < 6
 }
 
-fn starts_with_incomplete_orphaned_sgr_mouse_tail(buffer: &[u8]) -> bool {
-    if buffer.len() > MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES {
-        return false;
-    }
-    buffer.len() < 3 && b"[<".starts_with(buffer)
-        || buffer.starts_with(b"[<")
-            && buffer[2..]
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || *byte == b';')
-}
-
-fn discard_complete_orphaned_sgr_mouse_tail(buffer: &mut Vec<u8>) -> bool {
-    let Some(terminator_len) = buffer
-        .iter()
-        .position(|byte| matches!(*byte, b'M' | b'm'))
-        .map(|idx| idx + 1)
-    else {
-        return false;
-    };
-    if terminator_len > MAX_ORPHANED_SGR_MOUSE_TAIL_BYTES {
-        return false;
-    }
-    let mut sequence = Vec::with_capacity(terminator_len + 1);
-    sequence.push(ESC);
-    sequence.extend_from_slice(&buffer[..terminator_len]);
-    let Ok(sequence) = std::str::from_utf8(&sequence) else {
-        return false;
-    };
-    if parse_sgr_mouse(sequence).is_none() {
-        return false;
-    }
-    buffer.drain(..terminator_len);
-    true
-}
-
 fn discard_host_reply_csi_tail(buffer: &mut Vec<u8>, discarded_tail_bytes: &mut usize) -> bool {
     let remaining = MAX_DISCARDED_CONTROL_TAIL_BYTES.saturating_sub(*discarded_tail_bytes);
     let inspected = buffer.len().min(remaining);
@@ -1409,11 +2636,30 @@ enum SgrMouseContinuation {
 fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContinuation {
     let remaining = MAX_DISCARDED_CONTROL_TAIL_BYTES.saturating_sub(prefix.len());
     let tail = &tail[..tail.len().min(remaining)];
+
+    // A prefix can stop before the `[<` introducer is complete, and a further
+    // read supplies the rest.
+    let mut report = prefix.to_vec();
+    let mut consumed_from_tail = 0;
+    if let Some(rest) = b"\x1b[<"
+        .strip_prefix(prefix)
+        .filter(|rest| !rest.is_empty())
+    {
+        if tail.len() < rest.len() {
+            return SgrMouseContinuation::Incomplete;
+        }
+        if !tail.starts_with(rest) {
+            return SgrMouseContinuation::Invalid;
+        }
+        report.extend_from_slice(rest);
+        consumed_from_tail = rest.len();
+    }
+    let tail = &tail[consumed_from_tail..];
+
     let final_index = tail
         .iter()
         .position(|byte| !byte.is_ascii_digit() && *byte != b';');
     let payload_len = final_index.unwrap_or(tail.len());
-    let mut report = prefix.to_vec();
     report.extend_from_slice(&tail[..payload_len]);
     if !plausible_sgr_mouse_prefix(&report) {
         return SgrMouseContinuation::Invalid;
@@ -1425,7 +2671,7 @@ fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContin
             .and_then(parse_sgr_mouse)
             .is_some();
         return if valid {
-            SgrMouseContinuation::Complete(index + 1)
+            SgrMouseContinuation::Complete(consumed_from_tail + index + 1)
         } else {
             SgrMouseContinuation::Invalid
         };
@@ -1437,9 +2683,27 @@ fn classify_sgr_mouse_continuation(prefix: &[u8], tail: &[u8]) -> SgrMouseContin
     }
 }
 
+/// An incomplete CSI dropped at its timeout whose tail could still make it a
+/// key or focus report: `ESC [` and parameter or intermediate bytes. X10
+/// (`M`) and SGR (`<`) prefixes are handled elsewhere (ADR-0012 D3).
+fn is_dropped_csi_key_prefix(prefix: &[u8]) -> bool {
+    let Some(params) = prefix.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    !params.is_empty()
+        && prefix.len() < MAX_DISCARDED_CONTROL_TAIL_BYTES
+        && !matches!(params.first(), Some(b'M' | b'<'))
+        && params.iter().all(|byte| (0x20..=0x3f).contains(byte))
+}
+
 // Reject impossible continuations early, without changing the general mouse
 // parser. A partial last field (including zero) can still become valid.
 fn plausible_sgr_mouse_prefix(report: &[u8]) -> bool {
+    // The prefix may stop before the `[<` introducer is complete; the next
+    // read can still supply the rest of it.
+    if report == b"\x1b[" {
+        return true;
+    }
     let Some(body) = report.strip_prefix(b"\x1b[<") else {
         return false;
     };
@@ -1472,6 +2736,7 @@ fn plausible_sgr_mouse_prefix(report: &[u8]) -> bool {
     true
 }
 
+#[cfg(any(windows, test))]
 fn osc_string_terminator(buffer: &[u8]) -> Option<usize> {
     let st = find_subsequence(buffer, b"\x1b\\").map(|idx| idx + 2);
     let bel = buffer
@@ -1487,17 +2752,37 @@ fn osc_string_terminator(buffer: &[u8]) -> Option<usize> {
     }
 }
 
-fn st_string_terminator(buffer: &[u8]) -> Option<usize> {
-    find_subsequence(buffer, b"\x1b\\").map(|idx| idx + 2)
+/// Where a control string in `buffer` ends, searching from `from`: through
+/// its terminator (BEL when `bel`, or ST), or before an ESC whose next byte is
+/// not `\`. That ESC cannot start the ST, so it aborts the string, as in the
+/// terminal's own parser, and starts the next token; a new ESC as the next
+/// byte ends the string with the ESC before it (ADR-0013 amendment 1, D1).
+/// `None` while the string can still go on.
+fn control_string_end(buffer: &[u8], from: usize, bel: bool) -> Option<usize> {
+    for (index, byte) in buffer.iter().enumerate().skip(from) {
+        match *byte {
+            0x07 if bel => return Some(index + 1),
+            ESC => {
+                return match buffer.get(index + 1)? {
+                    b'\\' => Some(index + 2),
+                    &ESC => Some(index + 1),
+                    _ => Some(index),
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn control_string_terminator_for_family(
     buffer: &[u8],
+    from: usize,
     family: ControlStringFamily,
 ) -> Option<usize> {
     match family {
-        ControlStringFamily::Osc => osc_string_terminator(buffer),
-        ControlStringFamily::StTerminated => st_string_terminator(buffer),
+        ControlStringFamily::Osc => control_string_end(buffer, from, true),
+        ControlStringFamily::StTerminated => control_string_end(buffer, from, false),
         ControlStringFamily::HostReplyCsi => None,
     }
 }
@@ -1630,6 +2915,19 @@ fn parse_mouse_cb(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
 
     Some((kind, modifiers))
 }
+
+#[cfg(test)]
+mod hold_property_tests;
+#[cfg(test)]
+mod review_5251_r1_tests;
+#[cfg(test)]
+mod review_5251_r2_tests;
+#[cfg(test)]
+mod review_nxa8_r3_tests;
+#[cfg(test)]
+mod review_nxa8_r4_tests;
+#[cfg(test)]
+mod review_nxa8_r5_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2574,7 +3872,7 @@ mod tests {
         let mut framer = RawInputFramer::default();
 
         assert!(framer.push(b"\x1b[<3").is_empty());
-        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.idle_tick().is_empty());
         let events = framer.push(b"5;58;30Mx");
 
         assert_eq!(events.len(), 1);
@@ -2622,7 +3920,7 @@ mod tests {
             let mut rest = tail[split..].to_vec();
             rest.extend_from_slice(b"x\x1b[A");
             assert_eq!(framer.push(&rest), vec![b"x".to_vec(), b"\x1b[A".to_vec()]);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert!(!framer.has_pending_input());
         }
     }
@@ -2640,7 +3938,7 @@ mod tests {
             assert!(framer.push(b"\x1b[<3").is_empty());
             assert!(framer.flush_timeout().is_empty());
             assert_eq!(framer.push(tail).concat(), tail);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
         }
     }
 
@@ -2664,7 +3962,7 @@ mod tests {
             let mut expected = b"5;28;".to_vec();
             expected.extend_from_slice(suffix);
             assert_eq!(chunks.concat(), expected);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert_eq!(framer.push(b"123M").concat(), b"123M");
         }
     }
@@ -2679,7 +3977,7 @@ mod tests {
         let mut valid_tail = vec![b'0'; remaining - 2];
         valid_tail.extend_from_slice(b"1M");
         assert!(framer.push(&valid_tail).is_empty()); // complete exactly at limit
-        assert!(framer.timed_out_mouse_prefix.is_none());
+        assert!(framer.tail_hold.is_none());
 
         for length in [remaining, remaining + 1024] {
             let mut framer = RawInputByteFramer::default();
@@ -2687,7 +3985,7 @@ mod tests {
             assert!(framer.flush_timeout().is_empty());
             let tail = vec![b'0'; length];
             assert_eq!(framer.push(&tail).concat(), tail);
-            assert!(framer.timed_out_mouse_prefix.is_none());
+            assert!(framer.tail_hold.is_none());
             assert_eq!(framer.push(b"1Mtext").concat(), b"1Mtext");
         }
 
@@ -2699,7 +3997,7 @@ mod tests {
         assert!(framer.flush_timeout().is_empty());
         tail.extend_from_slice(b"01M");
         assert_eq!(framer.push(b"01M").concat(), tail);
-        assert!(framer.timed_out_mouse_prefix.is_none());
+        assert!(framer.tail_hold.is_none());
     }
 
     #[test]
@@ -2767,6 +4065,216 @@ mod tests {
             KeyCode::Char('x'),
             KeyModifiers::empty(),
         );
+    }
+
+    #[test]
+    fn three_fragment_sgr_mouse_tail_after_lone_escape_timeout_is_discarded() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+
+        // #5251: the orphaned tail split again after its bracket. The bare `[`
+        // must not be released as a key while the report can still complete.
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        let events = framer.push(b"<35;100;30Mx");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.byte_framer.has_pending_input());
+    }
+
+    #[test]
+    fn orphaned_sgr_mouse_tail_survives_every_read_split() {
+        let tail = b"[<35;100;30M";
+        for split in 0..=tail.len() {
+            let mut framer = RawInputFramer::default();
+            assert!(framer.push(b"\x1b").is_empty());
+            assert_eq!(framer.flush_timeout().len(), 1, "split {split}");
+
+            let mut events = Vec::new();
+            for byte in &tail[..split] {
+                events.extend(framer.push(&[*byte]));
+                events.extend(framer.flush_timeout());
+                events.extend(framer.flush_timeout());
+            }
+            events.extend(framer.push(&tail[split..]));
+            events.extend(framer.flush_timeout());
+            events.extend(framer.flush_timeout());
+            events.extend(framer.push(b"x"));
+            events.extend(framer.flush_timeout());
+
+            assert_eq!(events.len(), 1, "split {split}: {events:?}");
+            assert_raw_key(
+                events.into_iter().next().unwrap(),
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+            );
+            assert!(!framer.byte_framer.has_pending_input(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn orphaned_bracket_prefix_releases_ordinary_input() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+
+        // A bracket that does not become a mouse report is still user input,
+        // not something to drop on the next read.
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        let events = framer.push(b"abc");
+        let codes: Vec<_> = events
+            .into_iter()
+            .filter_map(|event| match event {
+                RawInputEvent::Key(key) => Some(key.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                KeyCode::Char('['),
+                KeyCode::Char('a'),
+                KeyCode::Char('b'),
+                KeyCode::Char('c')
+            ]
+        );
+    }
+
+    #[test]
+    fn retained_bracket_is_released_when_semantic_input_interrupts() {
+        let mut framer = RawInputFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout().len(), 1);
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        // Windows flushes before a semantic key record; the bracket was input.
+        let events = framer.flush_interrupted();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('['),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.byte_framer.has_pending_input());
+    }
+
+    #[test]
+    fn retained_bracket_is_released_after_its_hold_limit() {
+        let mut framer = RawInputByteFramer::default();
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert_eq!(framer.flush_timeout(), vec![vec![ESC]]);
+        assert!(framer.push(b"[").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.flush_timeout().is_empty());
+
+        // The caller must keep scheduling a flush for the held bracket.
+        assert!(framer.has_pending_input());
+        let wait = framer.held_input_release_ms().expect("bounded hold");
+        assert!(
+            (1..=REPORT_TAIL_LIMIT.as_millis() as i32 + 1).contains(&wait),
+            "{wait}"
+        );
+
+        framer.age_held_input(REPORT_TAIL_LIMIT);
+        assert_eq!(framer.flush_timeout(), vec![b"[".to_vec()]);
+        assert!(!framer.has_pending_input());
+        assert_eq!(framer.held_input_release_ms(), None);
+        assert_eq!(framer.push(b"a"), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn retained_mouse_prefix_stops_capturing_input_after_its_hold_limit() {
+        let mut framer = RawInputByteFramer::default();
+
+        assert!(framer.push(b"\x1b[<35;10").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        // The dropped prefix is not pending input; only its hold is open.
+        assert!(!framer.has_pending_input());
+        assert!(framer.tail_hold.is_some());
+
+        framer.age_held_input(REPORT_TAIL_LIMIT);
+        assert!(framer.flush_timeout().is_empty());
+        assert!(!framer.has_pending_input());
+        // Digits typed later are not taken for the old report's tail.
+        assert_eq!(framer.push(b"5"), vec![b"5".to_vec()]);
+    }
+
+    #[test]
+    fn sgr_mouse_tail_after_timed_out_csi_introducer_is_discarded() {
+        let mut framer = RawInputFramer::default();
+
+        // #5251: with mouse capture on, `ESC [` idles out after 50 ms and is
+        // released as Alt+[ before the rest of the report arrives.
+        assert!(framer.push(b"\x1b[").is_empty());
+        let events = framer.flush_timeout();
+        assert!(
+            matches!(&events[..], [RawInputEvent::Key(key)]
+                if key.code == KeyCode::Char('[') && key.modifiers == KeyModifiers::ALT),
+            "{events:?}"
+        );
+
+        let events = framer.push(b"<35;100;30Mx");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.byte_framer.has_pending_input());
+    }
+
+    #[test]
+    fn sgr_mouse_tail_after_timed_out_csi_introducer_survives_every_read_split() {
+        let tail = b"<35;100;30M";
+        for split in 0..=tail.len() {
+            let mut framer = RawInputFramer::default();
+            assert!(framer.push(b"\x1b[").is_empty());
+            assert_eq!(framer.flush_timeout().len(), 1, "split {split}");
+
+            let mut events = Vec::new();
+            events.extend(framer.push(&tail[..split]));
+            events.extend(framer.flush_timeout());
+            events.extend(framer.flush_timeout());
+            events.extend(framer.push(&tail[split..]));
+            events.extend(framer.push(b"x"));
+
+            assert_eq!(events.len(), 1, "split {split}: {events:?}");
+            assert_raw_key(
+                events.into_iter().next().unwrap(),
+                KeyCode::Char('x'),
+                KeyModifiers::empty(),
+            );
+            assert!(!framer.byte_framer.has_pending_input(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn text_after_timed_out_csi_introducer_is_preserved() {
+        let mut framer = RawInputByteFramer::default();
+        assert!(framer.push(b"\x1b[").is_empty());
+        assert_eq!(framer.flush_timeout(), vec![b"\x1b[".to_vec()]);
+        assert_eq!(framer.push(b"<x"), vec![b"<".to_vec(), b"x".to_vec()]);
+
+        // Past the split-read window a `<` is just typing.
+        let mut framer = RawInputByteFramer::default();
+        assert!(framer.push(b"\x1b[").is_empty());
+        assert_eq!(framer.flush_timeout(), vec![b"\x1b[".to_vec()]);
+        framer.age_held_input(REPORT_TAIL_LIMIT);
+        assert_eq!(framer.push(b"<"), vec![b"<".to_vec()]);
     }
 
     #[test]
@@ -3054,9 +4562,106 @@ mod tests {
 
         assert!(framer.push(b"\x1b]").is_empty());
         assert!(framer.flush_timeout().is_empty());
+        // `x` and `y` are outside the OSC color-reply alphabet, so they are
+        // input: delivered at once, not swallowed with the dropped header.
+        assert_eq!(framer.push(b"x"), vec![b"x".to_vec()]);
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(framer.push(b"y"), vec![b"y".to_vec()]);
+        assert!(!framer.has_pending_input());
+    }
+
+    #[test]
+    fn typed_hex_letters_after_discarded_osc_header_reach_the_pane() {
+        let mut framer = RawInputByteFramer::default();
+
+        assert!(framer.push(b"\x1b]").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        // `a` and `b` could be a color reply payload, so they are held as a
+        // bounded candidate, not discarded.
         assert!(framer.push(b"a").is_empty());
         assert!(framer.flush_timeout().is_empty());
-        assert_eq!(framer.push(b"b"), vec![b"b".to_vec()]);
+        assert!(framer.push(b"b").is_empty());
+        assert!(framer.has_pending_input());
+        let wait = framer.held_input_release_ms().expect("bounded hold");
+        assert!(
+            (1..=COLOR_REPLY_TAIL_LIMIT.as_millis() as i32 + 1).contains(&wait),
+            "{wait}"
+        );
+
+        framer.age_held_input(COLOR_REPLY_TAIL_LIMIT);
+        assert_eq!(framer.flush_timeout(), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(!framer.has_pending_input());
+        assert_eq!(framer.held_input_release_ms(), None);
+        assert_eq!(framer.push(b"c"), vec![b"c".to_vec()]);
+    }
+
+    #[test]
+    fn typed_hex_letters_after_discarded_osc_header_end_at_next_foreign_byte() {
+        let mut framer = RawInputByteFramer::default();
+
+        assert!(framer.push(b"\x1b]").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.push(b"a").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(
+            framer.push(b"bx"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"x".to_vec()]
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_after_discarded_osc_header_is_delivered() {
+        for held in [b"".as_slice(), b"ab"] {
+            let mut framer = RawInputFramer::default();
+
+            assert!(framer.push(b"\x1b]").is_empty());
+            assert!(framer.idle_tick().is_empty());
+            let mut events = framer.push(held);
+            events.extend(framer.idle_tick());
+            events.extend(framer.push(b"\x1b[200~hello world\x1b[201~"));
+
+            let pasted: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    RawInputEvent::Paste(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pasted, vec!["hello world"], "{held:?}: {events:?}");
+            assert_eq!(events.len(), 1 + held.len(), "{held:?}: {events:?}");
+            assert!(!framer.byte_framer.has_pending_input());
+        }
+    }
+
+    #[test]
+    fn terminator_typed_after_discarded_osc_bound_reaches_the_pane() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+            let mut framer = RawInputByteFramer::default();
+
+            assert!(framer.push(b"\x1b]").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            framer.age_held_input(COLOR_REPLY_TAIL_LIMIT);
+            let mut typed = framer.push(terminator);
+            typed.extend(framer.flush_timeout());
+            assert_eq!(typed.concat(), terminator.to_vec(), "{terminator:?}");
+        }
+    }
+
+    #[test]
+    fn discarded_osc_tail_is_dropped_only_through_its_terminator() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+            let mut framer = RawInputByteFramer::default();
+
+            assert!(framer.push(b"\x1b]4;50;").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.push(b"rgb:afaf/").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            let mut tail = b"d7d7/8787".to_vec();
+            tail.extend_from_slice(terminator);
+            tail.push(b'x');
+            assert_eq!(framer.push(&tail), vec![b"x".to_vec()], "{terminator:?}");
+            assert!(!framer.has_pending_input());
+        }
     }
 
     #[test]
@@ -3148,18 +4753,18 @@ mod tests {
         assert!(framer.flush_timeout().is_empty());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     #[test]
     fn windows_host_color_prefix_respects_query_deadline() {
         let mut framer = RawInputFramer::for_host_input();
         framer.host_default_color_query_sent(Duration::from_secs(1));
         assert!(framer.push(b"\x1b]10").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(framer.push(b";rgb:aaaa/").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(matches!(
             framer.push(b"bbbb/cccc\x1b\\").as_slice(),
@@ -3172,7 +4777,7 @@ mod tests {
         let mut expired = RawInputFramer::for_host_input();
         expired.host_default_color_query_sent(Duration::ZERO);
         assert!(expired.push(b"\x1b]11;").is_empty());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         assert!(matches!(
             expired.push(b"x").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
@@ -3186,16 +4791,16 @@ mod tests {
         ));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     #[test]
     fn windows_expired_host_color_reply_tail_does_not_reach_pane() {
         let mut framer = RawInputFramer::for_host_input();
         framer.host_default_color_query_sent(Duration::ZERO);
         assert!(framer.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.idle_tick().is_empty());
         assert!(framer.push(b"2222/").is_empty());
         for _ in 0..3 {
-            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.idle_tick().is_empty());
         }
         assert!(matches!(
             framer.push(b"3333\x1b\\x").as_slice(),
@@ -3205,9 +4810,9 @@ mod tests {
         let mut expired = RawInputFramer::for_host_input();
         expired.host_default_color_query_sent(Duration::ZERO);
         assert!(expired.push(b"\x1b]10;rgb:aaaa/").is_empty());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         expired.byte_framer.host_color_tail_deadline = Some(Instant::now());
-        assert!(expired.flush_timeout().is_empty());
+        assert!(expired.idle_tick().is_empty());
         assert!(matches!(
             expired.push(b"y").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('y')
@@ -3216,18 +4821,18 @@ mod tests {
         let mut raw_keyboard = RawInputFramer::for_host_input();
         raw_keyboard.host_default_color_query_sent(Duration::ZERO);
         assert!(raw_keyboard.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(raw_keyboard.flush_timeout().is_empty());
+        assert!(raw_keyboard.idle_tick().is_empty());
         assert!(raw_keyboard.push(b"a").is_empty());
         raw_keyboard.byte_framer.host_color_tail_deadline = Some(Instant::now());
         assert!(matches!(
-            raw_keyboard.flush_timeout().as_slice(),
+            raw_keyboard.idle_tick().as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('a')
         ));
 
         let mut split_st = RawInputFramer::for_host_input();
         split_st.host_default_color_query_sent(Duration::ZERO);
         assert!(split_st.push(b"\x1b]11;rgb:1111/2222/3333\x1b").is_empty());
-        assert!(split_st.flush_timeout().is_empty());
+        assert!(split_st.idle_tick().is_empty());
         assert!(matches!(
             split_st.push(b"\\x").as_slice(),
             [RawInputEvent::Key(key)] if key.code == KeyCode::Char('x')
@@ -3238,7 +4843,7 @@ mod tests {
         assert!(abandoned_st
             .push(b"\x1b]11;rgb:1111/2222/3333\x1b")
             .is_empty());
-        assert!(abandoned_st.flush_timeout().is_empty());
+        assert!(abandoned_st.idle_tick().is_empty());
         assert!(matches!(
             abandoned_st
                 .push(b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\")
@@ -3252,7 +4857,7 @@ mod tests {
         let mut next_reply = RawInputFramer::for_host_input();
         next_reply.host_default_color_query_sent(Duration::ZERO);
         assert!(next_reply.push(b"\x1b]11;rgb:1111/").is_empty());
-        assert!(next_reply.flush_timeout().is_empty());
+        assert!(next_reply.idle_tick().is_empty());
         assert!(next_reply.push(b"\x1b").is_empty());
         assert!(matches!(
             next_reply.push(b"]10;rgb:aaaa/bbbb/cccc\x1b\\").as_slice(),
@@ -3381,6 +4986,54 @@ mod tests {
             framer.age_partial_host_color_reply(gap);
         }
         assert_eq!(chunks, vec![pieces.concat()]);
+    }
+
+    #[test]
+    fn palette_reply_fragments_after_discarded_header_do_not_leak() {
+        // #5302: the OSC 4 header is dropped once it idles out, and the reply
+        // fragments that follow must be discarded with it, not typed.
+        let pieces: [&[u8]; 5] = [b"\x1b]4;50;", b"rgb:afaf/", b"d7d7/", b"8787", b"\x1b\\"];
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        let mut chunks = Vec::new();
+        for piece in pieces {
+            chunks.extend(framer.push(piece));
+            chunks.extend(framer.flush_timeout());
+            chunks.extend(framer.flush_timeout());
+        }
+        chunks.extend(framer.push(b"x"));
+
+        let events = events_from_framed_chunks(chunks);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.has_pending_input());
+    }
+
+    #[test]
+    fn palette_payload_bytes_after_discarded_header_do_not_leak() {
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        let mut chunks = framer.push(b"\x1b]4;50;");
+        chunks.extend(framer.flush_timeout());
+
+        for byte in b"rgb:afaf/d7d7/8787\x1b\\" {
+            chunks.extend(framer.push(&[*byte]));
+            chunks.extend(framer.flush_timeout());
+        }
+        chunks.extend(framer.push(b"x"));
+
+        let events = events_from_framed_chunks(chunks);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+        assert!(!framer.has_pending_input());
     }
 
     #[test]
@@ -3797,5 +5450,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn non_reply_events(events: &[RawInputEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter(|event| !is_host_reply_event(event))
+            .map(|event| format!("{event:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn color_reply_after_released_escape_does_not_leak() {
+        let cases: [(&[u8], &[u8]); 4] = [
+            (b"]10;rgb:afaf/", b"d7d7/8787\x07x"),
+            (b"]11;rgb:afaf/", b"d7d7/8787\x07x"),
+            (b"]10;rgb:afaf/", b"d7d7/8787\x1b\\x"),
+            (b"]11;rgb:afaf/", b"d7d7/8787\x1b\\x"),
+        ];
+        for (first, second) in cases {
+            let mut framer = RawInputFramer::default();
+            framer.byte_framer.host_color_query_sent();
+
+            // The reply split after its ESC, and both idle flushes ran: the
+            // first held the ESC, the second released it as a key.
+            assert!(framer.push(b"\x1b").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            assert_eq!(framer.flush_timeout().len(), 1);
+
+            let mut events = framer.push(first);
+            events.extend(framer.flush_timeout());
+            events.extend(framer.flush_timeout());
+            events.extend(framer.push(second));
+
+            let typed = non_reply_events(&events);
+            assert_eq!(typed.len(), 1, "{first:?} {second:?}: {events:?}");
+            let event = events
+                .into_iter()
+                .find(|event| !is_host_reply_event(event))
+                .unwrap();
+            assert_raw_key(event, KeyCode::Char('x'), KeyModifiers::empty());
+            assert!(!framer.byte_framer.has_pending_input());
+        }
+    }
+
+    #[test]
+    fn color_reply_split_inside_its_header_after_released_escape_does_not_leak() {
+        let reply = b"]11;rgb:afaf/d7d7/8787\x07";
+        for split in 1..reply.len() {
+            let mut framer = RawInputFramer::default();
+            framer.byte_framer.host_color_query_sent();
+            assert!(framer.push(b"\x1b").is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            assert_eq!(framer.flush_timeout().len(), 1);
+
+            let mut events = framer.push(&reply[..split]);
+            events.extend(framer.flush_timeout());
+            events.extend(framer.flush_timeout());
+            events.extend(framer.push(&reply[split..]));
+            events.extend(framer.push(b"x"));
+
+            assert_eq!(
+                non_reply_events(&events).len(),
+                1,
+                "split {split}: {events:?}"
+            );
+            assert!(!framer.byte_framer.has_pending_input(), "split {split}");
+        }
+    }
+
+    #[test]
+    fn bracket_typed_after_escape_during_color_query_is_bounded() {
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(framer.flush_timeout(), vec![vec![ESC]]);
+
+        // `]` could start the reply's header, so it waits, but only while
+        // the reply can still arrive.
+        assert!(framer.push(b"]").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert!(framer.held_input_release_ms().is_some());
+        framer.age_held_input(HOST_REPLY_QUIET_WINDOW);
+        assert_eq!(framer.flush_timeout(), vec![b"]".to_vec()]);
+        assert_eq!(framer.held_input_release_ms(), None);
+
+        // Text that cannot be a reply header is never held.
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        assert_eq!(framer.flush_timeout(), vec![vec![ESC]]);
+        assert_eq!(framer.push(b"]x"), vec![b"]".to_vec(), b"x".to_vec()]);
     }
 }
