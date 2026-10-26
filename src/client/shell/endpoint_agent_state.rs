@@ -376,6 +376,52 @@ mod tests {
         assert_eq!(settled.agents[0].agent_status, AgentStatus::Idle);
     }
 
+    // herdr-3iee premise: an agent restored or detected in the state the pane
+    // already had keeps the previous agent's state_change_seq (pi Blocked at
+    // seq 4, then Claude Blocked at seq 4). The operator's acknowledgement of
+    // pi does not hide Claude's prompt: acknowledgement projects Idle and Done
+    // only.
+    #[test]
+    fn acknowledged_blocked_agent_replaced_at_the_same_seq_stays_blocked() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut baseline = snapshot(AgentStatus::Working, 3, 1);
+        presentation.project_snapshot(&mut baseline);
+        let mut pi = snapshot(AgentStatus::Blocked, 4, 2);
+        pi.agents[0].agent = Some("pi".into());
+        presentation.project_snapshot(&mut pi);
+        assert!(presentation.acknowledge_surface(&mut pi, &surface(2), Some(true)));
+        let mut claude = snapshot(AgentStatus::Blocked, 4, 3);
+        claude.agents[0].agent = Some("claude".into());
+
+        presentation.project_snapshot(&mut claude);
+
+        assert_eq!(claude.agents[0].agent_status, AgentStatus::Blocked);
+        assert!(!presentation.acknowledge_surface(&mut claude, &surface(3), Some(true)));
+        assert_eq!(claude.agents[0].agent_status, AgentStatus::Blocked);
+    }
+
+    // herdr-3iee premise, the completion half: pi's unacknowledged Done at seq
+    // 4 is not inherited by a Claude that takes the pane Idle at seq 4, since
+    // the server's completion companion drops pi's completion with pi.
+    #[test]
+    fn completion_of_an_agent_replaced_at_the_same_seq_is_not_inherited() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut baseline = snapshot(AgentStatus::Working, 3, 1);
+        presentation.project_snapshot(&mut baseline);
+        presentation.receive_completions(None, completions(&baseline.boot_id, 2, Some(4)));
+        let mut pi = snapshot(AgentStatus::Done, 4, 2);
+        pi.agents[0].agent = Some("pi".into());
+        presentation.project_snapshot(&mut pi);
+        assert_eq!(pi.agents[0].agent_status, AgentStatus::Done);
+        presentation.receive_completions(None, completions(&baseline.boot_id, 3, None));
+        let mut claude = snapshot(AgentStatus::Idle, 4, 3);
+        claude.agents[0].agent = Some("claude".into());
+
+        presentation.project_snapshot(&mut claude);
+
+        assert_eq!(claude.agents[0].agent_status, AgentStatus::Idle);
+    }
+
     #[test]
     fn completion_guard_companion_is_scoped_to_boot_revision_and_connection() {
         for (boot, revision, generation, seq) in [
