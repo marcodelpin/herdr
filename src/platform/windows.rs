@@ -1778,24 +1778,24 @@ fn carries_pane_runtime_marker(
 
 /// Whether foreground selection could pick `pid` for this pane: a descendant
 /// of the pane shell, or an escaped Git Bash agent with the pane's marker.
+/// Each read answers `None` when it failed, and so does the result.
 fn process_belongs_to_pane(
     shell_pid: u32,
     pid: u32,
     snapshot: &ProcessSnapshot,
-    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
-    mut runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
-) -> bool {
-    if process_is_ancestor(shell_pid, pid, snapshot) {
-        return true;
-    }
-    let (Some(shell), Some(entry)) = (snapshot.entry(shell_pid), snapshot.entry(pid)) else {
-        return false;
-    };
-    shell_is_git_bash(shell)
-        && process_entry_identifies_agent(entry)
-        && pane_runtime_marker(shell, &mut runtime_marker).is_some_and(|pane_marker| {
-            carries_pane_runtime_marker(entry, &pane_marker, &mut runtime_marker)
-        })
+    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> Option<bool>,
+    runtime_marker: impl Fn(&WindowsProcessEntry) -> Option<Option<String>>,
+) -> Option<bool> {
+    let shell = snapshot.entry(shell_pid);
+    let entry = snapshot.entry(pid);
+    super::pane_membership(
+        shell.is_some() && entry.is_some(),
+        process_is_ancestor(shell_pid, pid, snapshot),
+        || shell.and_then(shell_is_git_bash),
+        || entry.map(process_entry_identifies_agent),
+        || shell.and_then(&runtime_marker),
+        || entry.and_then(&runtime_marker),
+    )
 }
 
 /// Creation time of `pid`. It tells a process apart from a later one that
@@ -1825,25 +1825,24 @@ pub fn pane_process_liveness(
             PaneProcessLiveness::Unknown
         };
     };
-    if !identity.running() {
-        return PaneProcessLiveness::Gone;
-    }
-    match identity.creation_time() {
-        Some(creation_time) if creation_time == start_token => {}
-        Some(_) => return PaneProcessLiveness::Gone,
-        None => return PaneProcessLiveness::Unknown,
-    }
-    if process_belongs_to_pane(
-        shell_pid,
+    super::held_process_liveness(
         pid,
-        &cached_foreground_processes(),
-        |shell| process_is_git_bash(shell.pid),
-        |entry| process_runtime_marker(entry.pid),
-    ) {
-        PaneProcessLiveness::Alive(pid)
-    } else {
-        PaneProcessLiveness::Gone
-    }
+        Some(identity.running()),
+        || {
+            identity
+                .creation_time()
+                .map(|creation_time| creation_time == start_token)
+        },
+        || {
+            process_belongs_to_pane(
+                shell_pid,
+                pid,
+                &cached_foreground_processes(),
+                |shell| Some(process_is_git_bash(shell.pid)),
+                |entry| Some(process_runtime_marker(entry.pid)),
+            )
+        },
+    )
 }
 
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
@@ -4541,11 +4540,14 @@ mod tests {
         let snapshot = super::ProcessSnapshot::new(entries);
         let marker = |pane: &'static str| {
             move |entry: &super::WindowsProcessEntry| {
-                Some(if entry.pid == 10 { "pane-a" } else { pane }.to_string())
+                Some(Some(
+                    if entry.pid == 10 { "pane-a" } else { pane }.to_string(),
+                ))
             }
         };
         let belongs = |pid, git_bash, pane| {
-            super::process_belongs_to_pane(10, pid, &snapshot, |_| git_bash, marker(pane))
+            super::process_belongs_to_pane(10, pid, &snapshot, |_| Some(git_bash), marker(pane))
+                == Some(true)
         };
 
         assert!(belongs(11, false, "pane-b"), "descendant of the shell");
@@ -4568,7 +4570,8 @@ mod tests {
             "agent whose parent chain no longer reaches the shell"
         );
         assert!(
-            !super::process_belongs_to_pane(60, 11, &snapshot, |_| true, marker("pane-a")),
+            super::process_belongs_to_pane(60, 11, &snapshot, |_| Some(true), marker("pane-a"))
+                != Some(true),
             "pane shell gone"
         );
     }

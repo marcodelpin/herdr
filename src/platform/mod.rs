@@ -436,6 +436,58 @@ pub enum PaneProcessLiveness {
     Unknown,
 }
 
+/// Liveness of a held agent on a platform that reads its facts one at a time,
+/// as Windows does. Each read answers `None` when it failed.
+#[cfg(any(windows, test))]
+pub(crate) fn held_process_liveness(
+    pid: u32,
+    running: Option<bool>,
+    start_token_matches: impl FnOnce() -> Option<bool>,
+    in_pane: impl FnOnce() -> Option<bool>,
+) -> PaneProcessLiveness {
+    if !running.unwrap_or(false) {
+        return PaneProcessLiveness::Gone;
+    }
+    match start_token_matches() {
+        Some(true) => {}
+        Some(false) => return PaneProcessLiveness::Gone,
+        None => return PaneProcessLiveness::Unknown,
+    }
+    if in_pane().unwrap_or(false) {
+        PaneProcessLiveness::Alive(pid)
+    } else {
+        PaneProcessLiveness::Gone
+    }
+}
+
+/// Whether a held agent still belongs to its pane on Windows: a descendant of
+/// the pane shell, or an escaped Git Bash agent that carries the pane's
+/// runtime marker. `listed` says the process table holds both the shell and
+/// the agent. Each read answers `None` when it failed.
+#[cfg(any(windows, test))]
+pub(crate) fn pane_membership(
+    listed: bool,
+    descends_from_shell: bool,
+    shell_is_git_bash: impl FnOnce() -> Option<bool>,
+    identifies_agent: impl FnOnce() -> Option<bool>,
+    shell_marker: impl FnOnce() -> Option<Option<String>>,
+    agent_marker: impl FnOnce() -> Option<Option<String>>,
+) -> Option<bool> {
+    if descends_from_shell {
+        return Some(true);
+    }
+    if !listed {
+        return Some(false);
+    }
+    if !shell_is_git_bash().unwrap_or(false) || !identifies_agent().unwrap_or(false) {
+        return Some(false);
+    }
+    let Some(pane_marker) = shell_marker().flatten().filter(|marker| !marker.is_empty()) else {
+        return Some(false);
+    };
+    Some(agent_marker().flatten().as_deref() == Some(pane_marker.as_str()))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {
     if job.process_group_id != child_pid
@@ -637,6 +689,123 @@ fn child_exit_classification_only_checkpoints_interruptions() {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_process_liveness_keeps_an_agent_whose_exit_code_query_failed() {
+        assert_eq!(
+            held_process_liveness(20, None, || Some(true), || Some(true)),
+            PaneProcessLiveness::Unknown,
+            "a failed exit-code query proves nothing"
+        );
+        assert_eq!(
+            held_process_liveness(20, Some(false), || Some(true), || Some(true)),
+            PaneProcessLiveness::Gone,
+            "an observed exit code other than still active"
+        );
+        assert_eq!(
+            held_process_liveness(20, Some(true), || Some(true), || Some(true)),
+            PaneProcessLiveness::Alive(20)
+        );
+        assert_eq!(
+            held_process_liveness(20, Some(true), || Some(false), || Some(true)),
+            PaneProcessLiveness::Gone,
+            "a later process reusing the pid"
+        );
+        assert_eq!(
+            held_process_liveness(20, Some(true), || None, || Some(true)),
+            PaneProcessLiveness::Unknown,
+            "a failed creation time read"
+        );
+    }
+
+    #[test]
+    fn held_process_liveness_keeps_an_agent_whose_membership_read_failed() {
+        let marker = |value: &str| Some(Some(value.to_string()));
+        let membership = |listed, git_bash, agent, shell_marker, agent_marker| {
+            pane_membership(
+                listed,
+                false,
+                || git_bash,
+                || agent,
+                || shell_marker,
+                || agent_marker,
+            )
+        };
+
+        assert_eq!(
+            held_process_liveness(20, Some(true), || Some(true), || None),
+            PaneProcessLiveness::Unknown,
+            "a failed membership read proves nothing"
+        );
+        assert_eq!(
+            held_process_liveness(20, Some(true), || Some(true), || Some(false)),
+            PaneProcessLiveness::Gone,
+            "a read that shows the agent outside the pane"
+        );
+
+        let pane = marker("pane-a");
+        assert_eq!(
+            membership(true, Some(true), Some(true), pane.clone(), None),
+            None,
+            "the agent's runtime marker could not be read"
+        );
+        assert_eq!(
+            membership(true, Some(true), Some(true), None, pane.clone()),
+            None,
+            "the shell's runtime marker could not be read"
+        );
+        assert_eq!(
+            membership(false, Some(true), Some(true), pane.clone(), pane.clone()),
+            None,
+            "a failed process snapshot lists neither process"
+        );
+        assert_eq!(
+            membership(true, None, Some(true), pane.clone(), pane.clone()),
+            None,
+            "the shell executable could not be read"
+        );
+        assert_eq!(
+            membership(true, Some(true), None, pane.clone(), pane.clone()),
+            None,
+            "the agent command line could not be read"
+        );
+
+        assert_eq!(
+            membership(true, Some(true), Some(true), pane.clone(), pane.clone()),
+            Some(true),
+            "an escaped agent with the pane marker"
+        );
+        assert_eq!(
+            membership(true, Some(true), Some(true), pane.clone(), marker("pane-b")),
+            Some(false),
+            "a marker from another pane"
+        );
+        assert_eq!(
+            membership(true, Some(true), Some(true), pane.clone(), Some(None)),
+            Some(false),
+            "an agent without a marker"
+        );
+        assert_eq!(
+            membership(true, Some(true), Some(true), Some(None), pane.clone()),
+            Some(false),
+            "a shell without a marker"
+        );
+        assert_eq!(
+            membership(true, Some(false), None, None, None),
+            Some(false),
+            "escape only applies to Git Bash"
+        );
+        assert_eq!(
+            membership(true, None, Some(false), None, None),
+            Some(false),
+            "an escaped process that is not an agent"
+        );
+        assert_eq!(
+            pane_membership(false, true, || None, || None, || None, || None),
+            Some(true),
+            "a descendant of the pane shell"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
