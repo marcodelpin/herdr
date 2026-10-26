@@ -2237,13 +2237,12 @@ mod tests {
             .collect()
     }
 
-    // codex c1o5-r8 P2 (ADR-0008 round 7, rule 19): custom:pi witnessed at t2;
-    // a native Claude acquisition and Working observation from t0/t1 < t2 are
-    // deferred; the release of custom:pi seq 2 replays them. The published
-    // update releases pi with its own final status and announces Claude with
-    // its status; nothing gives pi Claude's status.
-    #[test]
-    fn a_release_publishes_the_released_agent_and_the_agent_it_leaves() {
+    // codex c1o5-r8 P2 (ADR-0008 round 7, rule 19): custom:pi witnessed at t2
+    // in `pi_state`; a native Claude acquisition and Working observation from
+    // t0/t1 < t2 are deferred; the release of custom:pi seq 2 replays them. The
+    // published update releases pi with its own final status and announces
+    // Claude with its status; nothing gives pi Claude's status.
+    fn assert_a_release_publishes_the_released_agent_and_the_agent_it_leaves(pi_state: AgentState) {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -2265,7 +2264,7 @@ mod tests {
         terminal.set_hook_authority_naming_agent_at(
             "custom:pi".into(),
             "pi".into(),
-            AgentState::Blocked,
+            pi_state,
             None,
             None,
             Some(1),
@@ -2320,6 +2319,68 @@ mod tests {
                 expected_events,
             ),
             "{update:?}"
+        );
+    }
+
+    #[test]
+    fn a_release_publishes_the_released_agent_and_the_agent_it_leaves() {
+        assert_a_release_publishes_the_released_agent_and_the_agent_it_leaves(AgentState::Blocked);
+    }
+
+    // codex c1o5-r9 P2 (ADR-0008 round 7, rule 19 c): pi Working is released
+    // over a deferred Claude Working. The status is equal, the subject is not:
+    // the status event names Claude, or a status subscriber keeps pi Working.
+    #[test]
+    fn a_release_restoring_an_agent_with_the_same_status_publishes_its_status() {
+        assert_a_release_publishes_the_released_agent_and_the_agent_it_leaves(AgentState::Working);
+    }
+
+    // ADR-0008 round 7, rule 19 c: the status event follows its subject without
+    // a release too - a detected agent replaced by another one in the same
+    // status publishes the new agent's status.
+    #[test]
+    fn an_agent_change_with_the_same_status_publishes_the_new_agents_status() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("agent-change");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Working);
+        let before = event_hub.events_after(0).len();
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Claude),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        assert_eq!(
+            app.state.terminals[&terminal_id].effective_agent_label(),
+            Some("claude")
+        );
+        assert_eq!(
+            release_publication_agent_events(&event_hub, before),
+            [
+                "detected Some(\"claude\") released=false final=None",
+                "status Some(\"claude\") Working",
+            ]
         );
     }
 
