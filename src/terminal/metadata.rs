@@ -86,7 +86,12 @@ impl TerminalState {
             return false;
         };
         let exited_agent_label = crate::detect::agent_label(exit.agent);
-        agent_label.and_then(crate::detect::parse_agent_label) == Some(exit.agent)
+        // herdr-jht1: once the live authority naming the exited agent was
+        // witnessed after the exit (ADR-0008 round 4, rule 14), a report that
+        // only names that agent describes the process holding the pane. The
+        // exited agent's own source still names the exited process.
+        (agent_label.and_then(crate::detect::parse_agent_label) == Some(exit.agent)
+            && !self.recorded_exit_superseded())
             || crate::agent_resume::is_official_agent_source(source, exited_agent_label)
             || applies_to_source.is_some_and(|source| {
                 crate::agent_resume::is_official_agent_source(source, exited_agent_label)

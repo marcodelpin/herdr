@@ -4590,6 +4590,135 @@ mod tests {
             .is_empty());
     }
 
+    /// herdr-jht1: a native Claude exits in the pane, then the tmux bridge
+    /// reports the Claude the pane shows, a process its shell did not start;
+    /// `witnessed` says whether the report names that process (herdr-c1o5).
+    /// Returns the app, the public pane id and the pane's terminal id.
+    fn app_with_exited_claude_then_bridge_report(
+        witnessed: bool,
+    ) -> (App, String, crate::terminal::TerminalId) {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let detected_at = std::time::Instant::now();
+        let exit_at = detected_at + std::time::Duration::from_millis(10);
+        let reported_at = detected_at + std::time::Duration::from_millis(30);
+        let named_agent = if witnessed {
+            crate::terminal::NamedAgentVerdict::Witnessed {
+                observed_at: reported_at,
+            }
+        } else {
+            crate::terminal::NamedAgentVerdict::Unnamed
+        };
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        for (agent, state, process_exited, at) in [
+            (Some(Agent::Claude), AgentState::Idle, false, detected_at),
+            (Some(Agent::Claude), AgentState::Idle, true, exit_at),
+            (
+                None,
+                AgentState::Unknown,
+                false,
+                exit_at + std::time::Duration::from_millis(1),
+            ),
+        ] {
+            terminal.set_detected_state_with_screen_signals_at(
+                agent,
+                state,
+                false,
+                false,
+                false,
+                process_exited,
+                at,
+            );
+        }
+        terminal.set_hook_authority_naming_agent_at(
+            "tmux-bridge:claude-0123456789ab".into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(1),
+            named_agent,
+            reported_at,
+        );
+        (app, pane_id, terminal_id)
+    }
+
+    fn ccwait_tokens_params(
+        pane_id: String,
+        source: &str,
+        value: &str,
+    ) -> PaneReportMetadataParams {
+        let mut params = metadata_params(pane_id);
+        params.source = source.into();
+        params.agent = Some("claude".into());
+        params.title = None;
+        params.tokens = std::collections::HashMap::from([("ver_acct".into(), Some(value.into()))]);
+        params.seq = Some(1);
+        params
+    }
+
+    // herdr-jht1 (c1o5 residual): the bridge's Claude was witnessed alive
+    // after the native Claude's recorded exit, so the exit is superseded
+    // (ADR-0008 round 4, rule 14) and herdr-ccwait's tokens naming claude
+    // describe the Claude that holds the pane. The exited Claude's own
+    // source stays dropped.
+    #[test]
+    fn pane_metadata_naming_an_exited_agent_applies_once_a_later_witness_holds_the_pane() {
+        let (mut app, pane_id, terminal_id) = app_with_exited_claude_then_bridge_report(true);
+        assert_eq!(
+            app.state.terminals[&terminal_id].effective_agent_label(),
+            Some("claude")
+        );
+
+        let response = app.handle_pane_report_metadata(
+            "ccwait".into(),
+            ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.300 live"),
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let response = app.handle_pane_report_metadata(
+            "official".into(),
+            ccwait_tokens_params(pane_id, "herdr:claude", "exited"),
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            (
+                terminal.metadata_tokens.values(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)),
+                terminal.metadata_report_sequence_is_fresh("herdr:claude", Some(1)),
+            ),
+            (
+                std::collections::HashMap::from([("ver_acct".into(), "2.1.300 live".into())]),
+                false,
+                true,
+            )
+        );
+    }
+
+    // herdr-jht1 negative control: a bridge report naming no process does not
+    // show a Claude other than the exited one, so the exit still stands and
+    // herdr-ccwait's tokens naming claude stay dropped.
+    #[test]
+    fn pane_metadata_naming_an_exited_agent_stays_dropped_without_a_later_witness() {
+        let (mut app, pane_id, terminal_id) = app_with_exited_claude_then_bridge_report(false);
+
+        let response = app.handle_pane_report_metadata(
+            "ccwait".into(),
+            ccwait_tokens_params(pane_id, "herdr:ccwait", "2.1.300 late"),
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.metadata_tokens.values().is_empty());
+        assert!(terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)));
+    }
+
     #[test]
     fn pane_metadata_ignored_after_process_exit_does_not_poison_sequence() {
         let (mut app, pane_id) = app_with_test_workspace();
