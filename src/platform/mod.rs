@@ -437,7 +437,8 @@ pub enum PaneProcessLiveness {
 }
 
 /// Liveness of a held agent on a platform that reads its facts one at a time,
-/// as Windows does. Each read answers `None` when it failed.
+/// as Windows does. Each read answers `None` when it failed, and only a read
+/// that succeeded may prove the agent gone.
 #[cfg(any(windows, test))]
 pub(crate) fn held_process_liveness(
     pid: u32,
@@ -445,25 +446,29 @@ pub(crate) fn held_process_liveness(
     start_token_matches: impl FnOnce() -> Option<bool>,
     in_pane: impl FnOnce() -> Option<bool>,
 ) -> PaneProcessLiveness {
-    if !running.unwrap_or(false) {
-        return PaneProcessLiveness::Gone;
+    match running {
+        Some(true) => {}
+        Some(false) => return PaneProcessLiveness::Gone,
+        None => return PaneProcessLiveness::Unknown,
     }
     match start_token_matches() {
         Some(true) => {}
         Some(false) => return PaneProcessLiveness::Gone,
         None => return PaneProcessLiveness::Unknown,
     }
-    if in_pane().unwrap_or(false) {
-        PaneProcessLiveness::Alive(pid)
-    } else {
-        PaneProcessLiveness::Gone
+    match in_pane() {
+        Some(true) => PaneProcessLiveness::Alive(pid),
+        Some(false) => PaneProcessLiveness::Gone,
+        None => PaneProcessLiveness::Unknown,
     }
 }
 
 /// Whether a held agent still belongs to its pane on Windows: a descendant of
 /// the pane shell, or an escaped Git Bash agent that carries the pane's
 /// runtime marker. `listed` says the process table holds both the shell and
-/// the agent. Each read answers `None` when it failed.
+/// the agent: a held agent missing from it, or with its shell missing, means
+/// the table was not read. Each read answers `None` when it failed, and so does
+/// the result unless a read that succeeded already decides it.
 #[cfg(any(windows, test))]
 pub(crate) fn pane_membership(
     listed: bool,
@@ -477,15 +482,22 @@ pub(crate) fn pane_membership(
         return Some(true);
     }
     if !listed {
+        return None;
+    }
+    let shell_is_git_bash = shell_is_git_bash();
+    if shell_is_git_bash == Some(false) {
         return Some(false);
     }
-    if !shell_is_git_bash().unwrap_or(false) || !identifies_agent().unwrap_or(false) {
+    let identifies_agent = identifies_agent();
+    if identifies_agent == Some(false) {
         return Some(false);
     }
-    let Some(pane_marker) = shell_marker().flatten().filter(|marker| !marker.is_empty()) else {
+    shell_is_git_bash?;
+    identifies_agent?;
+    let Some(pane_marker) = shell_marker()?.filter(|marker| !marker.is_empty()) else {
         return Some(false);
     };
-    Some(agent_marker().flatten().as_deref() == Some(pane_marker.as_str()))
+    Some(agent_marker()?.as_deref() == Some(pane_marker.as_str()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

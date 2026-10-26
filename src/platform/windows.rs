@@ -901,16 +901,22 @@ impl ProcessIdentity {
     }
 
     fn running(&self) -> bool {
+        self.exit_status() == Some(true)
+    }
+
+    /// Whether the process is still active; `None` when the exit code query
+    /// failed, which proves nothing.
+    fn exit_status(&self) -> Option<bool> {
         match self {
             Self::Handle(handle) => {
                 let mut exit_code = 0;
                 let read = unsafe {
                     GetExitCodeProcess(handle.as_raw_handle().cast(), &mut exit_code) != 0
                 };
-                read && exit_code == STILL_ACTIVE
+                read.then_some(exit_code == STILL_ACTIVE)
             }
             #[cfg(test)]
-            Self::Stub { running, .. } => *running,
+            Self::Stub { running, .. } => Some(*running),
         }
     }
 
@@ -1792,7 +1798,7 @@ fn process_belongs_to_pane(
         shell.is_some() && entry.is_some(),
         process_is_ancestor(shell_pid, pid, snapshot),
         || shell.and_then(shell_is_git_bash),
-        || entry.map(process_entry_identifies_agent),
+        || entry.and_then(process_entry_identifies_agent_read),
         || shell.and_then(&runtime_marker),
         || entry.and_then(&runtime_marker),
     )
@@ -1827,7 +1833,7 @@ pub fn pane_process_liveness(
     };
     super::held_process_liveness(
         pid,
-        Some(identity.running()),
+        identity.exit_status(),
         || {
             identity
                 .creation_time()
@@ -1838,11 +1844,21 @@ pub fn pane_process_liveness(
                 shell_pid,
                 pid,
                 &cached_foreground_processes(),
-                |shell| Some(process_is_git_bash(shell.pid)),
-                |entry| Some(process_runtime_marker(entry.pid)),
+                |shell| process_git_bash_read(shell.pid),
+                |entry| process_runtime_marker_read(entry.pid),
             )
         },
     )
+}
+
+/// Whether `entry` is an agent; `None` when its name does not say so and its
+/// command line could not be read.
+fn process_entry_identifies_agent_read(entry: &WindowsProcessEntry) -> Option<bool> {
+    if crate::detect::identify_agent(&entry.name).is_some() {
+        return Some(true);
+    }
+    entry.command().cmdline.as_ref()?;
+    Some(crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some())
 }
 
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
@@ -2205,12 +2221,14 @@ impl WindowsProcessCommand {
 }
 
 fn process_is_git_bash(pid: u32) -> bool {
-    let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
-        return false;
-    };
-    let Some(creation_time) = process_creation_time(process.0) else {
-        return false;
-    };
+    process_git_bash_read(pid).unwrap_or(false)
+}
+
+/// Whether `pid` runs Git Bash; `None` when the process or its executable path
+/// could not be read. A failed read is not cached.
+fn process_git_bash_read(pid: u32) -> Option<bool> {
+    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let creation_time = process_creation_time(process.0)?;
     {
         let mut cache = GIT_BASH_PROCESS_CACHE
             .lock()
@@ -2218,14 +2236,13 @@ fn process_is_git_bash(pid: u32) -> bool {
         if let Some(cached) = cache.get_mut(&pid) {
             if cached.creation_time == creation_time {
                 cached.last_used = Instant::now();
-                return cached.is_git_bash;
+                return Some(cached.is_git_bash);
             }
         }
     }
 
-    let is_git_bash = process_executable_path(process.0)
-        .as_deref()
-        .is_some_and(|path| is_git_bash_executable_path(std::path::Path::new(path)));
+    let is_git_bash =
+        is_git_bash_executable_path(std::path::Path::new(&process_executable_path(process.0)?));
     let mut cache = GIT_BASH_PROCESS_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -2245,7 +2262,7 @@ fn process_is_git_bash(pid: u32) -> bool {
             last_used: Instant::now(),
         },
     );
-    is_git_bash
+    Some(is_git_bash)
 }
 
 fn process_executable_path(process: HANDLE) -> Option<String> {
@@ -2329,6 +2346,12 @@ fn is_git_bash_executable_path(path: &std::path::Path) -> bool {
 }
 
 fn process_runtime_marker(pid: u32) -> Option<String> {
+    process_runtime_marker_read(pid).flatten()
+}
+
+/// The pane runtime marker in the environment of `pid`: `Some(None)` when the
+/// environment was read and carries none, `None` when it could not be read.
+fn process_runtime_marker_read(pid: u32) -> Option<Option<String>> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
     let creation_time = process_creation_time(process.0)?;
     {
@@ -2341,7 +2364,7 @@ fn process_runtime_marker(pid: u32) -> Option<String> {
                     || cached.cached_at.elapsed() < PROCESS_RUNTIME_MARKER_NEGATIVE_TTL)
             {
                 cached.last_used = Instant::now();
-                return cached.marker.clone();
+                return Some(cached.marker.clone());
             }
         }
     }
@@ -2367,7 +2390,7 @@ fn process_runtime_marker(pid: u32) -> Option<String> {
             last_used: Instant::now(),
         },
     );
-    marker
+    Some(marker)
 }
 
 fn process_creation_time(process: HANDLE) -> Option<u64> {
@@ -4573,6 +4596,56 @@ mod tests {
             super::process_belongs_to_pane(60, 11, &snapshot, |_| Some(true), marker("pane-a"))
                 != Some(true),
             "pane shell gone"
+        );
+    }
+
+    #[test]
+    fn windows_held_agent_membership_keeps_failed_reads_unknown() {
+        let entries = vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry_without_cmdline(21, 99, "node.exe", 7),
+        ];
+        let snapshot = super::ProcessSnapshot::new(entries);
+        let pane_marker = |_: &super::WindowsProcessEntry| Some(Some("pane-a".to_string()));
+        let shell_marker_only = |entry: &super::WindowsProcessEntry| {
+            (entry.pid == 10).then(|| Some("pane-a".to_string()))
+        };
+
+        assert_eq!(
+            super::process_belongs_to_pane(10, 20, &snapshot, |_| Some(true), pane_marker),
+            Some(true)
+        );
+        assert_eq!(
+            super::process_belongs_to_pane(10, 20, &snapshot, |_| Some(true), shell_marker_only),
+            None,
+            "the agent's runtime marker could not be read"
+        );
+        assert_eq!(
+            super::process_belongs_to_pane(10, 20, &snapshot, |_| Some(true), |_| None),
+            None,
+            "the shell's runtime marker could not be read"
+        );
+        assert_eq!(
+            super::process_belongs_to_pane(10, 20, &snapshot, |_| None, pane_marker),
+            None,
+            "the shell executable could not be read"
+        );
+        assert_eq!(
+            super::process_belongs_to_pane(10, 21, &snapshot, |_| Some(true), pane_marker),
+            None,
+            "the agent command line could not be read"
+        );
+        assert_eq!(
+            super::process_belongs_to_pane(
+                10,
+                20,
+                &super::ProcessSnapshot::new(Vec::new()),
+                |_| Some(true),
+                pane_marker,
+            ),
+            None,
+            "a failed process snapshot"
         );
     }
 
