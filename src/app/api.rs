@@ -739,7 +739,16 @@ impl App {
             .map(|pane| pane_agent_status(update.state, pane.seen))
             .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
 
+        // herdr-c1o5 (ADR-0008 round 7, rule 19 c): the status event follows
+        // its subject, the agent it names, as well as the status. An agent
+        // that takes the pane in the status the pane already had (restored by
+        // a release, or detected in place of another) is published, or a
+        // status subscriber keeps the agent it last read.
+        let (status_agent_label, status_known_agent) = update.status_agent();
+        let status_subject_changed = update.previous_agent_label.as_deref() != status_agent_label
+            || update.previous_known_agent != status_known_agent;
         if previous_agent_status != agent_status
+            || status_subject_changed
             || update.previous_presentation != update.presentation
         {
             let presentation = update.presentation.clone();
@@ -749,7 +758,7 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.status_agent().0.map(str::to_string),
+                    agent: status_agent_label.map(str::to_string),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     state_labels: presentation.state_labels,
