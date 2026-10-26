@@ -500,6 +500,102 @@ pub(crate) fn pane_membership(
     Some(agent_marker()?.as_deref() == Some(pane_marker.as_str()))
 }
 
+/// The exit code Windows reports for a process that is still running.
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_STILL_ACTIVE: u32 = 259;
+
+/// The error OpenProcess sets for a pid that names no process.
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
+
+/// The reads Windows makes on an opened held agent, each as the raw API
+/// result: `None` when the call failed.
+#[cfg(any(windows, test))]
+pub(crate) trait HeldProcessReads {
+    /// The code GetExitCodeProcess reported.
+    fn exit_code(&self) -> Option<u32>;
+    /// The creation time of the process.
+    fn creation_time(&self) -> Option<u64>;
+    /// Whether foreground selection could still pick the process for its pane.
+    fn in_pane(&self) -> Option<bool>;
+}
+
+/// Liveness of a held agent on Windows from the result of opening it:
+/// `Err` carries the OS error code OpenProcess set, if any. Only an open that
+/// names no process, or a read that succeeded, may prove the agent gone.
+#[cfg(any(windows, test))]
+pub(crate) fn opened_held_process_liveness(
+    pid: u32,
+    start_token: u64,
+    opened: Result<impl HeldProcessReads, Option<i32>>,
+) -> PaneProcessLiveness {
+    let reads = match opened {
+        Ok(reads) => reads,
+        Err(Some(WINDOWS_ERROR_INVALID_PARAMETER)) => return PaneProcessLiveness::Gone,
+        Err(_) => return PaneProcessLiveness::Unknown,
+    };
+    held_process_liveness(
+        pid,
+        reads
+            .exit_code()
+            .map(|exit_code| exit_code == WINDOWS_STILL_ACTIVE),
+        || {
+            reads
+                .creation_time()
+                .map(|creation_time| creation_time == start_token)
+        },
+        || reads.in_pane(),
+    )
+}
+
+/// Whether `path` names a regular file; `None` when its metadata could not be
+/// read, which proves nothing. Only a read that finds no entry proves absence.
+#[cfg(any(windows, test))]
+pub(crate) fn path_is_file_read(path: &std::path::Path) -> Option<bool> {
+    Some(path.is_file())
+}
+
+/// Whether `path` is the bash.exe of a Git for Windows install; `None` when a
+/// file check it needed failed. `is_file` answers as `path_is_file_read`.
+#[cfg(any(windows, test))]
+pub(crate) fn git_bash_executable_path_read(
+    path: &std::path::Path,
+    is_file: impl Fn(&std::path::Path) -> Option<bool>,
+) -> Option<bool> {
+    use std::ffi::OsStr;
+
+    let named = |path: &std::path::Path, name: &str| {
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|file_name| file_name.eq_ignore_ascii_case(name))
+    };
+    if !named(path, "bash.exe") || !path.is_absolute() {
+        return Some(false);
+    }
+    if !is_file(path)? {
+        return Some(false);
+    }
+    let Some(bin_dir) = path.parent().filter(|bin_dir| named(bin_dir, "bin")) else {
+        return Some(false);
+    };
+    let Some(mut root) = bin_dir.parent() else {
+        return Some(false);
+    };
+    if named(root, "usr") {
+        let Some(parent) = root.parent() else {
+            return Some(false);
+        };
+        root = parent;
+    }
+
+    let msys = is_file(&root.join("usr").join("bin").join("msys-2.0.dll"));
+    let git = is_file(&root.join("cmd").join("git.exe"));
+    if msys == Some(false) || git == Some(false) {
+        return Some(false);
+    }
+    Some(msys? && git?)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {
     if job.process_group_id != child_pid
@@ -817,6 +913,178 @@ mod tests {
             Some(true),
             "a descendant of the pane shell"
         );
+    }
+
+    struct StubHeldProcess {
+        exit_code: Option<u32>,
+        creation_time: Option<u64>,
+        in_pane: Option<bool>,
+    }
+
+    impl HeldProcessReads for StubHeldProcess {
+        fn exit_code(&self) -> Option<u32> {
+            self.exit_code
+        }
+
+        fn creation_time(&self) -> Option<u64> {
+            self.creation_time
+        }
+
+        fn in_pane(&self) -> Option<bool> {
+            self.in_pane
+        }
+    }
+
+    #[test]
+    fn opened_held_process_liveness_keeps_an_agent_whose_api_reads_failed() {
+        let liveness = |exit_code, creation_time, in_pane| {
+            opened_held_process_liveness(
+                20,
+                7,
+                Ok::<_, Option<i32>>(StubHeldProcess {
+                    exit_code,
+                    creation_time,
+                    in_pane,
+                }),
+            )
+        };
+        let active = Some(WINDOWS_STILL_ACTIVE);
+
+        assert_eq!(
+            liveness(None, Some(7), Some(true)),
+            PaneProcessLiveness::Unknown,
+            "GetExitCodeProcess failed"
+        );
+        assert_eq!(
+            liveness(Some(0), Some(7), Some(true)),
+            PaneProcessLiveness::Gone,
+            "an exit code other than still active"
+        );
+        assert_eq!(
+            liveness(active, Some(7), Some(true)),
+            PaneProcessLiveness::Alive(20)
+        );
+        assert_eq!(
+            liveness(active, None, Some(true)),
+            PaneProcessLiveness::Unknown,
+            "the creation time query failed"
+        );
+        assert_eq!(
+            liveness(active, Some(8), Some(true)),
+            PaneProcessLiveness::Gone,
+            "a later process reusing the pid"
+        );
+        assert_eq!(
+            liveness(active, Some(7), None),
+            PaneProcessLiveness::Unknown,
+            "the membership read failed"
+        );
+        assert_eq!(
+            liveness(active, Some(7), Some(false)),
+            PaneProcessLiveness::Gone,
+            "the agent left the pane"
+        );
+
+        let not_opened =
+            |error| opened_held_process_liveness(20, 7, Err::<StubHeldProcess, _>(error));
+        assert_eq!(
+            not_opened(Some(WINDOWS_ERROR_INVALID_PARAMETER)),
+            PaneProcessLiveness::Gone,
+            "OpenProcess names no process"
+        );
+        assert_eq!(
+            not_opened(Some(5)),
+            PaneProcessLiveness::Unknown,
+            "OpenProcess was denied access"
+        );
+        assert_eq!(
+            not_opened(None),
+            PaneProcessLiveness::Unknown,
+            "OpenProcess failed without an error code"
+        );
+    }
+
+    #[test]
+    fn git_bash_executable_path_read_keeps_a_failed_file_check_unknown() {
+        use std::path::Path;
+
+        let bash = Path::new("/git/usr/bin/bash.exe");
+        let check = |failed: &'static str, missing: &'static str| {
+            git_bash_executable_path_read(bash, move |path: &Path| {
+                let path = path.to_string_lossy();
+                if path.ends_with(failed) {
+                    None
+                } else {
+                    Some(!path.ends_with(missing))
+                }
+            })
+        };
+
+        assert_eq!(check("-", "-"), Some(true), "a Git for Windows bash");
+        assert_eq!(check("git.exe", "-"), None, "cmd/git.exe could not be read");
+        assert_eq!(
+            check("msys-2.0.dll", "-"),
+            None,
+            "msys-2.0.dll could not be read"
+        );
+        assert_eq!(check("bash.exe", "-"), None, "bash.exe could not be read");
+        assert_eq!(
+            check("git.exe", "msys-2.0.dll"),
+            Some(false),
+            "a read that found msys-2.0.dll missing decides"
+        );
+        assert_eq!(check("-", "git.exe"), Some(false), "no cmd/git.exe");
+        assert_eq!(
+            git_bash_executable_path_read(Path::new("/git/usr/bin/zsh.exe"), |_| None),
+            Some(false),
+            "not bash.exe"
+        );
+        assert_eq!(
+            git_bash_executable_path_read(Path::new("/git/usr/lib/bash.exe"), |_| Some(true)),
+            Some(false),
+            "bash.exe outside a bin directory"
+        );
+    }
+
+    #[test]
+    fn path_is_file_read_tells_a_failed_metadata_read_from_a_missing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-path-is-file-read-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let locked = root.join("cmd");
+        std::fs::create_dir_all(&locked).expect("create dir");
+        let file = root.join("file");
+        std::fs::write(&file, b"").expect("write file");
+        std::fs::write(locked.join("git.exe"), b"").expect("write locked file");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("lock dir");
+        // A process that can still read the locked directory, such as root,
+        // cannot observe the failure this test needs.
+        let denied = std::fs::metadata(locked.join("git.exe")).is_err();
+
+        let answers = (
+            path_is_file_read(&file),
+            path_is_file_read(&root.join("missing")),
+            path_is_file_read(&file.join("below-a-file")),
+            path_is_file_read(&root),
+            path_is_file_read(&locked.join("git.exe")),
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock dir");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(answers.0, Some(true), "a regular file");
+        assert_eq!(answers.1, Some(false), "no such file");
+        assert_eq!(answers.2, Some(false), "a parent that is a file");
+        assert_eq!(answers.3, Some(false), "a directory");
+        if denied {
+            assert_eq!(answers.4, None, "access denied proves nothing");
+        }
     }
 
     #[cfg(target_os = "linux")]

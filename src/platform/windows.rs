@@ -516,7 +516,7 @@ use windows_sys::{
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
-const STILL_ACTIVE: u32 = 259;
+const STILL_ACTIVE: u32 = super::WINDOWS_STILL_ACTIVE;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
 const FOREGROUND_SELECTION_RECHECK: Duration = Duration::from_secs(5);
 const FOREGROUND_SELECTION_CACHE_CAPACITY: usize = 1_024;
@@ -901,22 +901,22 @@ impl ProcessIdentity {
     }
 
     fn running(&self) -> bool {
-        self.exit_status() == Some(true)
+        self.exit_code() == Some(STILL_ACTIVE)
     }
 
-    /// Whether the process is still active; `None` when the exit code query
-    /// failed, which proves nothing.
-    fn exit_status(&self) -> Option<bool> {
+    /// The exit code of the process; `None` when the query failed, which
+    /// proves nothing.
+    fn exit_code(&self) -> Option<u32> {
         match self {
             Self::Handle(handle) => {
                 let mut exit_code = 0;
                 let read = unsafe {
                     GetExitCodeProcess(handle.as_raw_handle().cast(), &mut exit_code) != 0
                 };
-                read.then_some(exit_code == STILL_ACTIVE)
+                read.then_some(exit_code)
             }
             #[cfg(test)]
-            Self::Stub { running, .. } => Some(*running),
+            Self::Stub { running, .. } => Some(if *running { STILL_ACTIVE } else { 0 }),
         }
     }
 
@@ -1818,37 +1818,43 @@ pub fn pane_process_liveness(
     pid: u32,
     start_token: u64,
 ) -> super::PaneProcessLiveness {
-    use super::PaneProcessLiveness;
+    // OpenProcess rejects a pid with no process as an invalid parameter; any
+    // other failure, such as access denied, proves nothing.
+    let opened = ProcessIdentity::open(pid)
+        .map(|identity| HeldProcess {
+            identity,
+            shell_pid,
+            pid,
+        })
+        .ok_or_else(|| std::io::Error::last_os_error().raw_os_error());
+    super::opened_held_process_liveness(pid, start_token, opened)
+}
 
-    let Some(identity) = ProcessIdentity::open(pid) else {
-        // OpenProcess rejects a pid with no process as an invalid parameter;
-        // any other failure, such as access denied, proves nothing.
-        let no_such_process = std::io::Error::last_os_error().raw_os_error()
-            == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32);
-        return if no_such_process {
-            PaneProcessLiveness::Gone
-        } else {
-            PaneProcessLiveness::Unknown
-        };
-    };
-    super::held_process_liveness(
-        pid,
-        identity.exit_status(),
-        || {
-            identity
-                .creation_time()
-                .map(|creation_time| creation_time == start_token)
-        },
-        || {
-            process_belongs_to_pane(
-                shell_pid,
-                pid,
-                &cached_foreground_processes(),
-                |shell| process_git_bash_read(shell.pid),
-                |entry| process_runtime_marker_read(entry.pid),
-            )
-        },
-    )
+/// An opened held agent and the pane shell it must still belong to.
+struct HeldProcess {
+    identity: ProcessIdentity,
+    shell_pid: u32,
+    pid: u32,
+}
+
+impl super::HeldProcessReads for HeldProcess {
+    fn exit_code(&self) -> Option<u32> {
+        self.identity.exit_code()
+    }
+
+    fn creation_time(&self) -> Option<u64> {
+        self.identity.creation_time()
+    }
+
+    fn in_pane(&self) -> Option<bool> {
+        process_belongs_to_pane(
+            self.shell_pid,
+            self.pid,
+            &cached_foreground_processes(),
+            |shell| process_git_bash_read(shell.pid),
+            |entry| process_runtime_marker_read(entry.pid),
+        )
+    }
 }
 
 /// Whether `entry` is an agent; `None` when its name does not say so and its
@@ -2241,8 +2247,11 @@ fn process_git_bash_read(pid: u32) -> Option<bool> {
         }
     }
 
-    let is_git_bash =
-        is_git_bash_executable_path(std::path::Path::new(&process_executable_path(process.0)?));
+    // A failed file check is returned before the cache, so it is retried.
+    let is_git_bash = super::git_bash_executable_path_read(
+        std::path::Path::new(&process_executable_path(process.0)?),
+        super::path_is_file_read,
+    )?;
     let mut cache = GIT_BASH_PROCESS_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -2308,41 +2317,9 @@ fn command_uses_git_bash(command: &portable_pty::CommandBuilder) -> bool {
     })
 }
 
+/// Spawn-time check: a failed file check reads as not Git Bash, as before.
 fn is_git_bash_executable_path(path: &std::path::Path) -> bool {
-    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    if !file_name.eq_ignore_ascii_case("bash.exe") || !path.is_absolute() || !path.is_file() {
-        return false;
-    }
-
-    let Some(bin_dir) = path.parent() else {
-        return false;
-    };
-    if !bin_dir
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("bin"))
-    {
-        return false;
-    }
-
-    let Some(mut root) = bin_dir.parent() else {
-        return false;
-    };
-    if root
-        .file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("usr"))
-    {
-        let Some(parent) = root.parent() else {
-            return false;
-        };
-        root = parent;
-    }
-
-    root.join("usr").join("bin").join("msys-2.0.dll").is_file()
-        && root.join("cmd").join("git.exe").is_file()
+    super::git_bash_executable_path_read(path, super::path_is_file_read).unwrap_or(false)
 }
 
 fn process_runtime_marker(pid: u32) -> Option<String> {
