@@ -552,7 +552,18 @@ pub(crate) fn opened_held_process_liveness(
 /// read, which proves nothing. Only a read that finds no entry proves absence.
 #[cfg(any(windows, test))]
 pub(crate) fn path_is_file_read(path: &std::path::Path) -> Option<bool> {
-    Some(path.is_file())
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.is_file()),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Some(false)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Whether `path` is the bash.exe of a Git for Windows install; `None` when a
