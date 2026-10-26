@@ -234,11 +234,12 @@ mod tests {
 
     // herdr-upm + herdr-6w2f: the operator layout row 1 (the outer repo's
     // docs/herdr-sidebar-config.toml carries the same rows; tests/test_sidebar_layout_docs.py keeps
-    // them equal). Thresholds 50/80 on `$ctx_num`. The machine name is neutral until measured; the
-    // `$ctx` cell is the indicator on a single-endpoint client, where `machine` renders nothing.
+    // them equal). Thresholds 50/80 on `$ctx_num`. The machine name is neutral until measured.
+    // herdr-44e3 (operator 2026-10-26, restating herdr-upm): row 1 carries no `$ctx` text cell, so
+    // a single-endpoint client, where `machine` renders nothing, shows no context signal.
     const CTX_LAYOUT: &str = r##"
 rows = [
-  ["state_icon", { token = "machine", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 49, fg = "#f9e2af" }, { source = "$ctx_num", lt = 50, fg = "#a6e3a1" }] }, "workspace", "tab", { token = "$ctx", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 49, fg = "#f9e2af" }, { source = "$ctx_num", lt = 50, hide = true }] }, { token = "$ver_acct", dim = true }, { token = "$ver_old", fg = "#f38ba8", bold = true }],
+  ["state_icon", { token = "machine", rules = [{ source = "$ctx_num", gt = 80, fg = "#f38ba8" }, { source = "$ctx_num", gt = 49, fg = "#f9e2af" }, { source = "$ctx_num", lt = 50, fg = "#a6e3a1" }] }, "workspace", "tab", { token = "$ver_acct", dim = true }, { token = "$ver_old", fg = "#f38ba8", bold = true }],
   ["state_text", { token = "$wait", fg = "#f9e2af" }, { token = "$stale", fg = "#f38ba8", bold = true }],
 ]
 "##;
@@ -293,33 +294,33 @@ rows = [
         }
     }
 
-    // herdr-6w2f: the single-endpoint renderer supplies no machine name, so the `machine` token is
-    // omitted; the `$ctx` cell must then carry the warning, and stay out of a healthy row.
+    // herdr-44e3: row 1 renders no context text in any state, with or without a machine name; the
+    // machine colour is the only context indicator.
     #[test]
-    fn single_endpoint_rows_keep_a_context_warning() {
-        let ctx_cell = |row: &[ResolvedToken]| {
-            row.iter()
-                .find(|token| matches!(token.kind, ResolvedTokenKind::Custom(ref value) if value.ends_with('%')))
-                .cloned()
-        };
+    fn row_one_renders_no_context_text() {
         for machine in [None, Some("dcc")] {
-            for (ctx, color) in [("81", Some(RED)), ("50", Some(YELLOW)), ("49", None)] {
-                let row = ctx_row(machine, Some(ctx));
-                let cell = ctx_cell(&row);
-                match color {
-                    Some(color) => {
-                        let cell = cell.unwrap_or_else(|| panic!("ctx {ctx} {machine:?}: no cell"));
-                        assert_eq!(cell.kind, ResolvedTokenKind::Custom(format!("{ctx}%")));
-                        assert_eq!(fg(&cell), rgb(color), "ctx {ctx} {machine:?}");
-                    }
-                    None => assert_eq!(cell, None, "a healthy row shows no ctx cell: {machine:?}"),
-                }
-            }
-            assert_eq!(
-                ctx_cell(&ctx_row(machine, None)),
+            for ctx in [
                 None,
-                "never measured: {machine:?}"
-            );
+                Some("0"),
+                Some("49"),
+                Some("50"),
+                Some("80"),
+                Some("81"),
+                Some("100"),
+            ] {
+                let row = ctx_row(machine, ctx);
+                for token in &row {
+                    if let ResolvedTokenKind::Custom(ref value) = token.kind {
+                        assert!(!value.contains('%'), "ctx {ctx:?} {machine:?}: {value}");
+                    }
+                }
+                assert_eq!(
+                    row.iter()
+                        .any(|token| matches!(token.kind, ResolvedTokenKind::Machine(_))),
+                    machine.is_some(),
+                    "ctx {ctx:?} {machine:?}"
+                );
+            }
         }
     }
 
