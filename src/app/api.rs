@@ -2449,6 +2449,55 @@ mod tests {
         );
     }
 
+    // codex c1o5-r10 P3 (ADR-0008 round 7, rule 19 c): the negative control of
+    // the status subject. Pi is Idle and seen; a native exit releases it, no
+    // agent is left and the status stays Idle with the same presentation. The
+    // status subject is still pi (the released agent), so only the release is
+    // published; comparing against the effective agent (none) instead would
+    // also publish `status Some("pi") Idle`.
+    #[test]
+    fn an_equal_status_exit_that_leaves_no_agent_publishes_only_the_release() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("equal-status-exit");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        workspace.pane_state_mut(pane_id).unwrap().seen = true;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let before = event_hub.events_after(0).len();
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(terminal.effective_agent_label(), None);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(
+            release_publication_agent_events(&event_hub, before),
+            ["detected Some(\"pi\") released=true final=Some(Idle)"]
+        );
+    }
+
     #[test]
     fn overlay_exit_layout_updated_uses_restored_zoom_state() {
         let event_hub = crate::api::EventHub::default();
