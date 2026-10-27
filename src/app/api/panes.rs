@@ -4940,6 +4940,106 @@ mod tests {
         );
     }
 
+    // herdr-d3jk (codex d3jk-r1 P3), the API tokens path: a source sends a
+    // title naming claude without a sequence, the native Claude exits at t1,
+    // the bridge's Claude is witnessed at t2 > t1, and the same source sends
+    // tokens only at seq 200 naming no agent, so no report of it ever named an
+    // agent with a sequence. Only then is the exit stamped t1 delivered: it
+    // clears the old title naming claude, but the seq 200 report recorded when
+    // its watermark was accepted, so the superseded exit keeps the watermark
+    // and the exited Claude's delayed seq 100 stays dropped instead of
+    // overwriting the live Claude's tokens.
+    #[test]
+    fn pane_metadata_unlabelled_token_watermark_survives_a_superseded_exit_clearing_a_labelled_title(
+    ) {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                false,
+                std::time::Instant::now(),
+            );
+        let mut title = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "unused");
+        title.title = Some("native claude".into());
+        title.tokens = std::collections::HashMap::new();
+        title.seq = None;
+        let response = app.handle_pane_report_metadata("title".into(), title);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.terminals[&terminal_id]
+            .agent_metadata
+            .contains_key("herdr:ccwait"));
+        let exit_at = instant_after(std::time::Instant::now());
+        let witnessed_at = instant_after(exit_at);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_hook_authority_naming_agent_at(
+                BRIDGE_CLAUDE_SOURCE.into(),
+                "claude".into(),
+                AgentState::Idle,
+                None,
+                None,
+                Some(1),
+                crate::terminal::NamedAgentVerdict::Witnessed {
+                    observed_at: witnessed_at,
+                },
+                witnessed_at,
+            );
+        let mut live = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.300 live");
+        live.agent = None;
+        live.seq = Some(200);
+        let response = app.handle_pane_report_metadata("live".into(), live);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                true,
+                exit_at,
+            );
+        let mut late = ccwait_tokens_params(pane_id, "herdr:ccwait", "2.1.299 exited");
+        late.seq = Some(100);
+        let response = app.handle_pane_report_metadata("late".into(), late);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            (
+                terminal.effective_agent_label(),
+                terminal.agent_metadata.contains_key("herdr:ccwait"),
+                terminal.metadata_tokens.values(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(200)),
+            ),
+            (
+                Some("claude"),
+                false,
+                std::collections::HashMap::from([("ver_acct".into(), "2.1.300 live".into())]),
+                false,
+            )
+        );
+    }
+
     #[test]
     fn pane_metadata_ignored_after_process_exit_does_not_poison_sequence() {
         let (mut app, pane_id) = app_with_test_workspace();
