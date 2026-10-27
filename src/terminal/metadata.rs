@@ -120,15 +120,23 @@ impl TerminalState {
         }
         self.metadata_report_sequences
             .insert(source.to_string(), seq);
-        if let Some(agent) = agent {
-            self.metadata_report_agents.insert(
-                source.to_string(),
-                super::MetadataReportOwner {
-                    agent,
-                    accepted_at: Instant::now(),
-                },
-            );
-        }
+        // herdr-d3jk (codex jht1-r2 P2): every accepted sequenced report
+        // refreshes when its watermark was accepted, so a superseded exit
+        // older than the report keeps it. A report naming no agent keeps the
+        // agent the source last named: the sequence stays that agent's
+        // generation, reset when that agent exits.
+        let agent = agent.or_else(|| {
+            self.metadata_report_agents
+                .get(source)
+                .and_then(|owner| owner.agent)
+        });
+        self.metadata_report_agents.insert(
+            source.to_string(),
+            super::MetadataReportOwner {
+                agent,
+                accepted_at: Instant::now(),
+            },
+        );
         if includes_tokens {
             self.metadata_token_sequence_sources
                 .insert(source.to_string());
@@ -1324,6 +1332,164 @@ mod tests {
                 terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(200)),
             ),
             (Some("live claude"), false)
+        );
+    }
+
+    /// herdr-d3jk: the first instant later than `earlier`, so a report
+    /// accepted before `earlier` and one accepted after the returned instant
+    /// fall on either side of an exit stamped between them.
+    fn instant_after(earlier: Instant) -> Instant {
+        loop {
+            let now = Instant::now();
+            if now > earlier {
+                return now;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// herdr-d3jk: a native claude detected, `herdr:ccwait` metadata naming
+    /// claude accepted at seq 50, then the bridge's claude witnessed after an
+    /// exit instant later than that report. Returns the exit instant, which
+    /// the caller delivers.
+    fn terminal_with_watermark_before_exit_then_witness() -> (TerminalState, Instant) {
+        let mut terminal = test_terminal();
+        observe(&mut terminal, Some(Agent::Claude), false, Instant::now());
+        assert!(terminal
+            .set_agent_metadata(ccwait_title("native claude", 50))
+            .is_some());
+        let exit_at = instant_after(Instant::now());
+        witness(
+            &mut terminal,
+            "tmux-bridge:claude-0123456789ab",
+            "claude",
+            instant_after(exit_at),
+        );
+        (terminal, exit_at)
+    }
+
+    // herdr-d3jk (codex jht1-r2 P2), the set_agent_metadata path: a source
+    // names claude at seq 50 before the native claude's exit at t1, the
+    // bridge's claude is witnessed at t2 > t1, and the same source reports
+    // seq 200 naming no agent; only then is the exit stamped t1 delivered.
+    // The unlabelled report refreshed the time its watermark was accepted,
+    // so the superseded exit keeps it and the exited claude's delayed seq 100
+    // stays dropped.
+    #[test]
+    fn presentation_watermark_advanced_by_an_unlabelled_report_survives_a_late_superseded_exit() {
+        let (mut terminal, exit_at) = terminal_with_watermark_before_exit_then_witness();
+        let mut unlabelled = ccwait_title("live claude", 200);
+        unlabelled.agent_label = None;
+        assert!(terminal.set_agent_metadata(unlabelled).is_some());
+        observe(&mut terminal, Some(Agent::Claude), true, exit_at);
+        assert!(terminal.recorded_exit_superseded());
+
+        let delayed = terminal.set_agent_metadata(ccwait_title("exited claude", 100));
+
+        assert_eq!(
+            (
+                delayed.is_none(),
+                terminal.effective_presentation().title.as_deref(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(200)),
+            ),
+            (true, Some("live claude"), false)
+        );
+    }
+
+    // herdr-3z9a (codex jht1-r2 P3): metadata naming claude is accepted
+    // before the native claude's exit at t1, the bridge's claude is witnessed
+    // at t2 > t1, and the exit stamped t1 is delivered. The watermark is older
+    // than the exit that supersedes it, so the exit resets it: the claude
+    // holding the pane restarts its sequence at 1 and that report applies.
+    #[test]
+    fn presentation_watermark_accepted_before_a_superseded_exit_is_reset_by_it() {
+        let (mut terminal, exit_at) = terminal_with_watermark_before_exit_then_witness();
+        observe(&mut terminal, Some(Agent::Claude), true, exit_at);
+        assert!(terminal.recorded_exit_superseded());
+
+        let restarted = terminal.set_agent_metadata(ccwait_title("restarted claude", 1));
+
+        assert_eq!(
+            (
+                restarted.is_some(),
+                terminal.effective_presentation().title.as_deref(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)),
+            ),
+            (true, Some("restarted claude"), false)
+        );
+    }
+
+    // herdr-3z9a (codex d3jk-r1 P3): the native claude's exit is stamped at
+    // exactly the instant herdr accepted metadata naming claude at seq 50, the
+    // bridge's claude is witnessed later, and the exit is delivered. A
+    // watermark accepted at the exit instant is not newer than the exit, so
+    // the superseded exit resets it and the restarted claude's seq 1 applies.
+    #[test]
+    fn presentation_watermark_accepted_at_the_exit_instant_is_reset_by_the_superseded_exit() {
+        let mut terminal = test_terminal();
+        observe(&mut terminal, Some(Agent::Claude), false, Instant::now());
+        assert!(terminal
+            .set_agent_metadata(ccwait_title("native claude", 50))
+            .is_some());
+        let exit_at = terminal.metadata_report_agents["herdr:ccwait"].accepted_at;
+        witness(
+            &mut terminal,
+            "tmux-bridge:claude-0123456789ab",
+            "claude",
+            instant_after(exit_at),
+        );
+        observe(&mut terminal, Some(Agent::Claude), true, exit_at);
+        assert!(terminal.recorded_exit_superseded());
+
+        let restarted = terminal.set_agent_metadata(ccwait_title("restarted claude", 1));
+
+        assert_eq!(
+            (
+                restarted.is_some(),
+                terminal.effective_presentation().title.as_deref(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)),
+            ),
+            (true, Some("restarted claude"), false)
+        );
+    }
+
+    // herdr-d3jk (codex d3jk-r1 P3): a source names claude at seq 50, then
+    // reports seq 200 naming no agent, both before the native claude's exit at
+    // t1; the bridge's claude is witnessed at t2 > t1 and the exit stamped t1
+    // is delivered. The unlabelled report kept the agent the source last
+    // named, so the exit resets that claude generation's sequence, although
+    // the source's current title names no agent, and the restarted claude's
+    // seq 1 applies.
+    #[test]
+    fn presentation_watermark_advanced_by_an_unlabelled_report_before_a_superseded_exit_is_reset_by_it(
+    ) {
+        let mut terminal = test_terminal();
+        observe(&mut terminal, Some(Agent::Claude), false, Instant::now());
+        assert!(terminal
+            .set_agent_metadata(ccwait_title("native claude", 50))
+            .is_some());
+        let mut unlabelled = ccwait_title("native claude", 200);
+        unlabelled.agent_label = None;
+        assert!(terminal.set_agent_metadata(unlabelled).is_some());
+        let exit_at = instant_after(Instant::now());
+        witness(
+            &mut terminal,
+            "tmux-bridge:claude-0123456789ab",
+            "claude",
+            instant_after(exit_at),
+        );
+        observe(&mut terminal, Some(Agent::Claude), true, exit_at);
+        assert!(terminal.recorded_exit_superseded());
+
+        let restarted = terminal.set_agent_metadata(ccwait_title("restarted claude", 1));
+
+        assert_eq!(
+            (
+                restarted.is_some(),
+                terminal.effective_presentation().title.as_deref(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(1)),
+            ),
+            (true, Some("restarted claude"), false)
         );
     }
 }

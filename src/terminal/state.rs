@@ -242,10 +242,12 @@ struct RecentAgentProcessExit {
 
 /// The agent the last sequenced metadata report of a source named, and when
 /// herdr accepted that report: herdr-jht1, an exit the live witness already
-/// supersedes keeps a watermark newer than it.
+/// supersedes keeps a watermark newer than it. herdr-d3jk: a report naming no
+/// agent keeps the agent the source last named (`None` if it never named one)
+/// and still refreshes the acceptance instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetadataReportOwner {
-    agent: Agent,
+    agent: Option<Agent>,
     accepted_at: Instant,
 }
 
@@ -838,7 +840,7 @@ impl TerminalState {
                 }
                 let mut exited_generation_sources = Vec::new();
                 self.metadata_report_agents.retain(|source, owner| {
-                    if owner.agent == agent && !kept_watermarks.contains(source) {
+                    if owner.agent == Some(agent) && !kept_watermarks.contains(source) {
                         exited_generation_sources.push(source.clone());
                         false
                     } else {
