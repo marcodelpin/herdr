@@ -240,6 +240,15 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// The agent the last sequenced metadata report of a source named, and when
+/// herdr accepted that report: herdr-jht1, an exit the live witness already
+/// supersedes keeps a watermark newer than it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetadataReportOwner {
+    agent: Agent,
+    accepted_at: Instant,
+}
+
 /// ADR-0008 round 4, consumer 3: the latest detector observation rule 13 did
 /// not apply, older than the live witness. The producer believes it published
 /// it and publishes on change only, so herdr applies it once no witness
@@ -287,7 +296,7 @@ pub struct TerminalState {
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
     metadata_report_sequences: HashMap<String, u64>,
-    metadata_report_agents: HashMap<String, Agent>,
+    metadata_report_agents: HashMap<String, MetadataReportOwner>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
@@ -780,6 +789,27 @@ impl TerminalState {
             }
             if let Some(agent) = agent {
                 let agent_label = crate::detect::agent_label(agent);
+                // herdr-jht1 (codex jht1-r1): once the live witness supersedes
+                // this exit (round 4, rule 14), the metadata gate's label clause
+                // admits reports naming the exited agent, so a source's
+                // sequence is their only order. A watermark accepted after the
+                // exit survives it; the exited agent's official source stays
+                // dropped (R28) and is reset as before.
+                let kept_watermarks: Vec<String> = if self.recorded_exit_superseded() {
+                    self.metadata_report_agents
+                        .iter()
+                        .filter(|(source, owner)| {
+                            owner.accepted_at > now
+                                && !crate::agent_resume::is_official_agent_source(
+                                    source,
+                                    agent_label,
+                                )
+                        })
+                        .map(|(source, _)| source.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let mut cleared_metadata_sources = Vec::new();
                 self.agent_metadata.retain(|source, metadata| {
                     let official_metadata = crate::agent_resume::is_official_agent_source(
@@ -799,13 +829,16 @@ impl TerminalState {
                     !clear
                 });
                 for source in cleared_metadata_sources {
+                    if kept_watermarks.contains(&source) {
+                        continue;
+                    }
                     self.metadata_report_sequences.remove(&source);
                     self.metadata_report_agents.remove(&source);
                     self.metadata_token_sequence_sources.remove(&source);
                 }
                 let mut exited_generation_sources = Vec::new();
                 self.metadata_report_agents.retain(|source, owner| {
-                    if *owner == agent {
+                    if owner.agent == agent && !kept_watermarks.contains(source) {
                         exited_generation_sources.push(source.clone());
                         false
                     } else {
