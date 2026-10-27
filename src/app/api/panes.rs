@@ -4839,6 +4839,107 @@ mod tests {
         );
     }
 
+    /// herdr-d3jk: the first instant later than `earlier`.
+    fn instant_after(earlier: std::time::Instant) -> std::time::Instant {
+        loop {
+            let now = std::time::Instant::now();
+            if now > earlier {
+                return now;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    // herdr-d3jk (codex jht1-r2 P2), the API tokens path: a source names
+    // claude at seq 50 before the native Claude's exit at t1, the bridge's
+    // Claude is witnessed at t2 > t1, and the same source sends seq 200
+    // naming no agent; only then is the exit stamped t1 delivered. The
+    // unlabelled report refreshed the time its watermark was accepted, so the
+    // superseded exit keeps it and the exited Claude's delayed seq 100 stays
+    // dropped instead of overwriting the live Claude's tokens.
+    #[test]
+    fn pane_metadata_watermark_advanced_by_an_unlabelled_report_survives_a_late_superseded_exit() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let (_, internal_pane_id) = app.parse_pane_id(&pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(internal_pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                false,
+                std::time::Instant::now(),
+            );
+        let mut native = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.299 native");
+        native.seq = Some(50);
+        let response = app.handle_pane_report_metadata("native".into(), native);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let exit_at = instant_after(std::time::Instant::now());
+        let witnessed_at = instant_after(exit_at);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_hook_authority_naming_agent_at(
+                BRIDGE_CLAUDE_SOURCE.into(),
+                "claude".into(),
+                AgentState::Idle,
+                None,
+                None,
+                Some(1),
+                crate::terminal::NamedAgentVerdict::Witnessed {
+                    observed_at: witnessed_at,
+                },
+                witnessed_at,
+            );
+        let mut live = ccwait_tokens_params(pane_id.clone(), "herdr:ccwait", "2.1.300 live");
+        live.agent = None;
+        live.seq = Some(200);
+        let response = app.handle_pane_report_metadata("live".into(), live);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                Some(Agent::Claude),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                true,
+                exit_at,
+            );
+        let mut late = ccwait_tokens_params(pane_id, "herdr:ccwait", "2.1.299 exited");
+        late.seq = Some(100);
+        let response = app.handle_pane_report_metadata("late".into(), late);
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert_eq!(
+            (
+                terminal.effective_agent_label(),
+                terminal.metadata_tokens.values(),
+                terminal.metadata_report_sequence_is_fresh("herdr:ccwait", Some(200)),
+            ),
+            (
+                Some("claude"),
+                std::collections::HashMap::from([("ver_acct".into(), "2.1.300 live".into())]),
+                false,
+            )
+        );
+    }
+
     #[test]
     fn pane_metadata_ignored_after_process_exit_does_not_poison_sequence() {
         let (mut app, pane_id) = app_with_test_workspace();
