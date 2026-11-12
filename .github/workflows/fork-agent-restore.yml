@@ -410,6 +410,12 @@ jobs:
     # id's native plan runs instead. Letting the reported command run in any directory must turn
     # both scenario tests red: P1 types `--continue` onto the pane dir's live conversation, P2 types
     # it twice in the same pane dir.
+    #
+    # Retargeted for herdr-n2tl: herdr-3cr replaced `deferred_resume_plan_in` (the
+    # `Some(reserved) if reserved == cwd` match arm) with `deferred_resume_launch`, which spawns the
+    # reported command in its reserved directory and falls back to the native plan only when that
+    # directory is gone or replaced. Hiding `launch_dir` from that function is the same mutant as the
+    # old `|| true`: every reported plan passes through unchanged, in the pane cwd.
     name: mutant - a reported resume command runs only in its reserved directory
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -443,7 +449,7 @@ jobs:
 
       - name: Let the reported command run in any directory and require both nrr tests to fail
         run: |
-          sed -i 's/Some(reserved) if reserved == cwd =>/Some(reserved) if reserved == cwd || true \/* MUTANT nrr launch dir *\/ =>/' src/app/agent_resume.rs
+          sed -i 's/let Some(reserved) = plan\.launch_dir\.clone() else {/let Some(reserved) = plan.launch_dir.clone().filter(|_| false \/* MUTANT nrr launch dir *\/) else {/' src/app/agent_resume.rs
           landed=$(grep -c 'MUTANT nrr launch dir' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
@@ -593,6 +599,10 @@ jobs:
     # amendment regression test calls it directly). The mutation target is the same FUNCTION, its BODY
     # changed; the assertions below are unchanged, since the observable behavior this test suite
     # checks did not move.
+    #
+    # Retargeted again for herdr-n2tl: herdr-3cr moved the directory test into
+    # `crate::agent_resume::usable_agent_cwd`, so the body no longer matches a literal copy. The
+    # mutation now replaces whatever body follows the function's signature, up to its closing brace.
     name: mutant - the ct9 agent cwd preference is load-bearing
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -626,7 +636,7 @@ jobs:
 
       - name: Ignore the reported agent cwd and require the preference test to fail
         run: |
-          perl -0777 -pi -e 's/pub\(crate\) fn agent_resume_cwd\(terminal: &crate::terminal::TerminalState\) -> std::path::PathBuf \{\n    terminal\n        \.persisted_agent_session\n        \.as_ref\(\)\n        \.and_then\(\|session\| session\.cwd\.as_deref\(\)\)\n        \.map\(std::path::Path::new\)\n        \.filter\(\|cwd\| cwd\.is_dir\(\)\)\n        \.map\(std::path::Path::to_path_buf\)\n        \.unwrap_or_else\(\|\| terminal\.cwd\.clone\(\)\)\n\}/pub(crate) fn agent_resume_cwd(terminal: &crate::terminal::TerminalState) -> std::path::PathBuf {\n    \/* MUTANT ct9 agent cwd ignored *\/\n    terminal.cwd.clone()\n}/' src/app/agent_resume.rs
+          perl -0777 -pi -e 's/(pub\(crate\) fn agent_resume_cwd\(terminal: &crate::terminal::TerminalState\) -> std::path::PathBuf \{\n).*?\n\}\n/$1    \/* MUTANT ct9 agent cwd ignored *\/\n    terminal.cwd.clone()\n}\n/s' src/app/agent_resume.rs
           landed=$(grep -c 'MUTANT ct9 agent cwd ignored' src/app/agent_resume.rs || true)
           [ "$landed" = 1 ] || { echo "mutation did not land exactly once (landed=$landed)"; exit 1; }
           cargo nextest run --locked --bin herdr --no-run
