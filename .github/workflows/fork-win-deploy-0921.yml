@@ -71,7 +71,7 @@ jobs:
           cargo nextest list --locked --bin herdr -E "$filter" --message-format oneline > fork-tests.txt
           cat fork-tests.txt
           count=$(grep -c . fork-tests.txt || true)
-          [ "$count" = 38 ] || { echo "expected 38 fork tests, the filter matched $count"; exit 1; }
+          [ "$count" = 39 ] || { echo "expected 39 fork tests, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
 
   frozen-spinner-mutant:

@@ -170,9 +170,9 @@ jobs:
           cat agent-restore-tests.txt
           count=$(grep -c . agent-restore-tests.txt || true)
           if [ "${{ runner.os }}" = "Windows" ]; then
-            expected=36
+            expected=38
           else
-            expected=50
+            expected=63
           fi
           [ "$count" = "$expected" ] || { echo "expected $expected agent-restore tests on ${{ runner.os }}, the filter matched $count"; exit 1; }
           cargo nextest run --locked --bin herdr --no-fail-fast --status-level pass --final-status-level all -E "$filter"
